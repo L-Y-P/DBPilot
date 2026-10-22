@@ -84,3 +84,6 @@ app.*.map.json
 /test/failures/
 **/test/failures/
 
+
+# 打包产物（DMG / zip 走 GitHub Release，不入库）
+/dist/

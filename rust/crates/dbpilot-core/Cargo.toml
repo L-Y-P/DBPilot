@@ -1,0 +1,21 @@
+[package]
+name = "dbpilot-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dbpilot_core"
+
+# 契约层：驱动 trait / 方言 / 连接句柄 / 注册表 / DTO / SQL 工具。
+# 这里**不允许**出现具体驱动、具体 sqlx 池类型或 SSH 实现依赖；
+# 依赖方向由 Cargo 强制：主 crate -> 本 crate。
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+# 只需要 sqlx 的错误类型（AppError::from(sqlx::Error)），不需要任何驱动特性。
+sqlx = { version = "0.8", default-features = false }
+base64 = "0.22"
+hex = "0.4"

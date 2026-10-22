@@ -1,0 +1,67 @@
+# docker-compose.live.yml
+#
+# 为 rust/ 的 live 测试套件起一套匹配的数据库环境。仓库里不含任何密码字面量：
+#   MySQL      127.0.0.1:3306   账号 root，**空密码**，库 rustmyadmin_demo
+#   PostgreSQL 127.0.0.1:5432   账号 postgres，trust 认证，库 rustmyadmin_demo
+#
+# 测试侧读取的环境变量（见 rust/tests/common/mod.rs）：
+#   DBPILOT_TEST_MYSQL_{HOST,PORT,USER,PASSWORD,DB}
+#   DBPILOT_TEST_PG_{HOST,PORT,USER,PASSWORD,DB}
+# 默认值与下面的容器一致，所以“起库 + 直接跑测试”即可，不需要任何密码配置。
+#
+# 用法：
+#   docker compose -f docker-compose.live.yml up -d --wait   # 起库并等 healthcheck
+#   docker compose -f docker-compose.live.yml ps
+#   docker compose -f docker-compose.live.yml down -v        # 停库并删数据卷
+#   等价 make 目标：make rust-live-up / make rust-live-down
+#
+# 端口可用环境变量覆盖（MYSQL_PORT / PG_PORT）。覆盖端口时，测试侧也要同步设置
+# DBPILOT_TEST_MYSQL_PORT / DBPILOT_TEST_PG_PORT，否则测试仍连默认端口。
+
+name: dbpilot-live
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: dbpilot-live-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      # 空密码：与测试的默认密码（空字符串）一致，仓库里不需要任何密码常量。
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: rustmyadmin_demo
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-live-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 40s
+
+  postgres:
+    image: postgres:17
+    container_name: dbpilot-live-pg
+    environment:
+      POSTGRES_USER: postgres
+      # trust 认证 + 空密码：与测试的默认密码（空字符串）一致。
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: rustmyadmin_demo
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pg-live-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rustmyadmin_demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+volumes:
+  mysql-live-data:
+  pg-live-data:

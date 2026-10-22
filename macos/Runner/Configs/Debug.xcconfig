@@ -1,0 +1,4 @@
+#include "../../Flutter/Flutter-Debug.xcconfig"
+#include "Warnings.xcconfig"
+OTHER_LDFLAGS = $(inherited) -framework SystemConfiguration -framework CoreFoundation -framework Security
+

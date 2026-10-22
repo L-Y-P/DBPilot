@@ -1,0 +1,145 @@
+name: build
+
+# 每次 push 到 main / PR / 手动触发：双平台（macOS + Windows）出 Release 包并上传 artifact。
+# 发布仓库根 = desktop/ 目录，所以下面的路径都没有 desktop/ 前缀（rust/、lib/、pubspec.yaml …）。
+# 真正的发布（建 Release + 更新 update.json）见 release.yml。
+
+on:
+  push:
+    branches: [main, master]
+    # 纯清单 / 纯文档提交不值得跑两平台构建（release 工作流会提交 update.json）
+    paths-ignore:
+      - "update.json"
+      - "**.md"
+  # PR 不做 paths-ignore：如果分支保护要求 build 检查，被跳过的 PR 会一直卡在
+  # "Expected — Waiting for status to be reported"。文档类 PR 白跑一次构建更省心。
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Flutter 版本与 release.yml 保持一致（项目实测版本，见 README.md）。
+  FLUTTER_VERSION: "3.47.7"
+  CARGO_TERM_COLOR: always
+  FLUTTER_SUPPRESS_ANALYTICS: "true"
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      # 两个平台互不阻塞：Windows 失败也要看到 macOS 的结果
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+            artifact: macos
+            # macOS 产物是 universal（x86_64 + arm64）：cargokit 按 ARCHS 给每个架构各编一份
+            # 静态库再 lipo，所以两个 Rust target 都必须预装。
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: windows-latest
+            platform: windows
+            artifact: windows-x64
+            rust_targets: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      # 只缓存 cargo 的下载缓存（registry / git）。这里**故意不缓存 rust/target**：
+      # flutter build 走 cargokit，Rust 产物落在 build/ 下的 CARGOKIT_TARGET_TEMP_DIR，
+      # 全新 checkout 里根本没有 rust/target 目录（.gitignore 掉了），缓存它只会让
+      # actions/cache 报 "Path(s) ... do(es) not exist" 并白白占掉仓库 10 GB 缓存配额。
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          flutter --version
+          rustc -vV
+          cargo -V
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build macOS
+        if: matrix.platform == 'macos'
+        run: flutter build macos --release
+
+      - name: Build Windows
+        if: matrix.platform == 'windows'
+        run: flutter build windows --release
+
+      # 版本号从 pubspec.yaml 取（唯一版本源；发版时 tag 必须与它一致）。
+      # 这一步只用 sed，macOS 与 Windows（Git Bash）都可用。
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml | head -1)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::pubspec.yaml 里没有解析到 version"
+            exit 1
+          fi
+          echo "版本：$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # ditto 保留 .app 里的符号链接与扩展属性，解压后可直接运行（普通 zip 会丢符号链接）。
+      - name: Package macOS
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/macos/Build/Products/Release/DBPilot.app"
+          test -d "$APP" || { echo "::error::找不到 $APP"; exit 1; }
+          echo "产物架构：$(lipo -archs "$APP/Contents/MacOS/DBPilot" 2>/dev/null || echo unknown)"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "DBPilot-$VERSION-macos.zip"
+          ls -lh "DBPilot-$VERSION-macos.zip"
+
+      # 把整个 Release 目录（exe + dll + data/）打平进 zip，解压即用，不套一层文件夹。
+      - name: Package Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $rel = "build\windows\x64\runner\Release"
+          if (-not (Test-Path $rel)) { Write-Error "找不到 $rel"; exit 1 }
+          $zip = "DBPilot-$env:VERSION-windows-x64.zip"
+          Compress-Archive -Path "$rel\*" -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name, Length | Format-List
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbpilot-${{ matrix.artifact }}
+          path: DBPilot-*-${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 14

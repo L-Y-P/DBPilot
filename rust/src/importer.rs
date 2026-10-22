@@ -1,0 +1,3580 @@
+//! Streaming data-file import engine.
+//!
+//! The web build only imported SQL scripts. The desktop app also imports data
+//! files (CSV / TSV / JSON arrays / JSON Lines / custom wrapped text) into a
+//! table, with a guided rule builder. Two properties drive this module:
+//!
+//! * **Never read a whole file into memory.** Everything is a byte stream with
+//!   a bounded record/statement buffer; the same code path validates a 10 KB
+//!   sample and a multi-GB data file.
+//! * **Every failure names a position.** Records and statements carry the byte
+//!   offset, 1-based line and record/statement index so the wizard can point at
+//!   the exact line that did not match the configured rule.
+//!
+//! The module is deliberately UI-free: api::import owns jobs/polling, this
+//! module owns parsing, conversion and batched INSERT generation.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+
+use crate::drivers::{literal, qi, qualify, DriverKind};
+use crate::error::{AppError, AppResult};
+
+/// How many invalid records a validation/import run reports back.
+pub const DEFAULT_MAX_ISSUES: usize = 100;
+/// Records per multi-row INSERT statement.
+pub const DEFAULT_BATCH_SIZE: usize = 500;
+pub const MAX_BATCH_SIZE: usize = 5_000;
+/// A single generated INSERT statement is capped so one enormous record cannot
+/// make sqlx build a gigabyte-sized query string.
+pub const MAX_BATCH_SQL_BYTES: usize = 512 * 1024;
+/// A per-record cap: a file without the configured separator would otherwise
+/// grow the record buffer until the process dies.
+pub const DEFAULT_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+/// A single SQL statement cap for the streaming SQL-file runner.
+pub const MAX_SQL_STATEMENT_BYTES: usize = 16 * 1024 * 1024;
+/// Preview reads at most this many records.
+pub const MAX_PREVIEW_RECORDS: usize = 20;
+
+fn default_true() -> bool {
+    true
+}
+fn default_quote() -> String {
+    "\"".to_string()
+}
+fn default_record_sep() -> String {
+    "\n".to_string()
+}
+fn default_max_record() -> usize {
+    DEFAULT_MAX_RECORD_BYTES
+}
+fn default_batch() -> usize {
+    DEFAULT_BATCH_SIZE
+}
+fn default_max_issues() -> usize {
+    DEFAULT_MAX_ISSUES
+}
+fn default_mode_line() -> String {
+    "line".to_string()
+}
+fn default_fields_mode() -> String {
+    "delimited".to_string()
+}
+fn default_field_sep() -> String {
+    ",".to_string()
+}
+fn default_on_error() -> String {
+    "stop".to_string()
+}
+fn default_null_tokens() -> Vec<String> {
+    vec!["\\N".to_string()]
+}
+
+// ---------------------------------------------------------------- rule specs
+
+/// How one complete record is delimited in the file.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReadSpec {
+    /// "line": one record per line (CSV / JSON Lines).
+    /// "wrapped": optional file-level wrapper plus a record separator
+    /// (JSON array "[ {...}, {...} ]", or BEGIN/END custom blocks).
+    #[serde(default = "default_mode_line")]
+    pub mode: String,
+    /// Bytes expected once before the first record ("[" for a JSON array).
+    #[serde(default)]
+    pub wrapper_start: String,
+    /// Bytes expected once after the last record ("]" for a JSON array).
+    #[serde(default)]
+    pub wrapper_end: String,
+    /// Record separator for line / wrapped modes. A newline is the default.
+    #[serde(default = "default_record_sep")]
+    pub record_sep: String,
+    /// String delimiter used while scanning records (CSV quoted fields, JSON
+    /// strings inside a wrapped array). Empty disables quote awareness.
+    #[serde(default = "default_quote")]
+    pub quote: String,
+    /// Wrapped mode only: ignore separators inside braces / brackets / parens.
+    #[serde(default = "default_true")]
+    pub balance: bool,
+    /// Skip blank records instead of reporting them.
+    #[serde(default = "default_true")]
+    pub skip_blank: bool,
+    /// Trim leading/trailing whitespace around each record.
+    #[serde(default = "default_true")]
+    pub trim: bool,
+    #[serde(default = "default_max_record")]
+    pub max_record_bytes: usize,
+}
+
+impl Default for ReadSpec {
+    fn default() -> Self {
+        ReadSpec {
+            mode: default_mode_line(),
+            wrapper_start: String::new(),
+            wrapper_end: String::new(),
+            record_sep: default_record_sep(),
+            quote: default_quote(),
+            balance: true,
+            skip_blank: true,
+            trim: true,
+            max_record_bytes: default_max_record(),
+        }
+    }
+}
+
+/// How the fields of one record are written.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FieldSpec {
+    /// How one record's fields are laid out:
+    ///
+    ///  * "delimited": CSV-style fields split by field_sep;
+    ///  * "json": one JSON value (object = keyed, array = positional);
+    ///  * "xml": `<col name="X">value</col>` / `<col name="X" null="true"/>`
+    ///    (the XML exporter's own shape);
+    ///  * "html": `<td>` cells, `<td class="null">` meaning NULL, `<th>` naming
+    ///    the columns;
+    ///  * "spreadsheet": SpreadsheetML `<Cell><Data ss:Type="..">v</Data></Cell>`,
+    ///    an empty `<Cell/>` meaning NULL (Excel export);
+    ///  * "markdown": a `| a | b |` table, header row above a `| --- |` rule.
+    #[serde(default = "default_fields_mode")]
+    pub mode: String,
+    #[serde(default = "default_field_sep")]
+    pub field_sep: String,
+    #[serde(default = "default_quote")]
+    pub quote: String,
+    /// Optional escape character inside quotes (a backslash for some CSV flavours).
+    #[serde(default)]
+    pub escape: String,
+    #[serde(default = "default_true")]
+    pub trim: bool,
+    /// Delimited files only: the first record names the columns.
+    #[serde(default)]
+    pub header: bool,
+}
+
+impl Default for FieldSpec {
+    fn default() -> Self {
+        FieldSpec {
+            mode: default_fields_mode(),
+            field_sep: default_field_sep(),
+            quote: default_quote(),
+            escape: String::new(),
+            trim: true,
+            header: false,
+        }
+    }
+}
+
+/// One destination column and where its value comes from.
+///
+/// The source is a JSON string (dictionary key / CSV header name) or a number
+/// (0-based field position). Mixing both kinds is rejected.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ColumnMap {
+    pub column: String,
+    pub source: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MappingSpec {
+    #[serde(default)]
+    pub columns: Vec<ColumnMap>,
+    /// Keyed records may carry extra keys; ignore them instead of failing.
+    #[serde(default = "default_true")]
+    pub ignore_unknown: bool,
+    /// Empty string means NULL for every column. When false, text/JSON columns
+    /// keep the empty string and other columns become NULL.
+    #[serde(default)]
+    pub empty_as_null: bool,
+    #[serde(default = "default_null_tokens")]
+    pub null_tokens: Vec<String>,
+    /// Trim string values before type conversion.
+    #[serde(default = "default_true")]
+    pub trim_values: bool,
+}
+
+impl Default for MappingSpec {
+    fn default() -> Self {
+        MappingSpec {
+            columns: Vec::new(),
+            ignore_unknown: true,
+            empty_as_null: false,
+            null_tokens: default_null_tokens(),
+            trim_values: true,
+        }
+    }
+}
+
+/// Parse request shared by preview / validate / probe / execute.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ParseSpec {
+    pub path: String,
+    pub read: ReadSpec,
+    pub fields: FieldSpec,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ValidateSpec {
+    #[serde(flatten)]
+    pub parse: ParseSpec,
+    #[serde(default)]
+    pub mapping: Option<MappingSpec>,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExecuteOptions {
+    #[serde(default = "default_batch")]
+    pub batch_size: usize,
+    /// "stop" aborts at the first invalid row; "skip" keeps going.
+    #[serde(default = "default_on_error")]
+    pub on_error: String,
+    #[serde(default = "default_max_issues")]
+    pub max_issues: usize,
+}
+
+impl Default for ExecuteOptions {
+    fn default() -> Self {
+        ExecuteOptions {
+            batch_size: default_batch(),
+            on_error: default_on_error(),
+            max_issues: default_max_issues(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExecuteSpec {
+    #[serde(flatten)]
+    pub validate: ValidateSpec,
+    #[serde(default)]
+    pub options: ExecuteOptions,
+}
+
+// ---------------------------------------------------------------- diagnostics
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Progress {
+    pub phase: String,
+    pub bytes: u64,
+    pub total_bytes: u64,
+    pub records: u64,
+    pub rows: u64,
+    pub failed: u64,
+    pub percent: f64,
+    pub elapsed_ms: u64,
+    pub message: String,
+}
+
+impl Progress {
+    fn refresh(&mut self, started: Instant) {
+        self.elapsed_ms = started.elapsed().as_millis() as u64;
+        self.percent = if self.total_bytes > 0 {
+            (self.bytes as f64 / self.total_bytes as f64 * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RowIssue {
+    /// 0-based record index (header records are not counted).
+    pub index: u64,
+    pub line: u64,
+    pub offset: u64,
+    pub message: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub snippet: String,
+}
+
+pub fn snippet(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out.replace('\n', "\\n").replace('\r', "\\r")
+}
+
+#[derive(Clone, Debug)]
+struct RawRecord {
+    index: u64,
+    offset: u64,
+    line: u64,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReadProblem {
+    message: String,
+    offset: u64,
+    line: u64,
+    /// Fatal structural problems stop the scan (the rule can no longer be
+    /// applied); recoverable ones (invalid UTF-8, blank record) let it continue.
+    fatal: bool,
+}
+
+enum ScanItem {
+    Record(RawRecord),
+    Problem(ReadProblem),
+}
+
+// ---------------------------------------------------------------- byte stream
+
+/// Buffered byte stream with absolute offset + line tracking.
+///
+/// All reads are bounded: the internal buffer is refilled in 64 KiB chunks and
+/// compacted after consumption, so memory stays flat no matter the file size.
+struct ByteStream {
+    file: File,
+    buf: Vec<u8>,
+    pos: usize,
+    eof: bool,
+    /// Absolute offset of the next unread byte.
+    abs: u64,
+    /// 1-based line of the next unread byte.
+    line: u64,
+}
+
+impl ByteStream {
+    fn open(path: &str) -> AppResult<Self> {
+        let mut file = File::open(path).map_err(|e| AppError::bad(format!("无法打开文件: {e}")))?;
+        // Detect a byte-order mark; UTF-16 is reported as unsupported rather
+        // than silently decoded as garbage.
+        let mut head = [0u8; 4];
+        let n = file.read(&mut head).unwrap_or(0);
+        let (skip, encoding) = detect_bom(&head[..n]);
+        if encoding == "utf-16le" || encoding == "utf-16be" {
+            return Err(AppError::bad(
+                "文件是 UTF-16 编码，暂不支持；请另存为 UTF-8 后重试".to_string(),
+            ));
+        }
+        // Always rewind to the first content byte: the BOM probe above consumed
+        // up to four bytes even when there is no BOM.
+        file.seek(SeekFrom::Start(skip as u64))
+            .map_err(|e| AppError::bad(format!("无法读取文件: {e}")))?;
+        Ok(ByteStream {
+            file,
+            buf: Vec::with_capacity(64 * 1024),
+            pos: 0,
+            eof: false,
+            abs: skip as u64,
+            line: 1,
+        })
+    }
+
+    fn ensure(&mut self, n: usize) -> AppResult<()> {
+        while self.buf.len().saturating_sub(self.pos) < n && !self.eof {
+            if self.pos > 0 {
+                self.buf.drain(..self.pos);
+                self.pos = 0;
+            }
+            let mut chunk = [0u8; 64 * 1024];
+            let read = self
+                .file
+                .read(&mut chunk)
+                .map_err(|e| AppError::bad(format!("读取文件失败: {e}")))?;
+            if read == 0 {
+                self.eof = true;
+                break;
+            }
+            self.buf.extend_from_slice(&chunk[..read]);
+        }
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    fn at_eof(&mut self) -> AppResult<bool> {
+        self.ensure(1)?;
+        Ok(self.remaining() == 0)
+    }
+
+    fn peek(&mut self) -> AppResult<Option<u8>> {
+        self.ensure(1)?;
+        Ok(self.buf.get(self.pos).copied())
+    }
+
+    /// Look n bytes ahead without consuming (None past EOF).
+    fn peek_at(&mut self, n: usize) -> AppResult<Option<u8>> {
+        self.ensure(n + 1)?;
+        Ok(self.buf.get(self.pos + n).copied())
+    }
+
+    fn starts_with(&mut self, pat: &[u8]) -> AppResult<bool> {
+        if pat.is_empty() {
+            return Ok(true);
+        }
+        self.ensure(pat.len())?;
+        Ok(self.remaining() >= pat.len() && self.buf[self.pos..self.pos + pat.len()] == *pat)
+    }
+
+    fn starts_with_ascii_ci(&mut self, pat: &str) -> AppResult<bool> {
+        let bytes = pat.as_bytes();
+        self.ensure(bytes.len())?;
+        if self.remaining() < bytes.len() {
+            return Ok(false);
+        }
+        Ok(self.buf[self.pos..self.pos + bytes.len()]
+            .iter()
+            .zip(bytes.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase()))
+    }
+
+    fn next_byte(&mut self) -> AppResult<Option<u8>> {
+        let byte = self.peek()?;
+        if let Some(b) = byte {
+            self.pos += 1;
+            self.abs += 1;
+            if b == b'\n' {
+                self.line += 1;
+            }
+        }
+        Ok(byte)
+    }
+
+    /// Consume n bytes (they must already be buffered; callers peeked).
+    fn advance(&mut self, n: usize) {
+        for _ in 0..n {
+            if let Some(b) = self.buf.get(self.pos).copied() {
+                self.pos += 1;
+                self.abs += 1;
+                if b == b'\n' {
+                    self.line += 1;
+                }
+            }
+        }
+    }
+
+    fn position(&self) -> (u64, u64) {
+        (self.abs, self.line)
+    }
+}
+
+/// Byte-order mark detection. Returns (bytes to skip, encoding label).
+pub fn detect_bom(head: &[u8]) -> (usize, &'static str) {
+    if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        (3, "utf-8")
+    } else if head.starts_with(&[0xFF, 0xFE]) {
+        (2, "utf-16le")
+    } else if head.starts_with(&[0xFE, 0xFF]) {
+        (2, "utf-16be")
+    } else {
+        (0, "utf-8")
+    }
+}
+
+// ---------------------------------------------------------------- record scan
+
+/// One record's text plus where it was found in the file.
+struct RecordScanner {
+    stream: ByteStream,
+    read: ReadSpec,
+    fields: FieldSpec,
+    /// Wrapped mode: the opening wrapper has been consumed.
+    started: bool,
+    /// Next record index (0-based, header included).
+    next_index: u64,
+    done: bool,
+    explicit_end: bool,
+}
+
+impl RecordScanner {
+    fn open(spec: &ParseSpec) -> AppResult<RecordScanner> {
+        std::fs::metadata(&spec.path)
+            .map_err(|e| AppError::bad(format!("无法读取文件: {e}")))?;
+        Ok(RecordScanner {
+            stream: ByteStream::open(&spec.path)?,
+            read: normalize_read(&spec.read),
+            fields: spec.fields.clone(),
+            started: false,
+            next_index: 0,
+            done: false,
+            explicit_end: false,
+        })
+    }
+
+    fn next(&mut self) -> AppResult<Option<ScanItem>> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            let item = match self.read.mode.as_str() {
+                "wrapped" => self.next_wrapped(),
+                _ => self.next_line(),
+            }?;
+            // The Markdown separator row (`| --- | --- |`) is table syntax, not
+            // a record: keeping it would show up as a bogus one-column row.
+            if self.fields.mode == "markdown" {
+                if let Some(ScanItem::Record(record)) = &item {
+                    if is_markdown_rule(&record.text) {
+                        continue;
+                    }
+                }
+            }
+            return Ok(item);
+        }
+    }
+
+    /// One record per line (CSV quoted fields may contain newlines).
+    fn next_line(&mut self) -> AppResult<Option<ScanItem>> {
+        let sep = self.read.record_sep.as_bytes().to_vec();
+        if sep.is_empty() {
+            self.done = true;
+            return Ok(Some(ScanItem::Problem(ReadProblem {
+                message: "记录分隔符不能为空".to_string(),
+                offset: self.stream.abs,
+                line: self.stream.line,
+                fatal: true,
+            })));
+        }
+        // CSV rule: a quote only opens at the start of a field, so embedded
+        // quotes in unquoted text do not swallow the rest of the file.
+        let quote_on = self.fields.mode == "delimited" && !self.read.quote.is_empty();
+        let quote = self.read.quote.as_bytes().first().copied();
+        let field_sep = self.fields.field_sep.as_bytes().to_vec();
+
+        loop {
+            if self.stream.at_eof()? {
+                self.done = true;
+                return Ok(None);
+            }
+            let (start_offset, start_line) = self.stream.position();
+            let mut text: Vec<u8> = Vec::new();
+            let mut in_quote = false;
+            let mut at_field_start = true;
+            loop {
+                if self.stream.at_eof()? {
+                    if in_quote {
+                        self.done = true;
+                        return Ok(Some(ScanItem::Problem(ReadProblem {
+                            message: "引号未闭合：记录一直读到文件结尾".to_string(),
+                            offset: start_offset,
+                            line: start_line,
+                            fatal: true,
+                        })));
+                    }
+                    break;
+                }
+                if !in_quote && self.stream.starts_with(&sep)? {
+                    self.stream.advance(sep.len());
+                    break;
+                }
+                if quote_on
+                    && !in_quote
+                    && !field_sep.is_empty()
+                    && self.stream.starts_with(&field_sep)?
+                {
+                    self.stream.advance(field_sep.len());
+                    text.extend_from_slice(&field_sep);
+                    at_field_start = true;
+                    continue;
+                }
+                let byte = match self.stream.next_byte()? {
+                    Some(b) => b,
+                    None => break,
+                };
+                if quote_on {
+                    if in_quote {
+                        if Some(byte) == quote {
+                            // Doubled quote escapes itself inside a quoted field.
+                            if Some(byte) == self.stream.peek()? {
+                                self.stream.advance(1);
+                                text.push(byte);
+                                text.push(byte);
+                            } else {
+                                in_quote = false;
+                                text.push(byte);
+                            }
+                        } else {
+                            text.push(byte);
+                        }
+                        continue;
+                    }
+                    if Some(byte) == quote && at_field_start {
+                        in_quote = true;
+                        at_field_start = false;
+                        text.push(byte);
+                        continue;
+                    }
+                }
+                at_field_start = false;
+                text.push(byte);
+                if text.len() > self.read.max_record_bytes {
+                    self.done = true;
+                    return Ok(Some(ScanItem::Problem(ReadProblem {
+                        message: format!(
+                            "单条记录超过上限 {} 字节，可能记录分隔符配置不正确",
+                            self.read.max_record_bytes
+                        ),
+                        offset: start_offset,
+                        line: start_line,
+                        fatal: true,
+                    })));
+                }
+            }
+            // A record terminated by CRLF keeps a trailing CR when the separator
+            // is a bare newline; strip it like a text editor would.
+            if sep.ends_with(b"\n") && text.last() == Some(&b'\r') {
+                text.pop();
+            }
+            let index = self.next_index;
+            self.next_index += 1;
+            let raw = match String::from_utf8(text) {
+                Ok(text) => text,
+                Err(_) => {
+                    return Ok(Some(ScanItem::Problem(ReadProblem {
+                        message: "记录不是有效的 UTF-8 文本（可能是 GBK/GB18030 编码）"
+                            .to_string(),
+                        offset: start_offset,
+                        line: start_line,
+                        fatal: false,
+                    })))
+                }
+            };
+            // Record-level trimming would eat a trailing field separator, which is
+            // exactly how a row ending in an empty (or NULL) last column looks.
+            // Delimited and Markdown rows trim their FIELDS instead (split_fields
+            // does that), so the empty cell survives.
+            let trim_record = self.read.trim
+                && !matches!(self.fields.mode.as_str(), "delimited" | "markdown");
+            let text = if trim_record { raw.trim().to_string() } else { raw };
+            if text.is_empty() {
+                if self.read.skip_blank {
+                    continue;
+                }
+                return Ok(Some(ScanItem::Problem(ReadProblem {
+                    message: "空记录（跳过空行可避免）".to_string(),
+                    offset: start_offset,
+                    line: start_line,
+                    fatal: false,
+                })));
+            }
+            return Ok(Some(ScanItem::Record(RawRecord {
+                index,
+                offset: start_offset,
+                line: start_line,
+                text,
+            })));
+        }
+    }
+
+    /// Records separated by record_sep, optionally inside one file-level
+    /// wrapper. Bracket depth and JSON strings are honoured so a comma inside a
+    /// JSON object never ends the record.
+    fn next_wrapped(&mut self) -> AppResult<Option<ScanItem>> {
+        let sep = self.read.record_sep.as_bytes().to_vec();
+        let open = self.read.wrapper_start.as_bytes().to_vec();
+        let close = self.read.wrapper_end.as_bytes().to_vec();
+        let quote = self.read.quote.as_bytes().first().copied();
+        if sep.is_empty() {
+            self.done = true;
+            return Ok(Some(ScanItem::Problem(ReadProblem {
+                message: "记录分隔符不能为空".to_string(),
+                offset: self.stream.abs,
+                line: self.stream.line,
+                fatal: true,
+            })));
+        }
+
+        if !self.started {
+            self.started = true;
+            self.skip_spaces()?;
+            if !open.is_empty() {
+                if !self.stream.starts_with(&open)? {
+                    self.done = true;
+                    return Ok(Some(ScanItem::Problem(ReadProblem {
+                        message: format!(
+                            "文件开头缺少记录包裹符 '{}'",
+                            self.read.wrapper_start
+                        ),
+                        offset: self.stream.abs,
+                        line: self.stream.line,
+                        fatal: true,
+                    })));
+                }
+                self.stream.advance(open.len());
+            }
+        }
+
+        loop {
+            self.skip_spaces()?;
+            if self.stream.at_eof()? {
+                self.done = true;
+                if !close.is_empty() && !self.explicit_end {
+                    return Ok(Some(ScanItem::Problem(ReadProblem {
+                        message: format!("文件结尾缺少记录包裹符 '{}'", self.read.wrapper_end),
+                        offset: self.stream.abs,
+                        line: self.stream.line,
+                        fatal: true,
+                    })));
+                }
+                return Ok(None);
+            }
+            if self.explicit_end {
+                let (offset, line) = self.stream.position();
+                self.done = true;
+                return Ok(Some(ScanItem::Problem(ReadProblem {
+                    message: format!(
+                        "记录包裹符 '{}' 之后还有内容",
+                        self.read.wrapper_end
+                    ),
+                    offset,
+                    line,
+                    fatal: true,
+                })));
+            }
+            if !close.is_empty() && self.stream.starts_with(&close)? {
+                self.stream.advance(close.len());
+                self.explicit_end = true;
+                continue;
+            }
+            // Blank lines / duplicated separators between records.
+            if self.stream.starts_with(&sep)? {
+                let (offset, line) = self.stream.position();
+                self.stream.advance(sep.len());
+                if self.read.skip_blank {
+                    continue;
+                }
+                return Ok(Some(ScanItem::Problem(ReadProblem {
+                    message: "空记录（跳过空记录可避免）".to_string(),
+                    offset,
+                    line,
+                    fatal: false,
+                })));
+            }
+
+            let (start_offset, start_line) = self.stream.position();
+            let mut text: Vec<u8> = Vec::new();
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut depth: i64 = 0;
+            let mut terminated = false;
+            loop {
+                if self.stream.at_eof()? {
+                    break;
+                }
+                // The closing wrapper at top level ends the last record.
+                if !in_string
+                    && depth == 0
+                    && !close.is_empty()
+                    && !text.is_empty()
+                    && self.stream.starts_with(&close)?
+                {
+                    break;
+                }
+                if !in_string
+                    && depth == 0
+                    && !text.is_empty()
+                    && self.stream.starts_with(&sep)?
+                {
+                    self.stream.advance(sep.len());
+                    terminated = true;
+                    break;
+                }
+                let byte = match self.stream.next_byte()? {
+                    Some(b) => b,
+                    None => break,
+                };
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if Some(byte) == quote {
+                        in_string = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    }
+                } else if Some(byte) == quote {
+                    in_string = true;
+                } else if self.read.balance {
+                    match byte {
+                        b'{' | b'[' | b'(' => depth += 1,
+                        b'}' | b']' | b')' => {
+                            depth -= 1;
+                            if depth < 0 {
+                                depth = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                text.push(byte);
+                if text.len() > self.read.max_record_bytes {
+                    self.done = true;
+                    return Ok(Some(ScanItem::Problem(ReadProblem {
+                        message: format!(
+                            "单条记录超过上限 {} 字节，可能记录分隔符/包裹符配置不正确",
+                            self.read.max_record_bytes
+                        ),
+                        offset: start_offset,
+                        line: start_line,
+                        fatal: true,
+                    })));
+                }
+            }
+            let index = self.next_index;
+            self.next_index += 1;
+            let raw = match String::from_utf8(text) {
+                Ok(text) => text,
+                Err(_) => {
+                    return Ok(Some(ScanItem::Problem(ReadProblem {
+                        message: "记录不是有效的 UTF-8 文本（可能是 GBK/GB18030 编码）"
+                            .to_string(),
+                        offset: start_offset,
+                        line: start_line,
+                        fatal: false,
+                    })))
+                }
+            };
+            let text = if self.read.trim { raw.trim().to_string() } else { raw };
+            if text.is_empty() {
+                if self.read.skip_blank {
+                    continue;
+                }
+                return Ok(Some(ScanItem::Problem(ReadProblem {
+                    message: "空记录（跳过空记录可避免）".to_string(),
+                    offset: start_offset,
+                    line: start_line,
+                    fatal: false,
+                })));
+            }
+            if !terminated && close.is_empty() {
+                // No wrapper and no separator: the rest of the file is one
+                // record; scanning ends after it.
+                self.done = true;
+            }
+            return Ok(Some(ScanItem::Record(RawRecord {
+                index,
+                offset: start_offset,
+                line: start_line,
+                text,
+            })));
+        }
+    }
+
+    fn skip_spaces(&mut self) -> AppResult<()> {
+        loop {
+            match self.stream.peek()? {
+                Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => {
+                    self.stream.advance(1);
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+}
+
+fn normalize_read(read: &ReadSpec) -> ReadSpec {
+    let mut read = read.clone();
+    read.mode = match read.mode.as_str() {
+        "wrapped" => "wrapped".to_string(),
+        _ => "line".to_string(),
+    };
+    read
+}
+
+// ---------------------------------------------------------------- field parse
+
+#[derive(Clone, Debug)]
+pub enum ParsedRow {
+    Keyed(Map<String, Value>),
+    Positional(Vec<Value>),
+}
+
+/// Split one delimited record into fields, honouring quotes.
+pub fn split_fields(
+    text: &str,
+    sep: &str,
+    quote: &str,
+    escape: &str,
+    trim: bool,
+) -> Result<Vec<String>, String> {
+    if sep.is_empty() {
+        return Err("字段分隔符不能为空".to_string());
+    }
+    let quote_char = quote.chars().next();
+    let escape_char = escape.chars().next();
+    let mut fields: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut field_started = false;
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < text.len() {
+        let ch = text[i..].chars().next().unwrap();
+        let clen = ch.len_utf8();
+        if in_quote {
+            if Some(ch) == escape_char {
+                cur.push(ch);
+                i += clen;
+                if i < text.len() {
+                    let next = text[i..].chars().next().unwrap();
+                    cur.push(next);
+                    i += next.len_utf8();
+                }
+                continue;
+            }
+            if Some(ch) == quote_char {
+                if text[i + clen..].starts_with(quote) {
+                    cur.push(ch);
+                    i += clen * 2;
+                    continue;
+                }
+                in_quote = false;
+                i += clen;
+                continue;
+            }
+            cur.push(ch);
+            i += clen;
+            continue;
+        }
+        if bytes[i..].starts_with(sep.as_bytes()) {
+            fields.push(finish_field(std::mem::take(&mut cur), trim));
+            field_started = false;
+            i += sep.len();
+            continue;
+        }
+        if Some(ch) == quote_char && (!field_started || cur.trim().is_empty()) {
+            cur.clear();
+            in_quote = true;
+            field_started = true;
+            i += clen;
+            continue;
+        }
+        cur.push(ch);
+        field_started = true;
+        i += clen;
+    }
+    if in_quote {
+        return Err("引号未闭合".to_string());
+    }
+    fields.push(finish_field(cur, trim));
+    Ok(fields)
+}
+
+fn finish_field(mut field: String, trim: bool) -> String {
+    if trim {
+        field = field.trim().to_string();
+    }
+    field
+}
+
+/// Parse one record according to the field rule.
+pub fn parse_row(text: &str, spec: &FieldSpec) -> Result<ParsedRow, String> {
+    match spec.mode.as_str() {
+        "xml" => return parse_xml_row(text),
+        "html" => return parse_html_row(text),
+        "spreadsheet" => return parse_spreadsheet_row(text),
+        "markdown" => return parse_markdown_row(text),
+        "json" => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(map)) => Ok(ParsedRow::Keyed(map)),
+            Ok(Value::Array(values)) => Ok(ParsedRow::Positional(values)),
+            Ok(other) => Err(format!(
+                "记录是 JSON {}，需要 JSON 对象（列名:值）或数组（按位置）",
+                json_kind(&other)
+            )),
+            Err(e) => Err(format!("JSON 解析失败: {e}")),
+        },
+        _ => {
+            if spec.field_sep.is_empty() {
+                return Err("字段分隔符不能为空".to_string());
+            }
+            let fields = split_fields(
+                text,
+                &spec.field_sep,
+                &spec.quote,
+                &spec.escape,
+                spec.trim,
+            )?;
+            Ok(ParsedRow::Positional(
+                fields.into_iter().map(Value::String).collect(),
+            ))
+        }
+    }
+}
+
+// ------------------------------------------------- structural record parsers
+//
+// The exporter writes seven non-SQL formats; the importer used to understand
+// only delimited text and JSON, so an exported XML/HTML/Excel/Markdown file
+// could not be read back. Each parser below mirrors exactly what
+// exporters::render emits for that format, including the NULL markers:
+//
+//   XML        <col name="x" null="true"/>   vs <col name="x"></col>
+//   HTML       <td class="null"></td>        vs <td></td>
+//   Excel      <Cell/>                       vs <Cell><Data>..</Data></Cell>
+//   Markdown   \N                            vs (empty)
+//   CSV/TXT    \N                            vs (empty)
+
+/// Unescape the five XML entities the exporter writes.
+fn xml_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let end = match rest.find(';') {
+            Some(end) => end,
+            None => break,
+        };
+        let entity = &rest[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => None,
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Text between the first `<tag ...>` and its matching `</tag>`.
+fn inner_of<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = text.find(&format!("<{tag}"))?;
+    let after_open = text[open..].find('>')? + open + 1;
+    let close = text[after_open..].find(&format!("</{tag}>"))? + after_open;
+    Some(&text[after_open..close])
+}
+
+/// Value of `name="..."` inside the first tag of `text`.
+fn attr_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let start = text.find(&needle)? + needle.len();
+    let end = text[start..].find('"')? + start;
+    Some(&text[start..end])
+}
+
+/// Parse one `<row>` of the XML export.
+///
+/// A `<col ... null="true"/>` element is NULL; a `<col name="x"></col>`
+/// element is the empty string. Keeping them apart is what makes the round
+/// trip lossless.
+fn parse_xml_row(text: &str) -> Result<ParsedRow, String> {
+    let mut map = Map::new();
+    let mut rest = text;
+    let mut seen = 0usize;
+    while let Some(start) = rest.find("<col") {
+        rest = &rest[start..];
+        let tag_end = match rest.find('>') {
+            Some(end) => end,
+            None => break,
+        };
+        let tag = &rest[..=tag_end];
+        let name = attr_value(tag, "name")
+            .ok_or_else(|| "XML 列缺少 name 属性".to_string())?
+            .to_string();
+        if tag.ends_with("/>") {
+            let is_null = attr_value(tag, "null").is_some_and(|v| v == "true");
+            map.insert(
+                name,
+                if is_null {
+                    Value::Null
+                } else {
+                    Value::String(String::new())
+                },
+            );
+            seen += 1;
+            rest = &rest[tag_end + 1..];
+            continue;
+        }
+        let body = inner_of(rest, "col").unwrap_or("");
+        map.insert(name, Value::String(xml_unescape(body)));
+        seen += 1;
+        rest = &rest[tag_end + 1..];
+    }
+    if seen == 0 {
+        return Err("XML 记录里没有 <col> 元素".to_string());
+    }
+    Ok(ParsedRow::Keyed(map))
+}
+
+/// Parse one `<tr>` of the HTML export into positional cells.
+///
+/// `<td class="null"></td>` is NULL; `<td></td>` is the empty string.
+fn parse_html_row(text: &str) -> Result<ParsedRow, String> {
+    let mut values = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<td") {
+        rest = &rest[start..];
+        let tag_end = match rest.find('>') {
+            Some(end) => end,
+            None => break,
+        };
+        let tag = &rest[..=tag_end];
+        let is_null = attr_value(tag, "class").is_some_and(|v| v == "null");
+        let body = inner_of(rest, "td").unwrap_or("");
+        values.push(if is_null {
+            Value::Null
+        } else {
+            Value::String(xml_unescape(body))
+        });
+        rest = &rest[tag_end + 1..];
+    }
+    if values.is_empty() {
+        return Err("HTML 记录里没有 <td> 元素".to_string());
+    }
+    Ok(ParsedRow::Positional(values))
+}
+
+/// Parse one `<Row>` of the SpreadsheetML (Excel) export.
+///
+/// `<Cell/>` is NULL; `ss:Index` (which Excel writes for sparse rows) skips
+/// positions so the values stay aligned with the header.
+fn parse_spreadsheet_row(text: &str) -> Result<ParsedRow, String> {
+    let mut values: Vec<Value> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<Cell") {
+        rest = &rest[start..];
+        let tag_end = match rest.find('>') {
+            Some(end) => end,
+            None => break,
+        };
+        let tag = &rest[..=tag_end];
+        if let Some(index) = attr_value(tag, "ss:Index").and_then(|v| v.parse::<usize>().ok()) {
+            // SpreadsheetML indices are 1-based and may skip positions.
+            while values.len() + 1 < index {
+                values.push(Value::Null);
+            }
+        }
+        if tag.ends_with("/>") {
+            values.push(Value::Null);
+            rest = &rest[tag_end + 1..];
+            continue;
+        }
+        let body = inner_of(rest, "Cell").unwrap_or("");
+        match inner_of(body, "Data") {
+            Some(data) => {
+                let kind = body
+                    .find("<Data")
+                    .and_then(|i| attr_value(&body[i..], "ss:Type"))
+                    .unwrap_or("String");
+                let raw = xml_unescape(data);
+                values.push(match kind {
+                    "Number" => raw
+                        .parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(Value::Number)
+                        .unwrap_or(Value::String(raw)),
+                    "Boolean" => Value::Bool(raw == "1" || raw.eq_ignore_ascii_case("true")),
+                    _ => Value::String(raw),
+                });
+            }
+            // A <Cell> with no <Data> child is an empty cell.
+            None => values.push(Value::Null),
+        }
+        rest = &rest[tag_end + 1..];
+    }
+    if values.is_empty() {
+        return Err("Excel 记录里没有 <Cell> 元素".to_string());
+    }
+    Ok(ParsedRow::Positional(values))
+}
+
+/// Parse one Markdown table row into positional cells.
+///
+/// The separator row (`| --- |`) is skipped by the caller. `\|` is an escaped
+/// pipe inside a cell.
+fn parse_markdown_row(text: &str) -> Result<ParsedRow, String> {
+    let trimmed = text.trim();
+    let body = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let body = body.strip_suffix('|').unwrap_or(body);
+    let mut values = Vec::new();
+    let mut cur = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'|') {
+            chars.next();
+            cur.push('|');
+        } else if c == '|' {
+            values.push(Value::String(cur.trim().to_string()));
+            cur.clear();
+        } else {
+            cur.push(c);
+        }
+    }
+    values.push(Value::String(cur.trim().to_string()));
+    Ok(ParsedRow::Positional(values))
+}
+
+/// Is this Markdown line the `| --- | --- |` separator?
+fn is_markdown_rule(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('|')
+        && trimmed.contains('-')
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "布尔值",
+        Value::Number(_) => "数字",
+        Value::String(_) => "字符串",
+        Value::Array(_) => "数组",
+        Value::Object(_) => "对象",
+    }
+}
+
+fn header_of(text: &str, spec: &FieldSpec) -> Result<Vec<String>, String> {
+    // The structural formats name their columns in their own way: XML carries
+    // the name in each <col>, HTML in the <th> row, Excel in the first <Row>
+    // (which has no ss:Type distinction).
+    let fields: Vec<String> = match spec.mode.as_str() {
+        "xml" => {
+            let mut names = Vec::new();
+            let mut rest = text;
+            while let Some(start) = rest.find("<col") {
+                rest = &rest[start..];
+                let tag_end = match rest.find('>') {
+                    Some(end) => end,
+                    None => break,
+                };
+                match attr_value(&rest[..=tag_end], "name") {
+                    Some(name) => names.push(name.to_string()),
+                    None => return Err("XML 列缺少 name 属性".to_string()),
+                }
+                rest = &rest[tag_end + 1..];
+            }
+            names
+        }
+        "html" => {
+            let mut names = Vec::new();
+            let mut rest = text;
+            while let Some(start) = rest.find("<th") {
+                rest = &rest[start..];
+                let tag_end = match rest.find('>') {
+                    Some(end) => end,
+                    None => break,
+                };
+                let body = inner_of(rest, "th").unwrap_or("");
+                names.push(xml_unescape(body));
+                rest = &rest[tag_end + 1..];
+            }
+            names
+        }
+        "spreadsheet" => match parse_spreadsheet_row(text)? {
+            ParsedRow::Positional(values) => values
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                })
+                .collect(),
+            ParsedRow::Keyed(map) => map.keys().cloned().collect(),
+        },
+        "markdown" => match parse_markdown_row(text)? {
+            ParsedRow::Positional(values) => values
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                })
+                .collect(),
+            ParsedRow::Keyed(map) => map.keys().cloned().collect(),
+        },
+        _ => split_fields(text, &spec.field_sep, &spec.quote, &spec.escape, true)?,
+    };
+    if fields.is_empty() {
+        return Err("表头为空".to_string());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (i, name) in fields.iter().enumerate() {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(format!("表头第 {} 列为空", i + 1));
+        }
+        if names.iter().any(|n| n == &name) {
+            return Err(format!("表头列名重复: '{}'", name));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+// ---------------------------------------------------------------- table types
+
+#[derive(Clone, Debug)]
+pub struct TableColumn {
+    pub name: String,
+    pub data_type: String,
+    pub type_name: String,
+    pub nullable: bool,
+    pub auto_increment: bool,
+}
+
+impl TableColumn {
+    fn kind(&self) -> ColumnKind {
+        let raw = if self.data_type.trim().is_empty() {
+            &self.type_name
+        } else {
+            &self.data_type
+        };
+        column_kind(raw)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnKind {
+    Int,
+    Float,
+    Bool,
+    Json,
+    Date,
+    Binary,
+    Text,
+}
+
+pub fn column_kind(data_type: &str) -> ColumnKind {
+    let mut norm = data_type.trim().to_ascii_lowercase();
+    if let Some(pos) = norm.find('(') {
+        norm.truncate(pos);
+    }
+    let norm = norm.trim().to_string();
+    if norm.contains("json") {
+        return ColumnKind::Json;
+    }
+    if norm == "bool" || norm == "boolean" || norm == "bit" {
+        return ColumnKind::Bool;
+    }
+    if (norm.contains("int")
+        && !norm.contains("interval")
+        && !norm.contains("point")
+        && !norm.contains("print"))
+        || norm == "serial"
+        || norm == "bigserial"
+        || norm == "smallserial"
+    {
+        return ColumnKind::Int;
+    }
+    if norm.contains("numeric")
+        || norm.contains("decimal")
+        || norm.contains("float")
+        || norm.contains("double")
+        || norm.contains("real")
+        || norm.contains("money")
+    {
+        return ColumnKind::Float;
+    }
+    if norm.contains("date") || norm.contains("time") || norm == "year" {
+        return ColumnKind::Date;
+    }
+    if norm.contains("blob") || norm.contains("binary") || norm == "bytea" {
+        return ColumnKind::Binary;
+    }
+    if norm.contains("char") || norm.contains("text") || norm.contains("clob") {
+        return ColumnKind::Text;
+    }
+    ColumnKind::Text
+}
+
+/// Extract the destination columns from a structure response.
+pub fn columns_from_structure(structure: &Value) -> Vec<TableColumn> {
+    let mut out = Vec::new();
+    let Some(columns) = structure.get("columns").and_then(|c| c.as_array()) else {
+        return out;
+    };
+    for column in columns {
+        let name = column
+            .get("name")
+            .or_else(|| column.get("COLUMN_NAME"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(TableColumn {
+            name,
+            data_type: column
+                .get("DATA_TYPE")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            type_name: column
+                .get("type_name")
+                .or_else(|| column.get("COLUMN_TYPE"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            nullable: column
+                .get("IS_NULLABLE")
+                .and_then(|v| v.as_str())
+                .map(|v| !v.eq_ignore_ascii_case("NO"))
+                .unwrap_or(true),
+            auto_increment: column
+                .get("EXTRA")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_ascii_lowercase().contains("auto_increment"))
+                .unwrap_or(false),
+        });
+    }
+    out
+}
+
+/// Resolved column mapping: destination metadata plus ordered sources.
+#[derive(Clone, Debug)]
+pub struct ResolvedMapping {
+    pub columns: Vec<TableColumn>,
+    pub sources: Vec<Value>,
+    pub keyed: bool,
+}
+
+/// Validate a mapping against the real table before any row is read.
+pub fn resolve_mapping(
+    mapping: &MappingSpec,
+    table_columns: &[TableColumn],
+) -> AppResult<ResolvedMapping> {
+    if mapping.columns.is_empty() {
+        return Err(AppError::bad("请先设置列映射（至少映射一列）"));
+    }
+    let mut keyed: Option<bool> = None;
+    let mut columns = Vec::new();
+    let mut sources = Vec::new();
+    let mut seen_columns: Vec<String> = Vec::new();
+    for entry in &mapping.columns {
+        let column = entry.column.trim().to_string();
+        if column.is_empty() {
+            return Err(AppError::bad("列映射包含空的目标列名"));
+        }
+        if seen_columns.iter().any(|c| c == &column) {
+            return Err(AppError::bad(format!("列 '{}' 被映射了多次", column)));
+        }
+        let Some(meta) = table_columns.iter().find(|c| c.name == column) else {
+            return Err(AppError::bad(format!(
+                "目标表不存在列 '{}'，请重新选择映射",
+                column
+            )));
+        };
+        let this_keyed = match &entry.source {
+            Value::String(_) => true,
+            Value::Number(n) => {
+                if n.as_u64().is_none() {
+                    return Err(AppError::bad(format!(
+                        "列 '{}' 的位置序号必须是非负整数",
+                        column
+                    )));
+                }
+                false
+            }
+            _ => {
+                return Err(AppError::bad(format!(
+                    "列 '{}' 的来源必须是列名（字典）或位置序号（无列名）",
+                    column
+                )))
+            }
+        };
+        match keyed {
+            None => keyed = Some(this_keyed),
+            Some(k) if k != this_keyed => {
+                return Err(AppError::bad(
+                    "列映射不能混用“按列名”和“按位置”两种来源".to_string(),
+                ))
+            }
+            _ => {}
+        }
+        seen_columns.push(column);
+        columns.push(meta.clone());
+        sources.push(entry.source.clone());
+    }
+    Ok(ResolvedMapping {
+        columns,
+        sources,
+        keyed: keyed.unwrap_or(true),
+    })
+}
+
+/// Turn the configured NULL token into a real `null` for the preview echo.
+///
+/// The final conversion happens in [convert_value] during validate/execute, but
+/// the wizard's "here is how your rule reads the file" panel has to show NULL
+/// where the file means NULL - otherwise the marker looks like literal text and
+/// the user cannot tell whether the rule is right.
+fn mark_null_token(value: Value) -> Value {
+    match value {
+        Value::String(s) if s == "\\N" => Value::Null,
+        other => other,
+    }
+}
+
+fn mark_null_tokens(values: Vec<Value>) -> Vec<Value> {
+    values.into_iter().map(mark_null_token).collect()
+}
+
+fn convert_value(raw: &Value, column: &TableColumn, mapping: &MappingSpec) -> Result<Value, String> {
+    if raw.is_null() {
+        return Ok(Value::Null);
+    }
+    let kind = column.kind();
+    let mut text: Option<String> = None;
+    if let Value::String(s) = raw {
+        let mut s = s.clone();
+        if mapping.trim_values {
+            s = s.trim().to_string();
+        }
+        if mapping.null_tokens.iter().any(|t| t == &s) {
+            return Ok(Value::Null);
+        }
+        if s.is_empty() {
+            // Empty is NULL for every non-text column. JSON goes here too: an
+            // empty string is not a valid JSON document, so keeping it would
+            // only fail later at INSERT time.
+            if mapping.empty_as_null || !matches!(kind, ColumnKind::Text) {
+                return Ok(Value::Null);
+            }
+            return Ok(Value::String(String::new()));
+        }
+        text = Some(s);
+    }
+    match kind {
+        ColumnKind::Int => {
+            let s = text.as_deref().unwrap_or("");
+            if !s.is_empty() {
+                let cleaned = s.replace([',', '_'], "");
+                if let Ok(v) = cleaned.parse::<i64>() {
+                    return Ok(json!(v));
+                }
+                if let Ok(v) = cleaned.parse::<u64>() {
+                    return Ok(json!(v));
+                }
+                return Err(format!(
+                    "列 '{}' 需要整数，但值是 '{}'",
+                    column.name,
+                    snippet(s, 40)
+                ));
+            }
+            match raw {
+                Value::Number(n) if n.is_i64() || n.is_u64() => Ok(raw.clone()),
+                Value::Number(_) => Err(format!("列 '{}' 需要整数，但值是小数", column.name)),
+                Value::Bool(b) => Ok(if *b { json!(1) } else { json!(0) }),
+                _ => Err(format!("列 '{}' 需要整数", column.name)),
+            }
+        }
+        ColumnKind::Float => {
+            let s = text.as_deref().unwrap_or("");
+            if !s.is_empty() {
+                let cleaned = s.replace([',', '_'], "");
+                if cleaned.parse::<f64>().is_err() {
+                    return Err(format!(
+                        "列 '{}' 需要数字，但值是 '{}'",
+                        column.name,
+                        snippet(s, 40)
+                    ));
+                }
+                // Keep the original text: the database parses decimals without
+                // the precision loss of an f64 round-trip.
+                return Ok(Value::String(cleaned));
+            }
+            match raw {
+                Value::Number(_) => Ok(raw.clone()),
+                Value::Bool(b) => Ok(if *b { json!(1) } else { json!(0) }),
+                _ => Err(format!("列 '{}' 需要数字", column.name)),
+            }
+        }
+        ColumnKind::Bool => {
+            if let Value::Bool(b) = raw {
+                return Ok(Value::Bool(*b));
+            }
+            let s = text.as_deref().unwrap_or("").to_ascii_lowercase();
+            let value = match s.as_str() {
+                "1" | "t" | "true" | "y" | "yes" | "on" => Some(true),
+                "0" | "f" | "false" | "n" | "no" | "off" => Some(false),
+                _ => None,
+            };
+            match value {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Err(format!(
+                    "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
+                    column.name,
+                    snippet(s.as_str(), 40)
+                )),
+            }
+        }
+        ColumnKind::Date => match raw {
+            Value::String(s) => Ok(Value::String(s.clone())),
+            _ => Err(format!(
+                "列 '{}' 是日期时间类型，请使用文本格式（如 2024-01-02 03:04:05）",
+                column.name
+            )),
+        },
+        ColumnKind::Json => match raw {
+            Value::String(s) => {
+                if serde_json::from_str::<Value>(s).is_err() {
+                    return Err(format!(
+                        "列 '{}' 是 JSON 类型，但值是 '{}'，不是合法的 JSON 文本",
+                        column.name,
+                        snippet(s, 40)
+                    ));
+                }
+                Ok(Value::String(s.clone()))
+            }
+            Value::Object(_) | Value::Array(_) => Ok(raw.clone()),
+            other => Ok(Value::String(other.to_string())),
+        },
+        ColumnKind::Binary => Err(format!(
+            "列 '{}' 是二进制/BLOB 类型，暂不支持从文本文件导入",
+            column.name
+        )),
+        ColumnKind::Text => match raw {
+            Value::String(s) => Ok(Value::String(s.clone())),
+            Value::Null => Ok(Value::Null),
+            other => Ok(Value::String(other.to_string())),
+        },
+    }
+}
+
+/// Convert one parsed record into the ordered values for the INSERT.
+fn map_record(
+    row: &ParsedRow,
+    resolved: &ResolvedMapping,
+    mapping: &MappingSpec,
+) -> Result<Vec<Value>, String> {
+    match row {
+        ParsedRow::Keyed(map) => {
+            if !resolved.keyed {
+                return Err("文件记录是字典格式（带列名），但列映射使用的是位置序号".to_string());
+            }
+            let mut values = Vec::with_capacity(resolved.sources.len());
+            for (i, source) in resolved.sources.iter().enumerate() {
+                let Some(key) = source.as_str() else {
+                    return Err("列映射来源类型错误".to_string());
+                };
+                let column = &resolved.columns[i];
+                match map.get(key) {
+                    Some(raw) => values.push(convert_value(raw, column, mapping)?),
+                    None if column.nullable || column.auto_increment => {
+                        values.push(Value::Null)
+                    }
+                    None => {
+                        return Err(format!(
+                            "缺少字段 '{}'（目标列 '{}' 不允许 NULL）",
+                            key, column.name
+                        ))
+                    }
+                }
+            }
+            if !mapping.ignore_unknown {
+                for key in map.keys() {
+                    if !resolved.sources.iter().any(|s| s.as_str() == Some(key)) {
+                        return Err(format!("记录多出未映射的字段 '{}'", key));
+                    }
+                }
+            }
+            Ok(values)
+        }
+        ParsedRow::Positional(fields) => {
+            if resolved.keyed {
+                return Err("文件记录没有列名（数组/分隔文本），但列映射使用的是列名".to_string());
+            }
+            // A SHORT record is not an error: an export may legitimately omit
+            // trailing columns (older exporters did exactly that), so missing
+            // positions are read as NULL. Only EXTRA fields are reported - they
+            // mean the rule split the record differently than the mapping
+            // expects, and silently dropping them would lose data.
+            if fields.len() > resolved.sources.len() {
+                return Err(format!(
+                    "记录有 {} 个字段，但列映射只有 {} 列（字段数多于列映射）",
+                    fields.len(),
+                    resolved.sources.len()
+                ));
+            }
+            let mut values = Vec::with_capacity(resolved.sources.len());
+            for (i, source) in resolved.sources.iter().enumerate() {
+                let Some(index) = source.as_u64() else {
+                    return Err("列映射来源类型错误".to_string());
+                };
+                let index = index as usize;
+                // Positions past the end of a short record are NULL (see above).
+                let raw = fields.get(index).cloned().unwrap_or(Value::Null);
+                values.push(convert_value(&raw, &resolved.columns[i], mapping)?);
+            }
+            Ok(values)
+        }
+    }
+}
+
+/// Build the column list for INSERT from a resolved mapping.
+pub fn mapping_column_names(resolved: &ResolvedMapping) -> Vec<String> {
+    resolved.columns.iter().map(|c| c.name.clone()).collect()
+}
+
+/// Render one multi-row INSERT statement.
+pub fn build_insert_sql(
+    driver: DriverKind,
+    database: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Value>],
+) -> String {
+    let target = qualify(driver, database, table);
+    let cols = columns
+        .iter()
+        .map(|c| qi(driver, c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut values = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push('(');
+        for (j, value) in row.iter().enumerate() {
+            if j > 0 {
+                values.push(',');
+            }
+            values.push_str(&literal(driver, value));
+        }
+        values.push(')');
+    }
+    format!("INSERT INTO {target} ({cols}) VALUES {values}")
+}
+
+/// Full INSERT of one row, used by the probe ("试插入") dialog.
+pub fn build_single_insert_sql(
+    driver: DriverKind,
+    database: &str,
+    table: &str,
+    columns: &[String],
+    values: &[Value],
+) -> String {
+    let rows = vec![values.to_vec()];
+    build_insert_sql(driver, database, table, columns, &rows)
+}
+
+// ---------------------------------------------------------------- inspection
+
+#[derive(Clone, Debug)]
+pub struct FileInfo {
+    pub size: u64,
+    pub name: String,
+}
+
+pub fn file_info(path: &str) -> AppResult<FileInfo> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(AppError::bad("请选择文件"));
+    }
+    let meta = std::fs::metadata(path).map_err(|e| AppError::bad(format!("无法读取文件: {e}")))?;
+    if !meta.is_file() {
+        return Err(AppError::bad("选择的路径不是文件"));
+    }
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    Ok(FileInfo {
+        size: meta.len(),
+        name,
+    })
+}
+
+pub fn read_prefix(path: &str, max: usize) -> AppResult<Vec<u8>> {
+    let mut file = File::open(path).map_err(|e| AppError::bad(format!("无法打开文件: {e}")))?;
+    let mut buf = vec![0u8; max.min(16 * 1024 * 1024)];
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| AppError::bad(format!("读取文件失败: {e}")))?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+pub fn read_suffix(path: &str, max: usize) -> AppResult<Vec<u8>> {
+    let mut file = File::open(path).map_err(|e| AppError::bad(format!("无法打开文件: {e}")))?;
+    let size = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| AppError::bad(format!("读取文件失败: {e}")))?;
+    let take = (max as u64).min(size) as usize;
+    file.seek(SeekFrom::Start(size - take as u64))
+        .map_err(|e| AppError::bad(format!("读取文件失败: {e}")))?;
+    let mut buf = vec![0u8; take];
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| AppError::bad(format!("读取文件失败: {e}")))?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Inspect a data file and suggest a read/field rule.
+pub fn inspect(path: &str) -> AppResult<Value> {
+    let info = file_info(path)?;
+    let head = read_prefix(path, 16 * 1024)?;
+    let tail = read_suffix(path, 8 * 1024)?;
+    let (bom, encoding) = detect_bom(&head);
+    let mut warnings: Vec<String> = Vec::new();
+    if encoding == "utf-16le" || encoding == "utf-16be" {
+        warnings.push("文件是 UTF-16 编码，暂不支持；请另存为 UTF-8".to_string());
+    }
+    let body = &head[bom.min(head.len())..];
+    let head_str = String::from_utf8_lossy(body).to_string();
+    let tail_str = String::from_utf8_lossy(&tail).to_string();
+    if !body.is_empty() && std::str::from_utf8(body).is_err() {
+        warnings.push(
+            "文件开头不是 UTF-8 文本（可能是 GBK/GB18030），请在编辑器中另存为 UTF-8 后导入"
+                .to_string(),
+        );
+    }
+
+    let ext = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let trimmed = head_str
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .to_string();
+    let tail_trimmed = tail_str.trim_end().to_string();
+
+    let mut read = ReadSpec::default();
+    let mut fields = FieldSpec::default();
+    let format: String;
+    // The structural formats the exporter writes. Each one is recognised by
+    // its extension OR by its own opening marker, because a file renamed to
+    // .txt still has to import.
+    // Excel (SpreadsheetML) is XML too, so it has to be tested FIRST or the
+    // generic XML branch would claim the workbook and look for <rows>.
+    if ext == "xls" || trimmed.contains("mso-application progid=\"Excel.Sheet\"") {
+        format = "excel".to_string();
+        fields.mode = "spreadsheet".to_string();
+        fields.header = true;
+        read.mode = "wrapped".to_string();
+        // The workbook opens with an <?xml?> prolog, so the wrapper PREFIX cannot
+        // match, but </Table> terminates the row list.
+        read.wrapper_start = String::new();
+        read.wrapper_end = "</Table>".to_string();
+        read.record_sep = "</Row>".to_string();
+        read.quote = String::new();
+    } else if ext == "xml" || trimmed.starts_with("<?xml") || trimmed.starts_with("<rows") {
+        format = "xml".to_string();
+        fields.mode = "xml".to_string();
+        read.mode = "wrapped".to_string();
+        // The document opens with an <?xml?> prolog, so a literal wrapper PREFIX
+        // cannot match, but </rows> is still needed as the terminator: without it
+        // the closing tag would be read as one more record.
+        read.wrapper_start = String::new();
+        read.wrapper_end = "</rows>".to_string();
+        read.record_sep = "</row>".to_string();
+        // Quotes are irrelevant here; disabling them keeps <col name="x"> from
+        // being mistaken for an unterminated string.
+        read.quote = String::new();
+        if !trimmed.contains("<rows") {
+            warnings.push("文件里没有 <rows> 根元素，可能不是本应用导出的 XML".to_string());
+        }
+    } else if ext == "html" || ext == "htm" || trimmed.starts_with("<!doctype") || trimmed.starts_with("<table") {
+        format = "html".to_string();
+        fields.mode = "html".to_string();
+        fields.header = true;
+        read.mode = "wrapped".to_string();
+        // The document opens with <!doctype html>, so the wrapper PREFIX cannot
+        // match, but </tbody> terminates the row list.
+        read.wrapper_start = String::new();
+        read.wrapper_end = "</tbody>".to_string();
+        read.record_sep = "</tr>".to_string();
+        read.quote = String::new();
+    } else if ext == "md" || ext == "markdown" || looks_like_markdown(&trimmed) {
+        format = "markdown".to_string();
+        fields.mode = "markdown".to_string();
+        fields.header = true;
+        read.mode = "line".to_string();
+        read.quote = String::new();
+    } else if matches!(ext.as_str(), "jsonl" | "ndjson" | "jsonlines") {
+        format = "json_lines".to_string();
+        fields.mode = "json".to_string();
+    } else if ext == "csv" || ext == "tsv" || ext == "tab" || ext == "txt" || ext.is_empty() {
+        format = "delimited".to_string();
+        detect_delimited(&trimmed, &ext, &mut fields);
+    } else if ext == "json" || trimmed.starts_with('[') || trimmed.starts_with('{') {
+        if trimmed.starts_with('[') {
+            format = "json_array".to_string();
+            read.mode = "wrapped".to_string();
+            read.wrapper_start = "[".to_string();
+            read.wrapper_end = "]".to_string();
+            read.record_sep = ",".to_string();
+            fields.mode = "json".to_string();
+            if !tail_trimmed.ends_with(']') {
+                warnings.push("文件结尾不是 ']'，JSON 数组可能不完整".to_string());
+            }
+        } else if ext == "json" || trimmed.starts_with('{') {
+            format = "json_lines".to_string();
+            fields.mode = "json".to_string();
+            warnings.push(
+                "每行一个 JSON 记录才能按行导入；若整个文件是一个多行 JSON 对象，请改用其他工具"
+                    .to_string(),
+            );
+        } else {
+            format = "delimited".to_string();
+            detect_delimited(&trimmed, &ext, &mut fields);
+        }
+    } else {
+        format = "delimited".to_string();
+        detect_delimited(&trimmed, &ext, &mut fields);
+    }
+
+    Ok(json!({
+        "path": path,
+        "name": info.name,
+        "size": info.size,
+        "encoding": encoding,
+        "format": format,
+        "read": read,
+        "fields": fields,
+        "head": snippet_keep(&head_str, 4000),
+        "tail": snippet_keep(&tail_str, 2000),
+        "warnings": warnings,
+    }))
+}
+
+/// First line starts with `|` and the second is a `| --- |` rule.
+fn looks_like_markdown(text: &str) -> bool {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or("");
+    let second = lines.next().unwrap_or("");
+    first.trim_start().starts_with('|') && is_markdown_rule(second)
+}
+
+fn detect_delimited(text: &str, ext: &str, fields: &mut FieldSpec) {
+    fields.mode = "delimited".to_string();
+    let first = text.lines().next().unwrap_or("");
+    let tabs = first.matches('\t').count();
+    let commas = first.matches(',').count();
+    let semis = first.matches(';').count();
+    let pipes = first.matches('|').count();
+    let sep = if ext == "tsv" || ext == "tab" || (tabs > 0 && tabs >= commas) {
+        "\t"
+    } else if commas > 0 {
+        ","
+    } else if semis > commas {
+        ";"
+    } else if pipes > commas {
+        "|"
+    } else {
+        ","
+    };
+    fields.field_sep = sep.to_string();
+    fields.quote = "\"".to_string();
+    fields.trim = true;
+    // Header heuristic: the first record has the same field count as the
+    // second and consists of non-numeric labels.
+    if let Some(second) = text.lines().nth(1) {
+        let first_fields = split_fields(first, sep, "\"", "", true).unwrap_or_default();
+        let second_fields = split_fields(second, sep, "\"", "", true).unwrap_or_default();
+        let first_all_text = first_fields
+            .iter()
+            .all(|v| v.parse::<f64>().is_err());
+        fields.header = !first_fields.is_empty()
+            && first_fields.len() == second_fields.len()
+            && first_all_text;
+    }
+}
+
+fn snippet_keep(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+// ---------------------------------------------------------------- preview
+
+/// Read a few records and parse them so the wizard can echo back exactly how
+/// the current rule splits the file.
+pub fn preview(spec: &ParseSpec, limit: usize) -> AppResult<Value> {
+    let info = file_info(&spec.path)?;
+    let limit = limit.clamp(1, MAX_PREVIEW_RECORDS);
+    let mut scanner = RecordScanner::open(spec)?;
+    let mut records: Vec<Value> = Vec::new();
+    let mut issues: Vec<Value> = Vec::new();
+    let mut header: Option<Vec<String>> = None;
+    let mut header_done = !spec.fields.header || !matches!(spec.fields.mode.as_str(), "delimited" | "xml" | "html" | "spreadsheet" | "markdown");
+    let mut read_bytes = 0u64;
+    while records.len() < limit {
+        match scanner.next()? {
+            None => break,
+            Some(ScanItem::Problem(problem)) => {
+                issues.push(issue_json(
+                    records.len() as u64,
+                    problem.line,
+                    problem.offset,
+                    &problem.message,
+                    "",
+                ));
+                if problem.fatal {
+                    break;
+                }
+            }
+            Some(ScanItem::Record(record)) => {
+                read_bytes = record.offset;
+                let mut item = json!({
+                    "index": record.index,
+                    "line": record.line,
+                    "offset": record.offset,
+                    "text": snippet_keep(&record.text, 4000),
+                    "text_truncated": record.text.chars().count() > 4000,
+                });
+                if !header_done {
+                    header_done = true;
+                    match header_of(&record.text, &spec.fields) {
+                        Ok(names) => {
+                            item["header"] = json!(true);
+                            item["values"] = json!(names.clone());
+                            item["field_count"] = json!(names.len());
+                            header = Some(names);
+                            records.push(item);
+                            continue;
+                        }
+                        Err(message) => {
+                            item["error"] = json!(message.clone());
+                            issues.push(issue_json(
+                                record.index,
+                                record.line,
+                                record.offset,
+                                &format!("表头解析失败: {message}"),
+                                &record.text,
+                            ));
+                            records.push(item);
+                            continue;
+                        }
+                    }
+                }
+                match parse_row(&record.text, &spec.fields) {
+                    Ok(ParsedRow::Keyed(map)) => {
+                        let keys: Vec<String> = map.keys().cloned().collect();
+                        item["kind"] = json!("object");
+                        item["field_count"] = json!(map.len());
+                        item["keys"] = json!(keys);
+                        let mut marked = Map::new();
+                        for (k, v) in map {
+                            marked.insert(k, mark_null_token(v));
+                        }
+                        item["values"] = json!(marked);
+                    }
+                    Ok(ParsedRow::Positional(values)) => {
+                        item["kind"] = json!("array");
+                        item["field_count"] = json!(values.len());
+                        item["values"] = json!(mark_null_tokens(values));
+                    }
+                    Err(message) => {
+                        item["error"] = json!(message.clone());
+                        let mut with_snippet = issue_json(
+                            record.index,
+                            record.line,
+                            record.offset,
+                            &message,
+                            &record.text,
+                        );
+                        with_snippet["snippet"] = json!(snippet(&record.text, 120));
+                        issues.push(with_snippet);
+                    }
+                }
+                records.push(item);
+            }
+        }
+    }
+    Ok(json!({
+        "path": spec.path,
+        "size": info.size,
+        "records": records,
+        "header": header,
+        "issues": issues,
+        "read_bytes": read_bytes,
+    }))
+}
+
+fn issue_json(index: u64, line: u64, offset: u64, message: &str, text: &str) -> Value {
+    json!({
+        "index": index,
+        "line": line,
+        "offset": offset,
+        "message": message,
+        "snippet": snippet(text, 120),
+    })
+}
+
+/// Parse the first data record and convert it with the configured mapping.
+///
+/// Used by the "试插入" step: the returned values are inserted inside a rolled
+/// back transaction so the UI can show the exact effect without modifying data.
+pub fn probe_first_row(spec: &ValidateSpec, table_columns: &[TableColumn]) -> AppResult<Value> {
+    let mapping = spec
+        .mapping
+        .as_ref()
+        .ok_or_else(|| AppError::bad("请先设置列映射"))?;
+    let resolved = resolve_mapping(mapping, table_columns)?;
+    let mut scanner = RecordScanner::open(&spec.parse)?;
+    let mut header: Option<Vec<String>> = None;
+    let mut header_pending = spec.parse.fields.header && matches!(spec.parse.fields.mode.as_str(), "delimited" | "xml" | "html" | "spreadsheet" | "markdown");
+    loop {
+        match scanner.next()? {
+            None => return Err(AppError::bad("文件中没有可导入的数据记录")),
+            Some(ScanItem::Problem(problem)) => {
+                return Err(AppError::bad(format!(
+                    "第 {} 行（字节 {}）: {}",
+                    problem.line, problem.offset, problem.message
+                )))
+            }
+            Some(ScanItem::Record(record)) => {
+                let parsed = if header_pending {
+                    header_pending = false;
+                    match header_of(&record.text, &spec.parse.fields) {
+                        Ok(names) => {
+                            header = Some(names);
+                            continue;
+                        }
+                        Err(message) => return Err(AppError::bad(
+                            format!("第 {} 行表头解析失败: {}", record.line, message)
+                        )),
+                    }
+                } else {
+                    parse_row(&record.text, &spec.parse.fields)
+                };
+                let row = match parsed {
+                    Err(message) => {
+                        return Err(AppError::bad(format!(
+                            "第 {} 行记录解析失败: {}",
+                            record.line, message
+                        )))
+                    }
+                    Ok(row) => row,
+                };
+                let row = if let Some(header) = &header {
+                    match row {
+                        ParsedRow::Positional(values) => {
+                            // Short rows pad with NULL; only extra fields are an
+                            // error (see resolve_mapping for the reasoning).
+                            if values.len() > header.len() {
+                                return Err(AppError::bad(format!(
+                                    "第 {} 行有 {} 个字段，表头只有 {} 列",
+                                    record.line,
+                                    values.len(),
+                                    header.len()
+                                )));
+                            }
+                            let mut map = Map::new();
+                            for (i, name) in header.iter().enumerate() {
+                                map.insert(
+                                    name.clone(),
+                                    values.get(i).cloned().unwrap_or(Value::Null),
+                                );
+                            }
+                            ParsedRow::Keyed(map)
+                        }
+                        keyed => keyed,
+                    }
+                } else {
+                    row
+                };
+                let values = map_record(&row, &resolved, mapping)
+                    .map_err(|e| AppError::bad(format!("第 {} 行: {}", record.line, e)))?;
+                return Ok(json!({
+                    "record": {
+                        "index": record.index,
+                        "line": record.line,
+                        "offset": record.offset,
+                        "text": snippet(&record.text, 200),
+                    },
+                    "header": header,
+                    "preview": match row {
+                        ParsedRow::Keyed(map) => json!({"kind": "object", "values": map}),
+                        ParsedRow::Positional(values) => json!({"kind": "array", "values": values}),
+                    },
+                    "columns": mapping_column_names(&resolved),
+                    "values": values,
+                }));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- validation
+
+/// Validate the whole file against the read/field rules (and, when a mapping is
+/// supplied, the mapping + type conversion).
+///
+/// Returns immediately on a fatal structural problem; per-record failures are
+/// counted and the first max_issues are returned with their position.
+pub fn validate(
+    spec: &ValidateSpec,
+    table_columns: Option<&[TableColumn]>,
+    max_issues: usize,
+    total_bytes: u64,
+    progress: &(dyn Fn(&Progress) + Sync),
+    cancel: &AtomicBool,
+) -> AppResult<Value> {
+    let started = Instant::now();
+    let max_issues = max_issues.clamp(1, 1_000);
+    let mut resolved = None;
+    if let Some(mapping) = &spec.mapping {
+        let columns = table_columns.ok_or_else(|| AppError::bad("校验列映射需要目标表结构"))?;
+        resolved = Some(resolve_mapping(mapping, columns)?);
+    }
+    let mut scanner = RecordScanner::open(&spec.parse)?;
+    let mut issues: Vec<Value> = Vec::new();
+    let mut progress_state = Progress {
+        phase: "validating".to_string(),
+        total_bytes,
+        ..Default::default()
+    };
+    let mut bytes_read = 0u64;
+    let mut records = 0u64;
+    let mut data_records = 0u64;
+    let mut valid = 0u64;
+    let mut invalid = 0u64;
+    let mut fatal = false;
+    let mut header: Option<Vec<String>> = None;
+    let mut header_pending = spec.parse.fields.header && matches!(spec.parse.fields.mode.as_str(), "delimited" | "xml" | "html" | "spreadsheet" | "markdown");
+    let mut cancelled = false;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let item = match scanner.next()? {
+            None => break,
+            Some(item) => item,
+        };
+        match item {
+            ScanItem::Problem(problem) => {
+                if issues.len() < max_issues {
+                    issues.push(issue_json(
+                        records,
+                        problem.line,
+                        problem.offset,
+                        &problem.message,
+                        "",
+                    ));
+                }
+                if problem.fatal {
+                    fatal = true;
+                    break;
+                }
+                invalid += 1;
+            }
+            ScanItem::Record(record) => {
+                records += 1;
+                bytes_read = record.offset.max(bytes_read);
+                let parsed = if header_pending {
+                    header_pending = false;
+                    match header_of(&record.text, &spec.parse.fields) {
+                        Ok(names) => {
+                            header = Some(names);
+                            progress_state.records = records;
+                            progress_state.bytes = bytes_read;
+                            progress_state.refresh(started);
+                            progress(&progress_state);
+                            continue;
+                        }
+                        Err(message) => Err(format!("表头解析失败: {}", message)),
+                    }
+                } else {
+                    parse_row(&record.text, &spec.parse.fields)
+                };
+                let result: Result<(), String> = match parsed {
+                    Err(message) => Err(message),
+                    Ok(row) => {
+                        let row = if let Some(header) = &header {
+                            match row {
+                                ParsedRow::Positional(values) => {
+                                    if values.len() > header.len() {
+                                        Err(format!(
+                                            "记录有 {} 个字段，表头只有 {} 列",
+                                            values.len(),
+                                            header.len()
+                                        ))
+                                    } else {
+                                        let mut map = Map::new();
+                                        for (i, name) in header.iter().enumerate() {
+                                            map.insert(
+                                                name.clone(),
+                                                values.get(i).cloned().unwrap_or(Value::Null),
+                                            );
+                                        }
+                                        Ok(ParsedRow::Keyed(map))
+                                    }
+                                }
+                                keyed => Ok(keyed),
+                            }
+                        } else {
+                            Ok(row)
+                        };
+                        match row {
+                            Ok(row) => match (&resolved, &spec.mapping) {
+                                (Some(resolved), Some(mapping)) => {
+                                    map_record(&row, resolved, mapping).map(|_| ())
+                                }
+                                _ => Ok(()),
+                            },
+                            Err(message) => Err(message),
+                        }
+                    }
+                };
+                match result {
+                    Ok(()) => valid += 1,
+                    Err(message) => {
+                        invalid += 1;
+                        if issues.len() < max_issues {
+                            let mut issue = issue_json(
+                                record.index,
+                                record.line,
+                                record.offset,
+                                &message,
+                                &record.text,
+                            );
+                            issue["snippet"] = json!(snippet(&record.text, 120));
+                            issues.push(issue);
+                        }
+                    }
+                }
+                data_records += 1;
+            }
+        }
+        progress_state.bytes = bytes_read;
+        progress_state.records = records;
+        progress_state.rows = data_records;
+        progress_state.failed = invalid;
+        progress_state.refresh(started);
+        progress(&progress_state);
+    }
+    if !fatal && !cancelled && bytes_read < total_bytes {
+        bytes_read = total_bytes;
+    }
+    progress_state.bytes = bytes_read;
+    progress_state.phase = "done".to_string();
+    progress_state.records = records;
+    progress_state.rows = data_records;
+    progress_state.failed = invalid;
+    progress_state.refresh(started);
+    progress(&progress_state);
+
+    Ok(json!({
+        "ok": !fatal && invalid == 0,
+        "cancelled": cancelled,
+        "fatal": fatal,
+        "bytes": bytes_read,
+        "total_bytes": total_bytes,
+        "records": records,
+        "data_records": data_records,
+        "valid": valid,
+        "invalid": invalid,
+        "issues": issues,
+        "header": header,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    }))
+}
+
+// ---------------------------------------------------------------- execution
+
+/// Stream the file and INSERT it in batches.
+///
+/// Reading stays incremental and inserts are multi-row statements; rows that
+/// fail conversion are reported with their position and either abort the run
+/// (on_error = stop) or are skipped (skip). A failed batch is retried row by row
+/// in skip mode so one bad row does not hide the rest.
+#[allow(unused_assignments)]
+pub async fn execute(
+    driver: &dyn crate::core::driver::DatabaseDriver,
+    conn: &crate::core::connection::ConnectionHandle,
+    spec: &ExecuteSpec,
+    table_columns: &[TableColumn],
+    total_bytes: u64,
+    progress: &(dyn Fn(&Progress) + Sync),
+    cancel: &AtomicBool,
+) -> AppResult<Value> {
+    let started = Instant::now();
+    let mapping = spec
+        .validate
+        .mapping
+        .as_ref()
+        .ok_or_else(|| AppError::bad("请先设置列映射"))?;
+    let resolved = resolve_mapping(mapping, table_columns)?;
+    let columns = mapping_column_names(&resolved);
+    let database = spec
+        .validate
+        .database
+        .as_deref()
+        .ok_or_else(|| AppError::bad("缺少目标数据库"))?;
+    let table = spec
+        .validate
+        .table
+        .as_deref()
+        .ok_or_else(|| AppError::bad("缺少目标表"))?;
+    let options = &spec.options;
+    let batch_size = options.batch_size.clamp(1, MAX_BATCH_SIZE);
+    let max_issues = options.max_issues.clamp(1, 1_000);
+    let skip_errors = options.on_error == "skip";
+
+    let mut scanner = RecordScanner::open(&spec.validate.parse)?;
+    let mut progress_state = Progress {
+        phase: "importing".to_string(),
+        total_bytes,
+        ..Default::default()
+    };
+    let mut bytes_read = 0u64;
+    let mut records = 0u64;
+    let mut data_records = 0u64;
+    let mut rows_inserted = 0u64;
+    let mut rows_failed = 0u64;
+    let mut batches = 0u64;
+    let mut issues: Vec<Value> = Vec::new();
+    let mut header: Option<Vec<String>> = None;
+    let mut header_pending =
+        spec.validate.parse.fields.header && spec.validate.parse.fields.mode == "delimited";
+    let mut cancelled = false;
+    let mut stopped = false;
+    let mut stop_message = String::new();
+
+    type Row = (u64, u64, u64, Vec<Value>);
+    let mut batch: Vec<Row> = Vec::new();
+    let mut batch_bytes: usize = 0;
+
+    macro_rules! report_issue {
+        ($index:expr, $line:expr, $offset:expr, $message:expr, $text:expr) => {{
+            rows_failed += 1;
+            if issues.len() < max_issues {
+                let mut issue = issue_json($index, $line, $offset, $message, "");
+                issue["snippet"] = json!(snippet($text, 120));
+                issues.push(issue);
+            }
+        }};
+    }
+
+    macro_rules! flush_batch {
+        () => {{
+            if !batch.is_empty() {
+                let rows: Vec<Vec<Value>> = batch.iter().map(|r| r.3.clone()).collect();
+                let sql = build_insert_sql(driver.kind(), database, table, &columns, &rows);
+                let result = conn.run_one(sql).await;
+                batches += 1;
+                if let Some(error) = result.error {
+                    if skip_errors {
+                        // Retry one row at a time to find the exact offenders.
+                        for (index, line, offset, values) in batch.iter() {
+                            let sql = build_single_insert_sql(
+                                driver.kind(),
+                                database,
+                                table,
+                                &columns,
+                                values,
+                            );
+                            let result = conn.run_one(sql).await;
+                            match result.error {
+                                Some(error) => {
+                                    report_issue!(
+                                        *index,
+                                        *line,
+                                        *offset,
+                                        &format!("插入失败: {}", error),
+                                        ""
+                                    );
+                                }
+                                None => rows_inserted += 1,
+                            }
+                        }
+                    } else {
+                        stopped = true;
+                        stop_message = format!("批量插入失败: {}", error);
+                        if issues.len() < max_issues {
+                            let (index, line, offset, _) = &batch[0];
+                            let mut issue = issue_json(
+                                *index,
+                                *line,
+                                *offset,
+                                &stop_message,
+                                "",
+                            );
+                            issue["snippet"] = json!("");
+                            issues.push(issue);
+                        }
+                    }
+                } else {
+                    rows_inserted += batch.len() as u64;
+                }
+                batch.clear();
+                batch_bytes = 0;
+            }
+        }};
+    }
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let item = match scanner.next()? {
+            None => break,
+            Some(item) => item,
+        };
+        match item {
+            ScanItem::Problem(problem) => {
+                if problem.fatal {
+                    stopped = true;
+                    stop_message = problem.message.clone();
+                    report_issue!(
+                        records,
+                        problem.line,
+                        problem.offset,
+                        &problem.message,
+                        ""
+                    );
+                    break;
+                }
+                report_issue!(
+                    records,
+                    problem.line,
+                    problem.offset,
+                    &problem.message,
+                    ""
+                );
+            }
+            ScanItem::Record(record) => {
+                records += 1;
+                bytes_read = record.offset.max(bytes_read);
+                let parsed = if header_pending {
+                    header_pending = false;
+                    match header_of(&record.text, &spec.validate.parse.fields) {
+                        Ok(names) => {
+                            header = Some(names);
+                            progress_state.records = records;
+                            progress_state.bytes = bytes_read;
+                            progress_state.refresh(started);
+                            progress(&progress_state);
+                            continue;
+                        }
+                        Err(message) => Err(format!("表头解析失败: {}", message)),
+                    }
+                } else {
+                    parse_row(&record.text, &spec.validate.parse.fields)
+                };
+                let row: Result<Vec<Value>, String> = match parsed {
+                    Err(message) => Err(message),
+                    Ok(row) => {
+                        let row = if let Some(header) = &header {
+                            match row {
+                                ParsedRow::Positional(values) => {
+                                    if values.len() > header.len() {
+                                        Err(format!(
+                                            "记录有 {} 个字段，表头只有 {} 列",
+                                            values.len(),
+                                            header.len()
+                                        ))
+                                    } else {
+                                        let mut map = Map::new();
+                                        for (i, name) in header.iter().enumerate() {
+                                            map.insert(
+                                                name.clone(),
+                                                values.get(i).cloned().unwrap_or(Value::Null),
+                                            );
+                                        }
+                                        Ok(ParsedRow::Keyed(map))
+                                    }
+                                }
+                                keyed => Ok(keyed),
+                            }
+                        } else {
+                            Ok(row)
+                        };
+                        match row {
+                            Ok(row) => map_record(&row, &resolved, mapping),
+                            Err(message) => Err(message),
+                        }
+                    }
+                };
+                match row {
+                    Err(message) => {
+                        report_issue!(
+                            record.index,
+                            record.line,
+                            record.offset,
+                            &message,
+                            &record.text
+                        );
+                        if !skip_errors {
+                            stopped = true;
+                            stop_message = message;
+                            break;
+                        }
+                    }
+                    Ok(values) => {
+                        data_records += 1;
+                        batch_bytes += values
+                            .iter()
+                            .map(|v| literal(driver.kind(), v).len() + 2)
+                            .sum::<usize>();
+                        batch.push((record.index, record.line, record.offset, values));
+                        if batch.len() >= batch_size || batch_bytes >= MAX_BATCH_SQL_BYTES {
+                            flush_batch!();
+                            if stopped {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        progress_state.bytes = bytes_read;
+        progress_state.records = records;
+        progress_state.rows = rows_inserted;
+        progress_state.failed = rows_failed;
+        progress_state.refresh(started);
+        progress(&progress_state);
+        if stopped {
+            break;
+        }
+    }
+    if !stopped && !cancelled {
+        flush_batch!();
+    }
+    if !cancelled && bytes_read < total_bytes {
+        bytes_read = total_bytes;
+    }
+    progress_state.bytes = bytes_read;
+    progress_state.phase = if cancelled {
+        "cancelled".to_string()
+    } else {
+        "done".to_string()
+    };
+    progress_state.records = records;
+    progress_state.rows = rows_inserted;
+    progress_state.failed = rows_failed;
+    progress_state.refresh(started);
+    progress(&progress_state);
+
+    Ok(json!({
+        "ok": rows_failed == 0 && !stopped && !cancelled,
+        "cancelled": cancelled,
+        "stopped": stopped,
+        "message": stop_message,
+        "bytes": bytes_read,
+        "total_bytes": total_bytes,
+        "records": records,
+        "data_records": data_records,
+        "rows_inserted": rows_inserted,
+        "rows_failed": rows_failed,
+        "batches": batches,
+        "issues": issues,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    }))
+}
+
+// ---------------------------------------------------------------- SQL scripts
+
+/// One statement found by the streaming SQL-file reader.
+#[derive(Clone, Debug)]
+pub struct SqlStatement {
+    pub sql: String,
+    pub offset: u64,
+    pub line: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScriptProblem {
+    pub message: String,
+    pub offset: u64,
+    pub line: u64,
+    pub fatal: bool,
+}
+
+pub enum ScriptItem {
+    Statement(SqlStatement),
+    Problem(ScriptProblem),
+}
+
+enum CharOutcome {
+    Char(char),
+    Eof,
+    Invalid,
+}
+
+/// Streaming equivalent of db::split_statements for files.
+///
+/// It keeps the same semantics (quotes, line/block comments, DELIMITER
+/// directives) but reads the file in 64 KiB chunks, so importing a multi-GB dump
+/// never loads it into memory. One statement is buffered at a time, capped by
+/// MAX_SQL_STATEMENT_BYTES.
+pub struct SqlScriptReader {
+    stream: ByteStream,
+    state: u8,
+    cur: String,
+    has_code: bool,
+    delimiter: Vec<u8>,
+    /// PostgreSQL dollar-quote tag currently open (state 6), e.g. `$$`.
+    dollar_tag: Vec<u8>,
+    stmt_offset: u64,
+    stmt_line: u64,
+    done: bool,
+}
+
+impl SqlScriptReader {
+    pub fn open(path: &str) -> AppResult<Self> {
+        Ok(SqlScriptReader {
+            stream: ByteStream::open(path)?,
+            state: 0,
+            cur: String::new(),
+            has_code: false,
+            delimiter: b";".to_vec(),
+            dollar_tag: Vec::new(),
+            stmt_offset: 0,
+            stmt_line: 1,
+            done: false,
+        })
+    }
+
+    pub fn bytes_read(&self) -> u64 {
+        self.stream.abs
+    }
+
+    pub fn next_statement(&mut self) -> AppResult<Option<ScriptItem>> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            if self.stream.at_eof()? {
+                self.done = true;
+                if self.has_code {
+                    return Ok(self.take_statement().map(|s| s));
+                }
+                return Ok(None);
+            }
+            if let Some(problem) = self.maybe_delimiter()? {
+                self.done = true;
+                return Ok(Some(ScriptItem::Problem(problem)));
+            }
+            // PostgreSQL dollar-quoted body: copy bytes verbatim until the exact
+            // closing tag appears, so embedded semicolons never split it.
+            if self.state == 6 {
+                if !self.dollar_tag.is_empty() && self.stream.starts_with(&self.dollar_tag.clone())? {
+                    let tag = String::from_utf8_lossy(&self.dollar_tag).to_string();
+                    let len = self.dollar_tag.len();
+                    self.stream.advance(len);
+                    self.cur.push_str(&tag);
+                    self.state = 0;
+                    self.dollar_tag.clear();
+                    continue;
+                }
+                let (pos, line) = self.stream.position();
+                let ch = match self.next_char()? {
+                    CharOutcome::Char(c) => c,
+                    CharOutcome::Eof => continue,
+                    CharOutcome::Invalid => {
+                        self.done = true;
+                        return Ok(Some(ScriptItem::Problem(ScriptProblem {
+                            message: "文件不是有效的 UTF-8 文本（可能是 GBK/GB18030 编码）"
+                                .to_string(),
+                            offset: pos,
+                            line,
+                            fatal: true,
+                        })));
+                    }
+                };
+                self.cur.push(ch);
+                continue;
+            }
+            // A dollar-quote opener starts a body; `$1` is a parameter, not a quote.
+            if self.state == 0 && self.stream.peek()? == Some(b'$') {
+                let (pos, line) = self.stream.position();
+                if let Some(tag) = self.peek_dollar_tag()? {
+                    let text = String::from_utf8_lossy(&tag).to_string();
+                    self.stream.advance(tag.len());
+                    self.cur.push_str(&text);
+                    self.dollar_tag = tag;
+                    self.mark_code(pos, line);
+                    self.state = 6;
+                    continue;
+                }
+            }
+            if self.state == 0 && self.stream.starts_with(&self.delimiter.clone())? {
+                let len = self.delimiter.len();
+                self.stream.advance(len);
+                if self.has_code {
+                    return Ok(self.take_statement());
+                }
+                self.cur.clear();
+                self.has_code = false;
+                continue;
+            }
+            // Comment openers are detected before consuming so the two
+            // characters stay together.
+            if self.state == 0 && self.stream.starts_with(b"--")? {
+                self.stream.advance(2);
+                self.cur.push_str("--");
+                self.state = 4;
+                continue;
+            }
+            if self.state == 0 && self.stream.starts_with(b"/*")? {
+                let (pos, line) = self.stream.position();
+                if self.stream.peek_at(2)? == Some(b'!') {
+                    // MySQL executable comment (`/*!NNNNN ... */`): keep it as
+                    // code so the server can execute it, instead of dropping the
+                    // whole statement as a comment.
+                    self.mark_code(pos, line);
+                    self.stream.advance(2);
+                    self.cur.push_str("/*");
+                    self.state = 0;
+                    continue;
+                }
+                self.stream.advance(2);
+                self.cur.push_str("/*");
+                self.state = 5;
+                continue;
+            }
+            if self.state == 0 && self.stream.starts_with(b"#")? {
+                self.stream.advance(1);
+                self.cur.push('#');
+                self.state = 4;
+                continue;
+            }
+            let (pos, line) = self.stream.position();
+            let ch = match self.next_char()? {
+                CharOutcome::Char(c) => c,
+                CharOutcome::Eof => continue,
+                CharOutcome::Invalid => {
+                    self.done = true;
+                    return Ok(Some(ScriptItem::Problem(ScriptProblem {
+                        message: "文件不是有效的 UTF-8 文本（可能是 GBK/GB18030 编码）"
+                            .to_string(),
+                        offset: pos,
+                        line,
+                        fatal: true,
+                    })));
+                }
+            };
+            match self.state {
+                0 => match ch {
+                    '\'' => {
+                        self.mark_code(pos, line);
+                        self.state = 1;
+                        self.cur.push(ch);
+                    }
+                    '"' => {
+                        self.mark_code(pos, line);
+                        self.state = 2;
+                        self.cur.push(ch);
+                    }
+                    BT_CHAR => {
+                        self.mark_code(pos, line);
+                        self.state = 3;
+                        self.cur.push(ch);
+                    }
+                    _ => {
+                        if !ch.is_whitespace() {
+                            self.mark_code(pos, line);
+                        }
+                        self.cur.push(ch);
+                    }
+                },
+                1 => {
+                    if ch == '\\' {
+                        self.cur.push(ch);
+                        if let CharOutcome::Char(next) = self.next_char()? {
+                            self.cur.push(next);
+                        }
+                    } else {
+                        if ch == '\'' {
+                            self.state = 0;
+                        }
+                        self.cur.push(ch);
+                    }
+                }
+                2 => {
+                    if ch == '\\' {
+                        self.cur.push(ch);
+                        if let CharOutcome::Char(next) = self.next_char()? {
+                            self.cur.push(next);
+                        }
+                    } else {
+                        if ch == '"' {
+                            self.state = 0;
+                        }
+                        self.cur.push(ch);
+                    }
+                }
+                3 => {
+                    if ch == BT_CHAR {
+                        self.state = 0;
+                    }
+                    self.cur.push(ch);
+                }
+                4 => {
+                    self.cur.push(ch);
+                    if ch == '\n' {
+                        self.state = 0;
+                    }
+                }
+                5 => {
+                    self.cur.push(ch);
+                    if ch == '*' && self.stream.starts_with(b"/")? {
+                        self.stream.advance(1);
+                        self.cur.push('/');
+                        self.state = 0;
+                    }
+                }
+                _ => {}
+            }
+            if self.cur.len() > MAX_SQL_STATEMENT_BYTES {
+                self.done = true;
+                return Ok(Some(ScriptItem::Problem(ScriptProblem {
+                    message: format!(
+                        "单条 SQL 语句超过 {} 字节，请拆分后导入",
+                        MAX_SQL_STATEMENT_BYTES
+                    ),
+                    offset: self.stmt_offset,
+                    line: self.stmt_line,
+                    fatal: true,
+                })));
+            }
+        }
+    }
+
+    fn mark_code(&mut self, offset: u64, line: u64) {
+        if !self.has_code {
+            self.stmt_offset = offset;
+            self.stmt_line = line;
+            self.has_code = true;
+        }
+    }
+
+    fn take_statement(&mut self) -> Option<ScriptItem> {
+        let sql = self.cur.trim().to_string();
+        let offset = self.stmt_offset;
+        let line = self.stmt_line;
+        self.cur.clear();
+        self.has_code = false;
+        if sql.is_empty() {
+            return None;
+        }
+        Some(ScriptItem::Statement(SqlStatement { sql, offset, line }))
+    }
+
+    /// DELIMITER xxx directive: recognised at the start of a statement, like
+    /// the synchronous splitter does.
+    fn maybe_delimiter(&mut self) -> AppResult<Option<ScriptProblem>> {
+        if self.state != 0 || self.has_code {
+            return Ok(None);
+        }
+        if !self.stream.starts_with_ascii_ci("delimiter")? {
+            return Ok(None);
+        }
+        // The keyword must be followed by whitespace (otherwise it is a plain
+        // identifier such as delimiter_count).
+        let after = self.stream.peek_at(9)?;
+        if !matches!(after, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')) {
+            return Ok(None);
+        }
+        let (offset, line) = self.stream.position();
+        let mut i = 0usize;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            match self.stream.peek_at(i)? {
+                None | Some(b'\n') => break,
+                Some(b) => {
+                    bytes.push(b);
+                    i += 1;
+                    if i > 1024 {
+                        return Ok(Some(ScriptProblem {
+                            message: "DELIMITER 指令行过长".to_string(),
+                            offset,
+                            line,
+                            fatal: true,
+                        }));
+                    }
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let token = text.get(9..).unwrap_or("").trim().to_string();
+        self.stream.advance(i);
+        if matches!(self.stream.peek()?, Some(b'\n')) {
+            self.stream.advance(1);
+        }
+        if !token.is_empty() {
+            self.delimiter = token.as_bytes().to_vec();
+        }
+        Ok(None)
+    }
+
+    /// Recognise a PostgreSQL dollar-quote opener at the current position.
+    ///
+    /// The caller has already checked that the current byte is `$`. Returns the
+    /// full tag (`$$` or `$name$`) or None when this is an ordinary dollar
+    /// (e.g. the `$1` positional parameter, which may not open a body).
+    fn peek_dollar_tag(&mut self) -> AppResult<Option<Vec<u8>>> {
+        if self.stream.peek_at(1)? == Some(b'$') {
+            return Ok(Some(b"$$".to_vec()));
+        }
+        let mut name: Vec<u8> = Vec::new();
+        let mut i = 1usize;
+        loop {
+            match self.stream.peek_at(i)? {
+                None => return Ok(None),
+                Some(b'$') => {
+                    if name.is_empty() {
+                        return Ok(None);
+                    }
+                    let mut tag = Vec::with_capacity(name.len() + 2);
+                    tag.push(b'$');
+                    tag.extend_from_slice(&name);
+                    tag.push(b'$');
+                    return Ok(Some(tag));
+                }
+                Some(b) if b.is_ascii_alphanumeric() || b == b'_' => {
+                    if name.is_empty() && b.is_ascii_digit() {
+                        return Ok(None);
+                    }
+                    name.push(b);
+                    i += 1;
+                    if i > 130 {
+                        return Ok(None);
+                    }
+                }
+                Some(_) => return Ok(None),
+            }
+        }
+    }
+
+    fn next_char(&mut self) -> AppResult<CharOutcome> {
+        self.stream.ensure(4)?;
+        if self.stream.remaining() == 0 {
+            return Ok(CharOutcome::Eof);
+        }
+        let first = match self.stream.peek()? {
+            Some(b) => b,
+            None => return Ok(CharOutcome::Eof),
+        };
+        let len = match first {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return Ok(CharOutcome::Invalid),
+        };
+        self.stream.ensure(len)?;
+        if self.stream.remaining() < len {
+            return Ok(CharOutcome::Invalid);
+        }
+        let mut bytes = [0u8; 4];
+        for (i, slot) in bytes.iter_mut().enumerate().take(len) {
+            *slot = self.stream.peek_at(i)?.unwrap_or(0);
+        }
+        match std::str::from_utf8(&bytes[..len]) {
+            Ok(s) => {
+                let ch = s.chars().next().unwrap_or('\u{fffd}');
+                self.stream.advance(len);
+                Ok(CharOutcome::Char(ch))
+            }
+            Err(_) => Ok(CharOutcome::Invalid),
+        }
+    }
+}
+
+/// Backtick, spelled without a literal backtick so this file stays easy to
+/// embed in tooling that treats that character specially.
+const BT_CHAR: char = '\u{60}';
+
+// ------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_file(name: &str, content: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("rma-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn parse_spec(path: &str, read: ReadSpec, fields: FieldSpec) -> ParseSpec {
+        ParseSpec {
+            path: path.to_string(),
+            read,
+            fields,
+        }
+    }
+
+    fn csv_fields(header: bool, sep: &str) -> FieldSpec {
+        FieldSpec {
+            mode: "delimited".to_string(),
+            field_sep: sep.to_string(),
+            quote: "\"".to_string(),
+            escape: String::new(),
+            trim: true,
+            header,
+        }
+    }
+
+    fn int_column(name: &str) -> TableColumn {
+        TableColumn {
+            name: name.to_string(),
+            data_type: "int".to_string(),
+            type_name: "int".to_string(),
+            nullable: false,
+            auto_increment: false,
+        }
+    }
+
+    fn text_column(name: &str) -> TableColumn {
+        TableColumn {
+            name: name.to_string(),
+            data_type: "varchar".to_string(),
+            type_name: "varchar(20)".to_string(),
+            nullable: true,
+            auto_increment: false,
+        }
+    }
+
+    #[test]
+    fn split_fields_handles_quotes_and_commas() {
+        let fields =
+            split_fields("1,\"a,b\",\"say \"\"hi\"\"\",x", ",", "\"", "", true).unwrap();
+        assert_eq!(fields, vec!["1", "a,b", "say \"hi\"", "x"]);
+    }
+
+    #[test]
+    fn line_reader_reports_csv_rows() {
+        let path = temp_file("a.csv", "id,name\n1,Ada\n2,\"Bob, Jr\"\n");
+        let spec = parse_spec(&path, ReadSpec::default(), csv_fields(true, ","));
+        let preview = preview(&spec, 10).unwrap();
+        let records = preview["records"].as_array().unwrap();
+        assert_eq!(records.len(), 3, "{}", preview);
+        assert_eq!(preview["header"], json!(["id", "name"]));
+        assert_eq!(records[2]["kind"], json!("array"));
+        assert_eq!(records[2]["values"], json!(["2", "Bob, Jr"]));
+    }
+
+    #[test]
+    fn quoted_newline_stays_in_one_record() {
+        let path = temp_file("b.csv", "a,b\n1,\"line1\nline2\"\n2,x\n");
+        let spec = parse_spec(&path, ReadSpec::default(), csv_fields(false, ","));
+        let preview = preview(&spec, 10).unwrap();
+        let records = preview["records"].as_array().unwrap();
+        assert_eq!(records.len(), 3, "{}", preview);
+        assert_eq!(records[1]["field_count"], json!(2));
+        assert_eq!(records[1]["values"][1], json!("line1\nline2"));
+    }
+
+    #[test]
+    fn wrapped_json_array_splits_at_depth_zero() {
+        let path = temp_file(
+            "c.json",
+            "[\n {\"id\":1,\"tags\":[1,2]},\n {\"id\":2,\"tags\":[]}\n]\n",
+        );
+        let mut read = ReadSpec::default();
+        read.mode = "wrapped".to_string();
+        read.wrapper_start = "[".to_string();
+        read.wrapper_end = "]".to_string();
+        read.record_sep = ",".to_string();
+        let fields = FieldSpec {
+            mode: "json".to_string(),
+            ..Default::default()
+        };
+        let spec = parse_spec(&path, read, fields);
+        let preview = preview(&spec, 10).unwrap();
+        let records = preview["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2, "{}", preview);
+        assert_eq!(records[0]["kind"], json!("object"));
+        assert_eq!(records[0]["values"]["id"], json!(1));
+        assert_eq!(records[1]["values"]["tags"], json!([]));
+    }
+
+    #[test]
+    fn preview_reports_missing_wrapper_position() {
+        let path = temp_file("d.txt", "{\"id\":1}\n");
+        let mut read = ReadSpec::default();
+        read.mode = "wrapped".to_string();
+        read.wrapper_start = "[".to_string();
+        read.wrapper_end = "]".to_string();
+        read.record_sep = ",".to_string();
+        let fields = FieldSpec {
+            mode: "json".to_string(),
+            ..Default::default()
+        };
+        let spec = parse_spec(&path, read, fields);
+        let preview = preview(&spec, 10).unwrap();
+        let issues = preview["issues"].as_array().unwrap();
+        assert!(!issues.is_empty(), "{}", preview);
+        assert!(issues[0]["message"].as_str().unwrap().contains("包裹符"));
+    }
+
+    #[test]
+    fn validate_reports_bad_rows_with_positions() {
+        let path = temp_file("e.csv", "id,name\n1,Ada\nx,Bob\n3,Cy\n");
+        let spec = parse_spec(&path, ReadSpec::default(), csv_fields(true, ","));
+        let columns = vec![int_column("id"), text_column("name")];
+        let mapping = MappingSpec {
+            columns: vec![
+                ColumnMap {
+                    column: "id".to_string(),
+                    source: json!("id"),
+                },
+                ColumnMap {
+                    column: "name".to_string(),
+                    source: json!("name"),
+                },
+            ],
+            ..Default::default()
+        };
+        let validate_spec = ValidateSpec {
+            parse: spec,
+            mapping: Some(mapping),
+            database: Some("main".to_string()),
+            table: Some("t".to_string()),
+        };
+        let result = validate(
+            &validate_spec,
+            Some(&columns),
+            100,
+            0,
+            &(|_| {}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result["invalid"], json!(1), "{}", result);
+        let issues = result["issues"].as_array().unwrap();
+        assert!(
+            issues[0]["message"].as_str().unwrap().contains("整数"),
+            "{}",
+            result
+        );
+        assert_eq!(issues[0]["line"], json!(3));
+    }
+
+    #[test]
+    fn type_conversion_rejects_text_in_number_column() {
+        let column = int_column("id");
+        let mapping = MappingSpec::default();
+        assert!(convert_value(&json!("12"), &column, &mapping).is_ok());
+        assert!(convert_value(&json!("12.5"), &column, &mapping).is_err());
+        assert!(convert_value(&json!("abc"), &column, &mapping).is_err());
+    }
+
+    #[test]
+    fn sql_reader_splits_statements_and_honours_delimiter() {
+        let path = temp_file(
+            "f.sql",
+            "-- comment\nCREATE TABLE t(x INT);\nINSERT INTO t VALUES (1);\n\
+             DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END//\nDELIMITER ;\n",
+        );
+        let mut reader = SqlScriptReader::open(&path).unwrap();
+        let mut statements = Vec::new();
+        while let Some(item) = reader.next_statement().unwrap() {
+            match item {
+                ScriptItem::Statement(stmt) => statements.push(stmt.sql),
+                ScriptItem::Problem(problem) => panic!("unexpected problem: {:?}", problem),
+            }
+        }
+        assert_eq!(statements.len(), 3, "{:?}", statements);
+        assert!(statements[0].contains("CREATE TABLE"));
+        assert!(statements[1].contains("INSERT INTO"));
+        assert!(statements[2].contains("CREATE PROCEDURE"));
+        assert!(statements[2].contains("SELECT 1; END"));
+    }
+
+    #[test]
+    fn sql_reader_keeps_dollar_quoted_and_executable_comment_statements() {
+        let path = temp_file(
+            "dollar.sql",
+            "CREATE FUNCTION f() RETURNS void AS $$ BEGIN PERFORM 1; PERFORM 2; END $$ LANGUAGE plpgsql;\n             /*!50001 CREATE VIEW v AS SELECT 1 */;\n             SELECT 3;\n",
+        );
+        let mut reader = SqlScriptReader::open(&path).unwrap();
+        let mut statements = Vec::new();
+        while let Some(item) = reader.next_statement().unwrap() {
+            match item {
+                ScriptItem::Statement(stmt) => statements.push(stmt.sql),
+                ScriptItem::Problem(problem) => panic!("unexpected problem: {:?}", problem),
+            }
+        }
+        assert_eq!(statements.len(), 3, "{:?}", statements);
+        assert!(statements[0].contains("PERFORM 2;"), "{}", statements[0]);
+        assert!(statements[0].ends_with("LANGUAGE plpgsql"), "{}", statements[0]);
+        assert!(statements[1].starts_with("/*!50001 CREATE VIEW"), "{}", statements[1]);
+        assert_eq!(statements[2], "SELECT 3");
+    }
+
+    #[test]
+    fn sql_reader_does_not_treat_dollar_parameters_as_quotes() {
+        let path = temp_file("params.sql", "UPDATE t SET a=$1, b=$2 WHERE id=$3;\n");
+        let mut reader = SqlScriptReader::open(&path).unwrap();
+        let mut statements = Vec::new();
+        while let Some(item) = reader.next_statement().unwrap() {
+            if let ScriptItem::Statement(stmt) = item {
+                statements.push(stmt.sql);
+            }
+        }
+        assert_eq!(statements.len(), 1, "{:?}", statements);
+        assert!(statements[0].contains("$1"));
+    }
+
+    #[test]
+    fn inspect_detects_json_array_and_csv() {
+        let json_path = temp_file("g.json", "[{\"a\":1},{\"a\":2}]");
+        let info = inspect(&json_path).unwrap();
+        assert_eq!(info["format"], json!("json_array"));
+        assert_eq!(info["read"]["wrapper_start"], json!("["));
+        assert_eq!(info["read"]["record_sep"], json!(","));
+
+        let csv_path = temp_file("h.csv", "id,name\n1,Ada\n2,Bob\n");
+        let info = inspect(&csv_path).unwrap();
+        assert_eq!(info["format"], json!("delimited"));
+        assert_eq!(info["fields"]["header"], json!(true));
+        assert_eq!(info["fields"]["field_sep"], json!(","));
+    }
+
+    #[test]
+    fn wrapped_custom_text_with_begin_end_and_newline_separator() {
+        let path = temp_file(
+            "i.txt",
+            "BEGIN\n1|Ada\n2|Bob\nEND\n",
+        );
+        let mut read = ReadSpec::default();
+        read.mode = "wrapped".to_string();
+        read.wrapper_start = "BEGIN".to_string();
+        read.wrapper_end = "END".to_string();
+        read.record_sep = "\n".to_string();
+        let fields = FieldSpec {
+            mode: "delimited".to_string(),
+            field_sep: "|".to_string(),
+            ..Default::default()
+        };
+        let spec = parse_spec(&path, read, fields);
+        let preview = preview(&spec, 10).unwrap();
+        let records = preview["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2, "{}", preview);
+        assert_eq!(records[0]["values"], json!(["1", "Ada"]));
+        assert_eq!(records[1]["values"], json!(["2", "Bob"]));
+    }
+
+    #[test]
+    fn wrapped_custom_text_reports_the_line_of_a_bad_record() {
+        let path = temp_file(
+            "j.txt",
+            "BEGIN\n1|Ada\n2|Bob\ntoo|many|fields\nEND\n",
+        );
+        let mut read = ReadSpec::default();
+        read.mode = "wrapped".to_string();
+        read.wrapper_start = "BEGIN".to_string();
+        read.wrapper_end = "END".to_string();
+        read.record_sep = "\n".to_string();
+        let fields = FieldSpec {
+            mode: "delimited".to_string(),
+            field_sep: "|".to_string(),
+            ..Default::default()
+        };
+        let mapping = MappingSpec {
+            columns: vec![
+                ColumnMap {
+                    column: "id".to_string(),
+                    source: json!(0),
+                },
+                ColumnMap {
+                    column: "name".to_string(),
+                    source: json!(1),
+                },
+            ],
+            ..Default::default()
+        };
+        let validate_spec = ValidateSpec {
+            parse: parse_spec(&path, read, fields),
+            mapping: Some(mapping),
+            database: Some("main".to_string()),
+            table: Some("t".to_string()),
+        };
+        let columns = vec![int_column("id"), text_column("name")];
+        let result = validate(
+            &validate_spec,
+            Some(&columns),
+            100,
+            0,
+            &(|_| {}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result["invalid"], json!(1), "{}", result);
+        let issue = &result["issues"][0];
+        assert_eq!(issue["line"], json!(4), "{}", result);
+        assert!(
+            issue["message"].as_str().unwrap().contains("字段数"),
+            "{}",
+            result
+        );
+    }
+
+    #[test]
+    fn sql_reader_streams_across_chunk_boundaries() {
+        let mut script = String::new();
+        for i in 0..4000 {
+            script.push_str(&format!("INSERT INTO t VALUES ({});\n", i));
+        }
+        assert!(script.len() > 64 * 1024, "must cross the 64 KiB read chunk");
+        let path = temp_file("k.sql", &script);
+        let mut reader = SqlScriptReader::open(&path).unwrap();
+        let mut count = 0usize;
+        let mut last = String::new();
+        while let Some(item) = reader.next_statement().unwrap() {
+            match item {
+                ScriptItem::Statement(stmt) => {
+                    count += 1;
+                    last = stmt.sql;
+                }
+                ScriptItem::Problem(problem) => panic!("unexpected problem: {:?}", problem),
+            }
+        }
+        assert_eq!(count, 4000);
+        assert_eq!(last, "INSERT INTO t VALUES (3999)");
+    }
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+    use super::*;
+    use crate::db::ColumnMeta;
+    use crate::exporters;
+    use serde_json::json;
+
+    /// Columns and rows that exercise every awkward case: a NULL, an empty
+    /// string, a comma inside a value, an XML-significant character, and a row
+    /// SHORTER than the column list.
+    fn sample() -> (Vec<ColumnMeta>, Vec<Vec<Value>>) {
+        let cols = vec![
+            ColumnMeta { name: "id".into(), type_name: "INTEGER".into() },
+            ColumnMeta { name: "name".into(), type_name: "TEXT".into() },
+            ColumnMeta { name: "note".into(), type_name: "TEXT".into() },
+        ];
+        let rows = vec![
+            vec![json!(1), json!("alice"), Value::Null],
+            vec![json!(2), Value::Null, json!("has,comma")],
+            vec![json!(3), json!("bob"), json!("")],
+            vec![json!(4), json!("a & b < c"), json!("x | y")],
+        ];
+        (cols, rows)
+    }
+
+    fn write_export(dir: &std::path::Path, format: &str) -> String {
+        let (cols, rows) = sample();
+        let (body, _, filename) =
+            exporters::render(format, "t", &cols, &rows).expect("format supported");
+        let path = dir.join(filename);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rma-rt-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn inspect_recognises_every_exporter_format() {
+        let dir = temp_dir("inspect");
+        // SQL is a script, not a record format; it is covered by the SQL reader tests.
+        for (format, expected) in [
+            ("csv", "delimited"),
+            ("txt", "delimited"),
+            ("json", "json_array"),
+            ("xml", "xml"),
+            ("html", "html"),
+            ("xls", "excel"),
+            ("md", "markdown"),
+        ] {
+            let path = write_export(&dir, format);
+            let info = inspect(&path).unwrap();
+            assert_eq!(
+                info["format"].as_str().unwrap(),
+                expected,
+                "{format} must be recognised as {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_format_previews_with_the_right_cell_count_and_null_placement() {
+        let dir = temp_dir("preview");
+        for format in ["csv", "txt", "json", "xml", "html", "xls", "md"] {
+            let path = write_export(&dir, format);
+            let info = inspect(&path).unwrap();
+            let spec = ParseSpec {
+                path: path.clone(),
+                read: serde_json::from_value(info["read"].clone()).unwrap(),
+                fields: serde_json::from_value(info["fields"].clone()).unwrap(),
+            };
+            let preview = preview(&spec, 10).unwrap();
+            let records = preview["records"].as_array().unwrap();
+            // The header is one of the records for delimited/xml/html/xls/md.
+            let data: Vec<&Value> = records
+                .iter()
+                .filter(|r| r["header"] != json!(true))
+                .collect();
+            assert_eq!(data.len(), 4, "{format}: four data records");
+            for record in &data {
+                assert_eq!(
+                    record["field_count"].as_u64().unwrap(),
+                    3,
+                    "{format}: every record must have 3 cells: {record}"
+                );
+            }
+            // Row 0 has a NULL note; row 2 has an EMPTY note.
+            let values = |i: usize| -> &Value { &data[i]["values"] };
+            let note_of = |i: usize| -> Value {
+                let v = values(i);
+                match v {
+                    Value::Object(map) => map.get("note").cloned().unwrap_or(Value::Null),
+                    Value::Array(items) => items.get(2).cloned().unwrap_or(Value::Null),
+                    other => other.clone(),
+                }
+            };
+            assert!(note_of(0).is_null(), "{format}: row 0 note must be NULL, got {}", note_of(0));
+            assert_eq!(
+                note_of(2),
+                json!(""),
+                "{format}: row 2 note must be the empty string"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_and_html_escape_sequences_round_trip() {
+        let dir = temp_dir("escape");
+        for format in ["xml", "html", "xls"] {
+            let path = write_export(&dir, format);
+            let info = inspect(&path).unwrap();
+            let spec = ParseSpec {
+                path: path.clone(),
+                read: serde_json::from_value(info["read"].clone()).unwrap(),
+                fields: serde_json::from_value(info["fields"].clone()).unwrap(),
+            };
+            let preview = preview(&spec, 10).unwrap();
+            let text = preview["records"].to_string();
+            assert!(
+                text.contains("a & b < c"),
+                "{format}: entities must be decoded again: {text}"
+            );
+        }
+    }
+}

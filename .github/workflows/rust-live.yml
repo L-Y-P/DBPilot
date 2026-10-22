@@ -1,0 +1,129 @@
+name: rust-live
+
+# 在真实 MySQL 8.4 / PostgreSQL 17 上跑 rust/ 的 hermetic + live 套件。
+# 数据库用仓库根的 docker-compose.live.yml 起（与本地一致），测试命令统一走
+# tools/run_live_tests.sh。发布仓库根 = desktop/ 目录，所以路径都没有 desktop/ 前缀。
+#
+# 数据库凭据一律走环境变量：compose 里 MySQL 允许空密码、PostgreSQL 用 trust，
+# Rust 侧从 DBPILOT_TEST_* 读取，脚本的端口探测用 MYSQL_* / PG_*。
+# 本文件不出现任何密码字面量。
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "rust/**"
+      - "tools/run_live_tests.sh"
+      - "docker-compose.live.yml"
+      - "Makefile"
+      - ".github/workflows/rust-live.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "tools/run_live_tests.sh"
+      - "docker-compose.live.yml"
+      - "Makefile"
+      - ".github/workflows/rust-live.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # MySQL 首次初始化约 30-40s，留足余量
+  RMA_WAIT_TIMEOUT: "120"
+  # --- 给 tools/run_live_tests.sh 的端口就绪探测 / 尽力探测 ---
+  MYSQL_HOST: "127.0.0.1"
+  MYSQL_PORT: "3306"
+  MYSQL_USER: "root"
+  MYSQL_PASSWORD: ""
+  PG_HOST: "127.0.0.1"
+  PG_PORT: "5432"
+  PG_USER: "postgres"
+  PG_PASSWORD: ""
+  PG_DB: "rustmyadmin_demo"
+  # --- 给 Rust live 测试（tests/common/mod.rs）读取的端点 ---
+  # PORT 是字符串，测试侧 parse 成 u16；PASSWORD 留空即空密码。
+  DBPILOT_TEST_MYSQL_HOST: "127.0.0.1"
+  DBPILOT_TEST_MYSQL_PORT: "3306"
+  DBPILOT_TEST_MYSQL_USER: "root"
+  DBPILOT_TEST_MYSQL_PASSWORD: ""
+  DBPILOT_TEST_MYSQL_DB: "rustmyadmin_demo"
+  DBPILOT_TEST_PG_HOST: "127.0.0.1"
+  DBPILOT_TEST_PG_PORT: "5432"
+  DBPILOT_TEST_PG_USER: "postgres"
+  DBPILOT_TEST_PG_PASSWORD: ""
+  DBPILOT_TEST_PG_DB: "rustmyadmin_demo"
+
+jobs:
+  live:
+    name: hermetic + live (MySQL 8.4 / PostgreSQL 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start MySQL and PostgreSQL
+        run: docker compose -f docker-compose.live.yml up -d --wait
+
+      - name: Show database containers
+        run: |
+          docker compose -f docker-compose.live.yml ps
+
+      - name: Install Rust (rustup)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc -vV
+          cargo -V
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/target
+          key: ${{ runner.os }}-rust-live-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-live-
+
+      # 先联网把依赖抓进 registry 缓存，之后 run_live_tests.sh 默认带 --offline 才能跑通
+      - name: Warm cargo registry
+        working-directory: rust
+        run: cargo fetch
+
+      - name: Hermetic and live suites
+        run: bash tools/run_live_tests.sh --no-wait
+
+      - name: Dump database logs on failure
+        if: failure()
+        run: |
+          echo "=== compose status ==="
+          docker compose -f docker-compose.live.yml ps
+          echo "=== compose logs (tail 200) ==="
+          docker compose -f docker-compose.live.yml logs --no-color --tail=200
+          echo "=== port check ==="
+          (command -v nc >/dev/null && nc -z -w 2 127.0.0.1 3306 && echo "3306 open") || echo "3306 closed"
+          (command -v nc >/dev/null && nc -z -w 2 127.0.0.1 5432 && echo "5432 open") || echo "5432 closed"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-live-test-logs
+          path: rust/target/live-test-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop databases
+        if: always()
+        run: docker compose -f docker-compose.live.yml down -v

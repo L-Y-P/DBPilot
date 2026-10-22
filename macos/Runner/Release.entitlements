@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The App Sandbox is disabled on purpose; see DebugProfile.entitlements for
+	  the full rationale. A database client must reach remote servers and the
+	  files the user selects, neither of which the sandbox permits.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- Outbound connections to database servers. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- file_picker checks this entitlement before opening a dialog; without
+	     it 浏览 / 导出 fail with ENTITLEMENT_NOT_FOUND even outside the sandbox. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+</dict>
+</plist>

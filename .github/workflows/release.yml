@@ -1,0 +1,337 @@
+name: release
+
+# 发布流程：push tag v*（或手动 workflow_dispatch 带 version）→
+#   1) meta：解析版本号，校验 pubspec.yaml 与 lib/src/app_version.dart 一致，生成 Release 说明；
+#   2) build：macOS + Windows 双平台出包；
+#   3) release：softprops/action-gh-release 建 Release 并上传 zip；
+#   4) manifest：把 version / url / notes 写进仓库根的 update.json 并提交回 main。
+# 客户端固定读取 https://raw.githubusercontent.com/L-Y-P/DBPilot/main/update.json 。
+# 发布仓库根 = desktop/ 目录，所以路径都没有 desktop/ 前缀。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不带 v，例如 1.0.0）；必须与 pubspec.yaml 的 version 一致"
+        required: false
+        type: string
+
+# 默认只读；只有真正需要写仓库的两个 job（release / manifest）单独提权。
+# 用内置 GITHUB_TOKEN，不需要任何额外 secrets。
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # 发版不允许被后来的 push 取消，否则会留下半个 Release
+  cancel-in-progress: false
+
+env:
+  # Flutter 版本与 build.yml 保持一致（项目实测版本）。
+  FLUTTER_VERSION: "3.47.7"
+  CARGO_TERM_COLOR: always
+  FLUTTER_SUPPRESS_ANALYTICS: "true"
+
+jobs:
+  # ---------------------------------------------------------------- meta ----
+  meta:
+    name: resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史与 tag 才能生成「上一个 tag 以来」的变更清单
+          fetch-depth: 0
+
+      - name: Resolve and verify version
+        id: v
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          PUBSPEC_VERSION="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml | head -1)"
+          APP_VERSION="$(sed -nE "s/^.*kAppVersion[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" lib/src/app_version.dart | head -1)"
+          echo "pubspec.yaml version = $PUBSPEC_VERSION"
+          echo "app_version.dart kAppVersion = $APP_VERSION"
+          if [ "$REF_TYPE" = "tag" ]; then
+            VERSION="${REF_NAME#v}"
+          else
+            VERSION="${INPUT_VERSION#v}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::workflow_dispatch 必须填 version（例如 1.0.0）"
+            exit 1
+          fi
+          if [ "$VERSION" != "$PUBSPEC_VERSION" ]; then
+            # 注意：$VAR 后面紧跟中文时必须写成 ${VAR}，否则 bash 3.2 会把多字节字符当成
+            # 变量名的一部分（set -u 下报 unbound variable）。下同。
+            echo "::error::版本不一致：tag/输入 = ${VERSION}，pubspec.yaml = ${PUBSPEC_VERSION}。请先改 pubspec.yaml 的 version 再打 tag。"
+            exit 1
+          fi
+          # 客户端「检查更新」拿 kAppVersion 与清单里的 version 比较，两处必须同步，
+          # 否则新版本推上去客户端仍报旧版本号，永远提示「已是最新」。
+          if [ "$APP_VERSION" != "$VERSION" ]; then
+            echo "::error::版本不一致：tag/输入 = ${VERSION}，lib/src/app_version.dart kAppVersion = ${APP_VERSION}。请同步 kAppVersion / kAppBuildNumber。"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "解析结果：v$VERSION"
+
+      - name: Build release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.v.outputs.version }}"
+          # 优先取「本 tag 的父提交之前」最近的 tag；workflow_dispatch（tag 还没建）时
+          # 退回到当前历史上最近的 tag，并把本版本自己排除掉。
+          PREV="$(git describe --tags --abbrev=0 "v$VERSION^" 2>/dev/null || git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ "$PREV" = "v$VERSION" ]; then PREV=""; fi
+          {
+            echo "DBPilot v$VERSION"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "自 $PREV 以来的变更："
+              git log --no-merges --pretty=format:'- %s (%h)' "$PREV..HEAD"
+            else
+              echo "首个发布版本。"
+            fi
+            echo
+            echo
+            echo "## 下载"
+            echo
+            echo "| 平台 | 文件 | 说明 |"
+            echo "| --- | --- | --- |"
+            echo "| macOS（universal，x86_64 + arm64） | DBPilot-$VERSION-macos.zip | 解压得到 DBPilot.app |"
+            echo "| Windows x64 | DBPilot-$VERSION-windows-x64.zip | 解压后运行 rust_myadmin_desktop.exe |"
+            echo
+            echo "> macOS 包为 ad-hoc 签名（未公证），首次打开请右键 → 打开，或执行："
+            # 反引号在双引号里会被当命令替换执行，这里用单引号整行输出
+            echo '> `xattr -dr com.apple.quarantine DBPilot.app`'
+            echo ">"
+            echo "> Windows 包未签名，SmartScreen 提示时选「更多信息 → 仍要运行」。"
+          } > release-body.md
+          echo "----- release-body.md -----"
+          cat release-body.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-body.md
+          if-no-files-found: error
+          retention-days: 3
+
+  # --------------------------------------------------------------- build ----
+  build:
+    name: build (${{ matrix.platform }})
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+            artifact: macos
+            # macOS 产物是 universal（x86_64 + arm64），两个 Rust target 都要预装。
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: windows-latest
+            platform: windows
+            artifact: windows-x64
+            rust_targets: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # tag 触发时默认 ref 就是该 tag；workflow_dispatch 时是触发分支
+          ref: ${{ github.ref }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      # 只缓存 cargo 的下载缓存（registry / git）。这里**故意不缓存 rust/target**：
+      # flutter build 走 cargokit，Rust 产物落在 build/ 下的 CARGOKIT_TARGET_TEMP_DIR；
+      # 全新 checkout 里没有 rust/target（.gitignore 掉了），缓存它只会让 actions/cache
+      # 报 "Path(s) ... do(es) not exist" 并白占仓库 10 GB 缓存配额。
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-build-
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build macOS
+        if: matrix.platform == 'macos'
+        run: flutter build macos --release
+
+      - name: Build Windows
+        if: matrix.platform == 'windows'
+        run: flutter build windows --release
+
+      - name: Package macOS
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          APP="build/macos/Build/Products/Release/DBPilot.app"
+          test -d "$APP" || { echo "::error::找不到 $APP"; exit 1; }
+          echo "产物架构：$(lipo -archs "$APP/Contents/MacOS/DBPilot" 2>/dev/null || echo unknown)"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "DBPilot-$VERSION-macos.zip"
+          ls -lh "DBPilot-$VERSION-macos.zip"
+
+      - name: Package Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $rel = "build\windows\x64\runner\Release"
+          if (-not (Test-Path $rel)) { Write-Error "找不到 $rel"; exit 1 }
+          $zip = "DBPilot-$env:VERSION-windows-x64.zip"
+          Compress-Archive -Path "$rel\*" -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name, Length | Format-List
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbpilot-release-${{ matrix.artifact }}
+          path: DBPilot-*-${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------- release ----
+  release:
+    name: create GitHub Release
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dbpilot-release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Show packages
+        run: ls -lh dist
+
+      # tag 已存在（push tag 触发）时更新该 Release 的资产；
+      # workflow_dispatch 时由 action 在目标提交上自动创建 tag。
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          body_path: release-body.md
+          files: dist/DBPilot-*.zip
+          # 同版本重跑时覆盖同名资产，避免 "already exists" 失败
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------ manifest ----
+  manifest:
+    name: update update.json
+    needs: [meta, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write update.json
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # url 取 Release 页面地址（拿不到时退回 releases 列表页）
+          URL="$(gh api "repos/$REPO/releases/tags/$TAG" --jq .html_url 2>/dev/null || true)"
+          if [ -z "$URL" ]; then
+            URL="https://github.com/$REPO/releases"
+          fi
+          BODY="$(gh api "repos/$REPO/releases/tags/$TAG" --jq .body 2>/dev/null || true)"
+          if [ -z "$BODY" ]; then
+            BODY="DBPilot $TAG"
+          fi
+          # 客户端（lib/src/update_check.dart）只认 version / url / notes 三个字段；
+          # notes 在设置弹窗里是单行展示，这里把多行压成一行并限制长度。
+          VERSION="$VERSION" URL="$URL" BODY="$BODY" python3 - <<'PY'
+          import json, os, re
+          body = re.sub(r"\s+", " ", os.environ["BODY"]).strip()
+          if len(body) > 500:
+              body = body[:497] + "..."
+          manifest = {
+              "version": os.environ["VERSION"],
+              "url": os.environ["URL"],
+              "notes": body,
+          }
+          with open("update.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          print("update.json:", json.dumps(manifest, ensure_ascii=False))
+          PY
+          cat update.json
+
+      - name: Commit update.json
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- update.json; then
+            echo "update.json 无变化（同版本重跑），跳过提交"
+            exit 0
+          fi
+          git add update.json
+          git commit -m "chore(release): update.json -> v${{ needs.meta.outputs.version }}"
+          git push origin HEAD:main

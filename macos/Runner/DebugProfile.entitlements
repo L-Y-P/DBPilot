@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The App Sandbox is disabled on purpose.
+
+	  This is a database administration tool: it must open TCP connections to
+	  MySQL / PostgreSQL servers on arbitrary hosts, and it must read and write
+	  files the user picks (SQLite database files, SQL dumps for import, export
+	  targets, backup destinations). The sandbox blocks all of that, and the
+	  container-relative paths it forces would also hide the real files.
+
+	  Desktop database clients that talk to arbitrary servers are not sandboxed
+	  for the same reason. The app ships outside the Mac App Store, so the
+	  sandbox is not required.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<!-- Outbound connections to database servers. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!--
+	  file_picker (>= v13) verifies these entitlements before it shows an
+	  NSOpenPanel/NSSavePanel, even when the sandbox is off. Without them every
+	  浏览 / 导出 button silently failed with ENTITLEMENT_NOT_FOUND.
+	  read-write is required by save dialogs (export, backup).
+	-->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+</dict>
+</plist>

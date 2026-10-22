@@ -1,0 +1,64 @@
+[workspace]
+# 契约层拆成独立 crate 后，用 workspace 统一锁文件与构建目标：
+# cargo test --workspace 会同时跑主 crate 与 dbpilot-core 的单元测试。
+members = ["crates/dbpilot-core"]
+# 默认命令同时覆盖主 crate 与契约层，避免 `cargo test` 静默漏掉 core 用例。
+default-members = [".", "crates/dbpilot-core"]
+
+[package]
+name = "rust_myadmin_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# cdylib/staticlib are what the Flutter desktop runner links against; rlib is
+# added so integration tests under tests/ can depend on the crate.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# 契约层（33 轮拆出）：driver/dialect/connection/registry/plugin/session/account
+# + ResultSet/AppError/DTO/SQL 工具。主 crate 单向依赖它，core 不依赖任何驱动。
+dbpilot-core = { path = "crates/dbpilot-core" }
+flutter_rust_bridge = { version = "=2.13.0", features = ["serde_json", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "mysql", "postgres", "sqlite", "chrono", "uuid", "json", "tls-rustls-ring-webpki"] }
+# `net` is used directly by ssh.rs (TcpListener/TcpStream for the local forward
+# port). It only reached the build transitively through sqlx before, which is a
+# fragile accident: a sqlx feature change or a Windows-only build could drop it.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+hex = "0.4"
+percent-encoding = "2"
+# SSH tunnel (jump host). Pure Rust, so no external ssh binary
+# is required at runtime; the `flate2` feature keeps compression for slow links.
+russh = { version = "0.45", default-features = false, features = ["flate2"] }
+russh-keys = "0.45"
+# Matches the version russh re-exports; needed for the host-key handler impl.
+async-trait = "0.1"
+# Stream row-by-row for the SQL console row cap (see drivers/mysql/exec.rs).
+futures = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# P7 (round 30): sqlx-core 0.8.6's NoHostnameTlsVerifier only recognizes the old
+# rustls CertificateError::NotValidForName variant. Current rustls (0.23.46) uses
+# NotValidForNameContext for "certificate not valid for name", so MySQL
+# ssl_verify=verify-ca kept enforcing hostname verification.
+#
+# The vendored copy (vendor/sqlx-core) is an unmodified 0.8.6 except for that one
+# match arm in src/net/tls/tls_rustls.rs. Re-sync it when bumping sqlx.
+[patch.crates-io]
+sqlx-core = { path = "vendor/sqlx-core" }

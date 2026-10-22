@@ -1,0 +1,90 @@
+import 'rewrite.dart';
+
+/// English for the connection manager and the SQLite file/folder actions.
+///
+/// Keys are the **rendered** Chinese strings; values are the English UI copy.
+/// Only user-visible copy belongs here — never identifiers, SQL or user data.
+const Map<String, String> enConnections = <String, String>{
+  '个数据库': ' databases',
+  '暂无连接': 'No connections yet',
+  '选择数据库目录（会递归扫描其中的 SQLite 文件）': 'Choose a database folder (SQLite files inside are scanned recursively)',
+  '选择 CA 证书': 'Choose the CA certificate',
+  '选择客户端证书': 'Choose the client certificate',
+  '选择客户端私钥': 'Choose the client key',
+  '常规': 'General',
+  '/path/to/client-cert.pem（可选）': '/path/to/client-cert.pem (optional)',
+  '/path/to/client-key.pem（可选）': '/path/to/client-key.pem (optional)',
+  '/path/to/db.sqlite（主数据库，可留空由目录自动选择）': '/path/to/db.sqlite (main database; leave blank to pick one from the folder)',
+  '数据库目录': 'Database folder',
+  '留空则使用主文件所在目录': 'Blank = folder of the main file',
+  '连接后会自动扫描该目录（含子目录）里所有 .sqlite / .sqlite3 / .db / .db3 文件，': 'After connecting, every .sqlite / .sqlite3 / .db / .db3 file in the folder (including subfolders) is scanned automatically.',
+  '主文件作为当前库，其余文件自动附加；在目录里增删文件后点「刷新」即可生效。': 'The main file becomes the current database and the other files are attached automatically; press Refresh after adding or removing files.',
+  '127.0.0.1 或 Unix socket 目录（如 /tmp）': '127.0.0.1 or a Unix socket directory (such as /tmp)',
+  '默认数据库（可选）': 'Default database (optional)',
+  '留空自动选择可访问的数据库；连接后可在左侧树中切换': 'Blank = pick an accessible database automatically; switch it from the tree after connecting',
+  '留空自动选择可访问的数据库': 'Blank = pick an accessible database automatically',
+  '仅显示数据库': 'Only show databases',
+  '隐藏数据库': 'Hide databases',
+  'SQLite 没有网络连接，SSL 设置不适用。': 'SQLite has no network connection, so SSL settings do not apply.',
+  'SSL 模式（libpq）': 'SSL mode (libpq)',
+  'require 只加密、不校验证书；要防止中间人攻击请选 verify-ca 或 verify-full。': 'require only encrypts and does not verify the certificate; choose verify-ca or verify-full to prevent man-in-the-middle attacks.',
+  '校验需要 CA 证书：不填会改用系统根证书，自签证书请指定 CA 文件。': 'Verification needs a CA certificate: leave it blank to use the system roots, or point at the CA file for self-signed certificates.',
+  '建议：先用 require 确认能加密连接，再用 verify-ca / verify-full 校验证书。': 'Tip: first confirm that require can encrypt the connection, then verify certificates with verify-ca / verify-full.',
+  'SQLite 是本地文件，无需 SSH 隧道。': 'SQLite is a local file; no SSH tunnel is needed.',
+  '数据库地址从跳板机解析：可填写只监听远程 127.0.0.1 或内网地址的数据库。': 'The database address is resolved from the jump host, so it may listen only on the remote 127.0.0.1 or an internal address.',
+  '数据库地址从跳板机解析：可填写只监听远程 127.0.0.1 或内网地址的数据库。本机 3306 等端口不会被暴露。':
+      'The database address is resolved from the jump host, so it may listen only on the remote 127.0.0.1 or an internal address. Local ports such as 3306 are never exposed.',
+  '本机 3306 等端口不会被暴露。': 'Local ports such as 3306 are never exposed.',
+  'SSH 主机': 'SSH host',
+  'SSH 端口': 'SSH port',
+  'SSH 用户名': 'SSH user',
+  '认证方式': 'Authentication',
+  '私钥文件': 'Private key file',
+  'SSH 密码': 'SSH password',
+  '~/.ssh/id_ed25519（加密私钥请在下方填口令）': '~/.ssh/id_ed25519 (enter the passphrase below for an encrypted key)',
+  '选择 SSH 私钥': 'Choose the SSH private key',
+  '私钥口令': 'Key passphrase',
+  '留空表示私钥未加密': 'Blank = the key is not encrypted',
+  'agent 套接字': 'Agent socket',
+  '留空使用 SSH_AUTH_SOCK': 'Blank = use SSH_AUTH_SOCK',
+  '主机密钥策略': 'Host key policy',
+  '首次连接信任并记住': 'Trust and remember on first connection',
+  '仅信任已保存指纹': 'Trust saved fingerprints only',
+  '主机密钥指纹': 'Host key fingerprint',
+  'SHA256:…（测试连接成功后自动填入，也可手动粘贴）': 'SHA256:… (filled in after a successful test, or paste it manually)',
+  'strict 模式必须先有指纹：点「测试连接」自动填入，或手动粘贴 ': 'strict mode requires a fingerprint first: press Test connection to fill it in, or paste the ',
+  'SHA256 指纹；指纹缺失或不匹配都会拒绝连接。': 'SHA256 fingerprint manually; a missing or mismatched fingerprint is rejected.',
+  '首次连接会用「测试连接」确认跳板机身份并自动填入指纹；': 'The first connection confirms the jump host identity with Test connection and fills in the fingerprint;',
+  '保存后指纹会被固定，以后指纹变化会拒绝连接。': 'after saving, the fingerprint is pinned and a later change is rejected.',
+  '主机密钥策略为「仅信任已保存指纹」时必须填写指纹：': 'The "trust saved fingerprints only" policy requires a fingerprint:',
+  '请先点「测试连接」自动填入，或手动粘贴跳板机的 SHA256 指纹。': 'press Test connection to fill it in, or paste the jump host SHA256 fingerprint.',
+  '密码': 'Password',
+  '颜色': 'Color',
+  '连接字符集': 'Connection charset',
+  'SSL 模式': 'SSL mode',
+  '证书校验': 'Certificate verification',
+  '打开目录': 'Open folder',
+  '断开连接': 'Disconnect',
+  '测试连接': 'Test connection',
+  '保存连接': 'Save connection',
+  '新建连接': 'New connection',
+  '编辑连接': 'Edit connection',
+  '连接名称': 'Connection name',
+  '数据库类型': 'Driver',
+  '主机': 'Host',
+  '端口': 'Port',
+  '用户名': 'User',
+  '密码（可留空）': 'Password (optional)',
+  '使用 TLS': 'Use TLS',
+  '跳过证书校验': 'Skip certificate verification',
+  'SSH 隧道': 'SSH tunnel',
+};
+
+/// Patterns for the interpolated prompts of this area, matched against the
+/// rendered string (see [Rewrite]).
+final List<Rewrite> rewritesConnections = <Rewrite>[
+  // "当前连接：name (SQLite)" — legacy pattern already covers it.
+  // Labels assembled from a translated noun plus a suffix, e.g.
+  // "Database（可选）".
+  Rewrite(RegExp(r'^(.+)（可选）$'), (m) => '${m[1]} (optional)'),
+];

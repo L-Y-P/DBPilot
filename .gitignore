@@ -1,0 +1,86 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Widget Preview related
+.widget_preview/
+
+# ---------------------------------------------------------------------------
+# DBPilot 开源仓库专用忽略规则（追加在 Flutter 默认规则之后）
+# ---------------------------------------------------------------------------
+
+# Rust 构建产物（workspace 主 crate 与 dbpilot-core 都落在 rust/target）
+/rust/target/
+
+# 本地运行期数据：连接信息、设置、备份、查询历史都可能含账号/密码，绝不入库
+/settings.json
+/connections.json
+/query_history.json
+/backups/
+*.db
+*.sqlite
+*.sqlite3
+
+# 本地工具链与缓存
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+**/ephemeral/
+**/Pods/
+**/Podfile.lock
+**/Flutter-Generated.xcconfig
+
+# 编辑器 / 系统
+.DS_Store
+*.iml
+.idea/
+.vscode/
+*.log
+*.pid
+
+# 本地测试产物
+/test/failures/
+**/test/failures/
+

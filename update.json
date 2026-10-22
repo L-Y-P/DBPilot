@@ -1,5 +1,5 @@
 {
   "version": "1.0.0",
   "url": "https://github.com/L-Y-P/DBPilot/releases/tag/v1.0.0",
-  "notes": "DBPilot 1.0.0 首个版本：Flutter + Rust 跨平台数据库管理客户端，支持 MySQL/MariaDB、PostgreSQL、SQLite。macOS 提供 universal DMG（x86_64 + arm64）。"
+  "notes": "DBPilot v1.0.0 首个发布版本。 ## 下载 | 平台 | 文件 | 说明 | | --- | --- | --- | | macOS（universal，x86_64 + arm64） | DBPilot-1.0.0-macos.zip | 解压得到 DBPilot.app | | Windows x64 | DBPilot-1.0.0-windows-x64.zip | 解压后运行 rust_myadmin_desktop.exe | > macOS 包为 ad-hoc 签名（未公证），首次打开请右键 → 打开，或执行： > `xattr -dr com.apple.quarantine DBPilot.app` > > Windows 包未签名，SmartScreen 提示时选「更多信息 → 仍要运行」。"
 }

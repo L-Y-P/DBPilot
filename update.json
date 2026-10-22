@@ -1,5 +1,5 @@
 {
   "version": "1.0.0",
-  "url": "https://github.com/L-Y-P/DBPilot/releases",
-  "notes": "首个开源版本"
+  "url": "https://github.com/L-Y-P/DBPilot/releases/tag/v1.0.0",
+  "notes": "DBPilot 1.0.0 首个版本：Flutter + Rust 跨平台数据库管理客户端，支持 MySQL/MariaDB、PostgreSQL、SQLite。macOS 提供 universal DMG（x86_64 + arm64）。"
 }

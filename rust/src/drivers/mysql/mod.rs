@@ -83,9 +83,16 @@ pub fn connect_options(spec: &ConnSpec, database: Option<&str>) -> AppResult<MyS
         .host(spec.host.trim())
         .port(spec.port())
         .username(&spec.user)
-        .password(&spec.password)
         .charset(&charset)
         .ssl_mode(ssl_mode_for(spec));
+    // 空密码时**不要**调 .password("")：sqlx 会把 Some("") 当成「带密码」处理，
+    // 在 caching_sha2_password + 非 TLS（本应用默认 ssl_mode=disable）下会走
+    // scramble 而非 cleartext 分支，服务端收到非空认证响应后报
+    // “Access denied ... (using password: YES)”，连空密码账号也连不上。
+    // 不设置密码时 sqlx 发送 0 长度响应，服务端才按「无密码」校验。
+    if !spec.password.is_empty() {
+        opts = opts.password(&spec.password);
+    }
     if let Some(db) = database.or_else(|| spec.database()) {
         opts = opts.database(db);
     }

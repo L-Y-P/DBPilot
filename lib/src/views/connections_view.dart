@@ -597,7 +597,33 @@ class _ConnectionsViewState extends State<ConnectionsView> {
               child: Center(child: CircularProgressIndicator()),
             )
           else if (_connections.isEmpty)
-            CardBox(child: Text('暂无连接', style: kMuted))
+            // 首次启动（或删光连接后）的引导：应用不再预置任何示例连接，
+            // 所以这里必须明确告诉用户下一步做什么，而不是只显示「暂无连接」。
+            CardBox(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Text('还没有任何数据库连接',
+                      key: const ValueKey('connections-empty-title'),
+                      style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.bodyText)),
+                  const SizedBox(height: 6),
+                  Text('点击右上角「新建连接」，选择 MySQL / PostgreSQL / SQLite 并填写地址即可。',
+                      key: const ValueKey('connections-empty-hint'),
+                      style: kMuted),
+                  const SizedBox(height: 12),
+                  // 文案故意避开「新建连接」：顶部工具栏已经有同名按钮，
+                  // 重复会让按文案查找控件的测试与自动化脚本产生歧义。
+                  Btn('创建第一个连接',
+                      key: const ValueKey('connections-empty-create'),
+                      primary: true,
+                      onPressed: () => _openForm()),
+                ],
+              ),
+            )
           else
             Wrap(
               spacing: 12,

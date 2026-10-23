@@ -7,6 +7,10 @@ import 'rewrite.dart';
 const Map<String, String> enConnections = <String, String>{
   '个数据库': ' databases',
   '暂无连接': 'No connections yet',
+  '还没有任何数据库连接': 'No database connections yet',
+  '创建第一个连接': 'Create your first connection',
+  '点击右上角「新建连接」，选择 MySQL / PostgreSQL / SQLite 并填写地址即可。':
+      'Click "New connection" in the top right, pick MySQL / PostgreSQL / SQLite and fill in the address.',
   '选择数据库目录（会递归扫描其中的 SQLite 文件）': 'Choose a database folder (SQLite files inside are scanned recursively)',
   '选择 CA 证书': 'Choose the CA certificate',
   '选择客户端证书': 'Choose the client certificate',

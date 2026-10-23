@@ -329,46 +329,21 @@ impl DesktopConfig {
     }
 }
 
-/// Connections offered on a brand-new install so the app is usable before the
-/// user configures anything. The SQLite entry points at a file inside the data
-/// directory; connecting creates it on demand.
-pub fn seed_connections(data_dir: &Path) -> Vec<ConnEntry> {
-    let parse = |raw: &str| serde_json::from_str::<ConnEntry>(raw).ok();
-    [
-        r##"{"id":"local-mysql","name":"本地 MySQL","driver":"mysql","host":"127.0.0.1","port":3306,"user":"root","password":"","color":"#f29111"}"##,
-        r##"{"id":"local-postgres","name":"本地 PostgreSQL","driver":"postgres","host":"127.0.0.1","port":5432,"user":"postgres","password":"","color":"#336791"}"##,
-    ]
-    .iter()
-    .filter_map(|raw| parse(raw))
-    .chain(std::iter::once(ConnEntry {
-        id: "local-sqlite".to_string(),
-        name: "SQLite 示例库".to_string(),
-        spec: crate::drivers::ConnSpec {
-            driver: crate::drivers::DriverKind::Sqlite,
-            host: String::new(),
-            port: None,
-            user: String::new(),
-            password: String::new(),
-            database: Some(
-                data_dir
-                    .join("demo.sqlite")
-                    .to_string_lossy()
-                    .to_string(),
-            ),
-            charset: None,
-            ssl_mode: None,
-            ssl_verify: None,
-            ssl_ca: None,
-            ssl_cert: None,
-            ssl_key: None,
-            sqlite_dir: None,
-            ssh: crate::ssh::SshSpec::default(),
-        },
-        only_db: None,
-        hide_db: None,
-        color: Some("#0f80cc".to_string()),
-    }))
-    .collect()
+/// Connections pre-populated on a brand-new install.
+///
+/// 故意返回空列表：预置 `root@127.0.0.1` / `postgres@127.0.0.1` 这类连接会带来三个问题 ——
+///
+/// 1. 用户没装对应数据库时，点这些条目只会得到「连接失败」，看起来像应用坏了；
+/// 2. `root` / `postgres` 是超级用户账号，会让人误以为应用要求用管理员账号；
+/// 3. 空密码的 root 连接在任何安全审计里都是红线。
+///
+/// 主流数据库客户端首次启动都是空列表 + 新建引导，这里保持一致。
+///
+/// 保留这个函数（而不是让调用方直接传 `Vec::new()`）有两个原因：
+/// - `ConnectionStore::load` 的签名需要它，且将来若要重新提供示例数据只改一处；
+/// - 现有单元测试与集成测试通过它构造「全新安装」场景。
+pub fn seed_connections(_data_dir: &Path) -> Vec<ConnEntry> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -522,6 +497,22 @@ mod tests {
         assert_eq!(
             config.backup_dir_for(&settings),
             PathBuf::from("/Volumes/dumps")
+        );
+    }
+
+    /// 全新安装不得预置任何数据库连接。
+    ///
+    /// 曾经这里会 seed `root@127.0.0.1:3306` 与 `postgres@127.0.0.1:5432`，
+    /// 发布后被用户当成「应用里带了开发者的连接信息」。预置超级用户账号
+    /// 既误导用户，也会在安全审计里被标红，所以锁定为空列表。
+    #[test]
+    fn brand_new_install_ships_no_connections() {
+        let dir = std::env::temp_dir().join("rma-seed-test");
+        let seeded = seed_connections(&dir);
+        assert!(
+            seeded.is_empty(),
+            "全新安装不应预置任何连接，实际有 {} 条",
+            seeded.len()
         );
     }
 }

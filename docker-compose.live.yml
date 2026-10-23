@@ -31,6 +31,9 @@ services:
       # 空密码：与测试的默认密码（空字符串）一致，仓库里不需要任何密码常量。
       MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
       MYSQL_DATABASE: rustmyadmin_demo
+      # 官方镜像默认只建 root@localhost，容器外（host 通过 Docker 网桥 172.18.0.1）
+      # 连进来会报 Access denied。CI 的 live 套件正是从 host 连容器，所以必须放开。
+      MYSQL_ROOT_HOST: "%"
     ports:
       - "${MYSQL_PORT:-3306}:3306"
     volumes:

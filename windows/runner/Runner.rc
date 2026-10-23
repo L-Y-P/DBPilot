@@ -94,7 +94,7 @@ BEGIN
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "DBPilot" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.rustmyadmin. All rights reserved." "\0"
-            VALUE "OriginalFilename", "rust_myadmin_desktop.exe" "\0"
+            VALUE "OriginalFilename", "DBPilot.exe" "\0"
             VALUE "ProductName", "DBPilot" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END

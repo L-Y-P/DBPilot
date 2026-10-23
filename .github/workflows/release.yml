@@ -114,7 +114,8 @@ jobs:
             echo "| 平台 | 文件 | 说明 |"
             echo "| --- | --- | --- |"
             echo "| macOS（universal，x86_64 + arm64） | DBPilot-$VERSION-macos.zip | 解压得到 DBPilot.app |"
-            echo "| Windows x64 | DBPilot-$VERSION-windows-x64.zip | 解压后运行 rust_myadmin_desktop.exe |"
+            echo "| Windows x64 | DBPilot-$VERSION-windows-x64-setup.exe | NSIS 安装包（推荐） |"
+            echo "| Windows x64 | DBPilot-$VERSION-windows-x64-portable.zip | 免安装版，解压即用 |"
             echo
             echo "> macOS 包为 ad-hoc 签名（未公证），首次打开请右键 → 打开，或执行："
             # 反引号在双引号里会被当命令替换执行，这里用单引号整行输出
@@ -211,7 +212,74 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$APP" "DBPilot-$VERSION-macos.zip"
           ls -lh "DBPilot-$VERSION-macos.zip"
 
-      - name: Package Windows
+      # 代码签名（可选）：配了 secrets 就签，没配就跳过。
+      - name: Decode signing certificate
+        # secrets 不能在 job 级 env 里判空，所以这里永远执行、由脚本自己判断。
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+        run: |
+          if (-not $env:WINDOWS_CERT_PFX_BASE64) {
+            Write-Host '未配置 WINDOWS_CERT_PFX_BASE64，跳过证书解码（产物不签名）'
+            exit 0
+          }
+          $bytes = [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64)
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\dbpilot-sign.pfx", $bytes)
+          Write-Host "证书已解码：$((Get-Item "$env:RUNNER_TEMP\dbpilot-sign.pfx").Length) bytes"
+
+      - name: Sign Windows binaries
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          CERT_PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PFX_PASSWORD }}
+          CERT_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          $pfx = "$env:RUNNER_TEMP\dbpilot-sign.pfx"
+          $params = @{ Path = "build/windows/x64/runner/Release" }
+          if (Test-Path $pfx) { $params.PfxPath = $pfx }
+          if ($env:CERT_PFX_PASSWORD) { $params.PfxPassword = $env:CERT_PFX_PASSWORD }
+          if ($env:CERT_THUMBPRINT) { $params.Thumbprint = $env:CERT_THUMBPRINT }
+          & .\packaging\windows\sign-windows.ps1 @params
+
+      # NSIS 安装包（主产物）。
+      - name: Build NSIS installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) { Write-Error "找不到 makensis.exe：$nsis"; exit 1 }
+          $nsisArgs = @(
+            "/DVERSION=$env:VERSION",
+            "/DSRCDIR=build\windows\x64\runner\Release",
+            "/DOUTFILE=DBPilot-$env:VERSION-windows-x64-setup.exe",
+            "/DAPP_ICON=windows\runner\resources\app_icon.ico",
+            "packaging\windows\installer.nsi"
+          )
+          & $nsis @nsisArgs
+          if ($LASTEXITCODE -ne 0) { Write-Error "makensis 失败（$LASTEXITCODE）"; exit 1 }
+          Get-Item "DBPilot-$env:VERSION-windows-x64-setup.exe" | Select-Object Name, Length | Format-List
+
+      # 安装包签名必须在 makensis 之后。
+      - name: Sign Windows installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          CERT_PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PFX_PASSWORD }}
+          CERT_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          $pfx = "$env:RUNNER_TEMP\dbpilot-sign.pfx"
+          $params = @{ Path = "DBPilot-$env:VERSION-windows-x64-setup.exe" }
+          if (Test-Path $pfx) { $params.PfxPath = $pfx }
+          if ($env:CERT_PFX_PASSWORD) { $params.PfxPassword = $env:CERT_PFX_PASSWORD }
+          if ($env:CERT_THUMBPRINT) { $params.Thumbprint = $env:CERT_THUMBPRINT }
+          & .\packaging\windows\sign-windows.ps1 @params
+
+      # 免安装 zip（备选）。
+      - name: Package Windows portable zip
         if: matrix.platform == 'windows'
         shell: pwsh
         env:
@@ -219,7 +287,7 @@ jobs:
         run: |
           $rel = "build\windows\x64\runner\Release"
           if (-not (Test-Path $rel)) { Write-Error "找不到 $rel"; exit 1 }
-          $zip = "DBPilot-$env:VERSION-windows-x64.zip"
+          $zip = "DBPilot-$env:VERSION-windows-x64-portable.zip"
           Compress-Archive -Path "$rel\*" -DestinationPath $zip -Force
           Get-Item $zip | Select-Object Name, Length | Format-List
 
@@ -227,7 +295,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dbpilot-release-${{ matrix.artifact }}
-          path: DBPilot-*-${{ matrix.artifact }}.zip
+          path: |
+            DBPilot-*-${{ matrix.artifact }}.zip
+            DBPilot-*-windows-x64-setup.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -263,7 +333,10 @@ jobs:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: ${{ needs.meta.outputs.tag }}
           body_path: release-body.md
-          files: dist/DBPilot-*.zip
+          # 三种资产：macOS zip、Windows NSIS 安装包、Windows 免安装 zip。
+          files: |
+            dist/DBPilot-*.zip
+            dist/DBPilot-*-windows-x64-setup.exe
           # 同版本重跑时覆盖同名资产，避免 "already exists" 失败
           overwrite_files: true
           fail_on_unmatched_files: true

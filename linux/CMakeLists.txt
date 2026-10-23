@@ -4,7 +4,8 @@ project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "rust_myadmin_desktop")
+# 用 DBPilot 而不是 crate 名：装到 /usr/bin 后用户看到的就是产品名。
+set(BINARY_NAME "DBPilot")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
 set(APPLICATION_ID "com.rustmyadmin.rust_myadmin_desktop")

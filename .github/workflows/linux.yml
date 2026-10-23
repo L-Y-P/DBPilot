@@ -1,0 +1,132 @@
+name: linux
+
+# 在 GitHub 托管的 Ubuntu runner 上构建 Linux 三种安装包：
+#   - AppImage（免安装，chmod +x 直接跑）
+#   - .deb（Debian / Ubuntu）
+#   - .rpm（Fedora / RHEL / openSUSE）
+#
+# 三种打包都在 packaging/linux/build-packages.sh 里完成，本地与 CI 共用同一份逻辑。
+# 发布仓库根 = desktop/ 目录，所以路径都没有 desktop/ 前缀。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.47.7"
+  CARGO_TERM_COLOR: always
+  FLUTTER_SUPPRESS_ANALYTICS: "true"
+  # appimagetool 本身是 AppImage；CI 里没有 FUSE，用解包运行模式。
+  APPIMAGE_EXTRACT_AND_RUN: "1"
+
+jobs:
+  build:
+    name: build linux packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Flutter Linux 桌面构建的系统依赖。
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libblkid-dev libstdc++-12-dev \
+            file desktop-file-utils rpm zstd
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-linux-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-linux-
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # 版本号取自 pubspec.yaml（与其它平台一致；tag 必须与它相同）。
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]*).*/\1/p' pubspec.yaml | head -1)"
+          [ -n "$VERSION" ] || { echo '::error::pubspec.yaml 里没有解析到 version'; exit 1; }
+          echo "版本：$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build Linux bundle
+        run: flutter build linux --release
+
+      - name: Inspect bundle
+        run: |
+          ls -la build/linux/x64/release/bundle
+          file build/linux/x64/release/bundle/DBPilot
+          du -sh build/linux/x64/release/bundle
+
+      - name: Fetch appimagetool
+        run: |
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          sudo install -m 0755 /tmp/appimagetool /usr/local/bin/appimagetool
+          appimagetool --version || true
+
+      - name: Build AppImage / deb / rpm
+        run: bash packaging/linux/build-packages.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Show packages
+        run: ls -lh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbpilot-linux-x64
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+      # tag 触发时直接补到同一个 Release；workflow_dispatch 只出 artifact。
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+          overwrite_files: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

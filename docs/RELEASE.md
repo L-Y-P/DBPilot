@@ -70,7 +70,7 @@ git push origin v1.1.0
    `flutter pub get` → `flutter build macos --release` / `flutter build windows --release`，
    打包 zip 并上传 artifact。
 3. **release**（ubuntu）：`softprops/action-gh-release@v2` 用 `tag_name=v1.1.0` 建 Release 并上传
-   `DBPilot-1.1.0-macos.zip`、`DBPilot-1.1.0-windows-x64.zip`；同版本重跑会覆盖资产
+   `DBPilot-1.1.0-macos.zip`、`DBPilot-1.1.0-windows-x64-setup.exe`、`DBPilot-1.1.0-windows-x64-portable.zip`；同版本重跑会覆盖资产
    （`overwrite_files: true`），不会报 "already exists"。
 4. **manifest**（ubuntu）：`gh api repos/<owner>/<repo>/releases/tags/v1.1.0` 取 `html_url` 与 `body`，
    写 `update.json` 后以 `github-actions[bot]` 身份提交回 `main`：
@@ -109,10 +109,15 @@ Actions → release → Run workflow → version: 1.1.0
 
 ## 4. 产物命名与内容
 
-| 平台 | 文件 | 内容 | 解压后 |
-| --- | --- | --- | --- |
-| macOS | `DBPilot-<version>-macos.zip` | `DBPilot.app`（universal：x86_64 + arm64，约 92 MB 未压缩） | 双击运行 |
-| Windows x64 | `DBPilot-<version>-windows-x64.zip` | `rust_myadmin_desktop.exe` + `rust_myadmin_core.dll` + `flutter_windows.dll` + `data/` | 双击 `rust_myadmin_desktop.exe` |
+| 平台 | 文件 | 说明 |
+| --- | --- | --- |
+| macOS | `DBPilot-<version>-macos.dmg` | `DBPilot.app`（universal：x86_64 + arm64，约 92 MB 未压缩），拖入 Applications |
+| macOS | `DBPilot-<version>-macos.zip` | 同上，CI 产出的 zip 形式（`ditto` 打包，保留 .app 内符号链接） |
+| Windows x64 | `DBPilot-<version>-windows-x64-setup.exe` | **NSIS 安装包（主产物）**：开始菜单/桌面快捷方式、卸载项、版本信息，默认装到 `Program Files` |
+| Windows x64 | `DBPilot-<version>-windows-x64-portable.zip` | 免安装版：`DBPilot.exe` + `rust_myadmin_core.dll` + `flutter_windows.dll` + `data/`，解压即用 |
+| Linux x64 | `DBPilot-<version>-linux-x64.AppImage` | 免安装单文件：`chmod +x` 后直接运行（需 `libfuse2`） |
+| Linux x64 | `dbpilot_<version>_amd64.deb` | Debian / Ubuntu 包，装到 `/usr/lib/dbpilot` + `/usr/bin/dbpilot` |
+| Linux x64 | `dbpilot-<version>-1.x86_64.rpm` | Fedora / RHEL / openSUSE 包，目录布局与 deb 相同 |
 
 构建目录（CI 与本地一致）：
 
@@ -123,21 +128,86 @@ Actions → release → Run workflow → version: 1.1.0
 
 - macOS 用 `ditto -c -k --sequesterRsrc --keepParent` 打包，保留 .app 内的符号链接与扩展属性；
   用普通 `zip` 打包 .app 容易丢符号链接，解压后打不开。
-- Windows 用 `Compress-Archive -Path <Release>/*` 把目录**内容**打平进 zip，解压即用（不套一层文件夹）。
+- Windows 免安装 zip 用 `Compress-Archive -Path <Release>/*` 把目录**内容**打平进 zip，解压即用（不套一层文件夹）。
+- Windows 安装包用 **NSIS**（`packaging/windows/installer.nsi`），`windows-latest` 镜像预装 NSIS 3.10，
+  路径 `C:\Program Files (x86)\NSIS\makensis.exe`，无需额外安装。
+- Windows 可执行文件已改名为 `DBPilot.exe`（`windows/CMakeLists.txt` 的 `BINARY_NAME`）。
 - 版本号来自 `pubspec.yaml` 的 `version:` 前缀（`+` 之后是 build number，不参与命名）。
 
-## 5. 未签名说明（重要）
+### 4.1 Linux 打包（AppImage / deb / rpm）
 
-- **macOS**：用 Xcode 默认的 ad-hoc 签名（`CODE_SIGN_IDENTITY = "-"`），**没有公证**。
-  首次打开会被 Gatekeeper 拦下，右键 → 打开，或：
+Linux 三种包由 **`.github/workflows/linux.yml`** 在 GitHub 托管的 `ubuntu-24.04` runner 上构建，
+本地可用同一份脚本复现：
 
-  ```bash
-  xattr -dr com.apple.quarantine DBPilot.app
-  ```
+```bash
+# 依赖（Ubuntu 24.04）
+sudo apt-get install -y clang cmake ninja-build pkg-config \
+  libgtk-3-dev liblzma-dev libblkid-dev libstdc++-12-dev \
+  file desktop-file-utils rpm zstd libfuse2
+# AppImage 工具（一次性）
+curl -fsSL -o /tmp/appimagetool \
+  https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+sudo install -m 0755 /tmp/appimagetool /usr/local/bin/appimagetool
 
-  要消除提示需要 Apple Developer ID + `codesign`/`notarytool`，那需要付费证书与 secrets，
-  目前刻意不做（见 §1）。
-- **Windows**：未签名 exe，SmartScreen 会提示「未知发布者」，点「更多信息 → 仍要运行」。
+# 构建
+flutter build linux --release
+VERSION=1.0.0 bash packaging/linux/build-packages.sh
+```
+
+`packaging/linux/build-packages.sh` 做的事：
+
+1. 把 `build/linux/x64/release/bundle/` 装成 `/usr/lib/dbpilot/`；
+2. 生成 `/usr/bin/dbpilot` 软链接、`.desktop` 入口与 hicolor 图标；
+3. `appimagetool --no-appstream` 出 AppImage（入口脚本 `packaging/linux/AppRun`）；
+4. `dpkg-deb --root-owner-group` 出 deb（带 `Depends` 与 postinst/postrm 刷新桌面缓存）；
+5. `rpmbuild` 出 rpm（同样目录布局，`AutoReqProv: no` 避免 runner 上解析不到依赖）。
+
+> CI 里 `APPIMAGE_EXTRACT_AND_RUN=1`：appimagetool 自身也是 AppImage，runner 没有 FUSE，
+> 用解包运行模式避免挂载失败。
+
+## 5. 代码签名
+
+### 5.1 Windows（已接入，证书待购买）
+
+签名流程已经接好，**证书配了就会签，没配就自动跳过**（PR 构建仍然出包，只是产物未签名）。
+
+签名覆盖：`build/windows/x64/runner/Release/` 下所有 `*.exe` / `*.dll`，以及 NSIS 安装包本身
+（安装包必须在 `makensis` 之后签，否则字节一变签名就失效）。
+
+**启用方式**：到 GitHub → Settings → Secrets and variables → Actions 添加：
+
+| Secret | 说明 | 必需 |
+| --- | --- | --- |
+| `WINDOWS_CERT_PFX_BASE64` | `.pfx` 证书的 base64 | 二选一 |
+| `WINDOWS_CERT_PFX_PASSWORD` | `.pfx` 密码 | 用 PFX 时必填 |
+| `WINDOWS_CERT_THUMBPRINT` | 已装进证书存储的证书 SHA-1 指纹 | 二选一 |
+
+生成 base64：
+
+```bash
+# macOS / Linux
+base64 -i dbpilot-code-signing.pfx | tr -d '\n' | pbcopy
+# Windows PowerShell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('dbpilot-code-signing.pfx')) | Set-Clipboard
+```
+
+脚本：`packaging/windows/sign-windows.ps1`（自动找 Windows SDK 的 `signtool.exe`，
+用 SHA-256 摘要 + DigiCert RFC3161 时间戳，签完逐个 `signtool verify /pa` 校验）。
+
+**证书要求**：Windows 代码签名证书分 OV / EV 两种。OV 证书签名后仍需累积 SmartScreen 信誉
+（新证书头几百次下载仍可能警告）；EV 证书立即获得信誉，但需要硬件令牌（CI 里要用
+Azure Trusted Signing 或云 HSM，成本更高）。
+
+### 5.2 macOS（未签名）
+
+用 Xcode 默认的 ad-hoc 签名（`CODE_SIGN_IDENTITY = "-"`），**没有公证**。
+首次打开会被 Gatekeeper 拦下，右键 → 打开，或：
+
+```bash
+xattr -dr com.apple.quarantine DBPilot.app
+```
+
+要消除提示需要 Apple Developer ID + `codesign`/`notarytool`，需要付费证书与 secrets。
 
 ## 6. 本地复现构建
 
@@ -162,11 +232,26 @@ ditto -c -k --sequesterRsrc --keepParent \
   "build/macos/Build/Products/Release/DBPilot.app" "DBPilot-${VERSION}-macos.zip"
 ```
 
-Windows 打包 zip（PowerShell）：
+Windows 打包（PowerShell，与 CI 一致）：
 
 ```powershell
+$VERSION = "1.0.0"
+
+# 1) 免安装 zip
 Compress-Archive -Path "build/windows/x64/runner/Release/*" `
-  -DestinationPath "DBPilot-1.0.0-windows-x64.zip" -Force
+  -DestinationPath "DBPilot-$VERSION-windows-x64-portable.zip" -Force
+
+# 2) NSIS 安装包（需先装 NSIS：choco install nsis）
+& "C:\Program Files (x86)\NSIS\makensis.exe" `
+  /DVERSION=$VERSION `
+  /DSRCDIR=build\windows\x64\runner\Release `
+  /DOUTFILE=DBPilot-$VERSION-windows-x64-setup.exe `
+  /DAPP_ICON=windows\runner\resources\app_icon.ico `
+  packaging\windows\installer.nsi
+
+# 3) 可选：签名（没有证书时会自动跳过）
+.\packaging\windows\sign-windows.ps1 -Path "DBPilot-$VERSION-windows-x64-setup.exe" `
+  -PfxPath cert.pfx -PfxPassword "***"
 ```
 
 ### 6.1 本地构建注意事项

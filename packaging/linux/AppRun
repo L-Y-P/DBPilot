@@ -1,0 +1,5 @@
+#!/bin/sh
+# AppImage 入口：包内是 Flutter 的 bundle（可执行文件 + lib/ + data/），
+# 可执行文件的 RPATH 已经是 $ORIGIN/lib，所以直接 exec 即可。
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/lib/dbpilot/DBPilot" "$@"

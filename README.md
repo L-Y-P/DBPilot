@@ -130,10 +130,14 @@ keyset 游标分页；自动列宽开关与大字段延迟加载（设置 → �
 
 **获取**：从 [Releases](https://github.com/L-Y-P/DBPilot/releases) 下载压缩包，或按下一节自行编译。
 
-| 平台 | 解压后 |
-| --- | --- |
-| macOS | `DBPilot.app`（universal）——ad-hoc 签名未公证，首次打开需右键 → 打开，或 `xattr -dr com.apple.quarantine DBPilot.app` |
-| Windows x64 | `rust_myadmin_desktop.exe` + `rust_myadmin_core.dll` + `flutter_windows.dll` + `data/`——未签名，SmartScreen 选「仍要运行」 |
+| 平台 | 文件 | 说明 |
+| --- | --- | --- |
+| macOS | `DBPilot-<version>-macos.dmg` | universal（x86_64 + arm64）；ad-hoc 签名未公证，首次打开需右键 → 打开，或 `xattr -dr com.apple.quarantine /Applications/DBPilot.app` |
+| Windows x64 | `DBPilot-<version>-windows-x64-setup.exe` | NSIS 安装包（推荐）：开始菜单/桌面快捷方式 + 卸载项；未签名时 SmartScreen 选「仍要运行」 |
+| Windows x64 | `DBPilot-<version>-windows-x64-portable.zip` | 免安装版，解压即用 |
+| Linux x64 | `DBPilot-<version>-linux-x64.AppImage` | 免安装：`chmod +x` 后直接运行，需要 `libfuse2` |
+| Linux x64 | `dbpilot_<version>_amd64.deb` | Debian / Ubuntu：`sudo apt install ./dbpilot_<version>_amd64.deb` |
+| Linux x64 | `dbpilot-<version>-1.x86_64.rpm` | Fedora / RHEL / openSUSE：`sudo rpm -i dbpilot-<version>-1.x86_64.rpm` |
 
 **第一次使用**：
 
@@ -182,6 +186,10 @@ flutter pub get
 flutter build macos   --release   # build/macos/Build/Products/Release/DBPilot.app
 flutter build windows --release   # build/windows/x64/runner/Release/
 flutter build linux   --release   # build/linux/x64/release/bundle/
+
+# Linux 三种安装包（AppImage / deb / rpm，本地与 CI 共用同一份脚本）
+# 依赖：apt install -y file libfuse2 rpm zstd desktop-file-utils，另需 appimagetool
+VERSION=1.0.0 bash packaging/linux/build-packages.sh
 ```
 
 Rust 部分由 cargokit 在 `flutter build` 内部自动触发，产物落在 `build/` 下，不复用 `rust/target`。

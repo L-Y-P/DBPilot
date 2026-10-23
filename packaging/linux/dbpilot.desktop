@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=DBPilot
+GenericName=Database Client
+Comment=Database client for MySQL / MariaDB / PostgreSQL / SQLite
+Comment[zh_CN]=支持 MySQL / MariaDB、PostgreSQL、SQLite 的数据库客户端
+Exec=dbpilot %U
+Icon=dbpilot
+Terminal=false
+Categories=Development;Database;
+Keywords=database;mysql;mariadb;postgres;postgresql;sqlite;sql;dbpilot;
+StartupNotify=true
+StartupWMClass=com.rustmyadmin.rust_myadmin_desktop

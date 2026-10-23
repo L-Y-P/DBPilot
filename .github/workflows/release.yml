@@ -249,8 +249,24 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
-          if (-not (Test-Path $nsis)) { Write-Error "找不到 makensis.exe：$nsis"; exit 1 }
+          # NSIS 在 windows runner 上的位置随镜像版本变化，不能写死路径：
+          # 先找 PATH，再找几个常见目录，最后用 choco 装一次。
+          $nsis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+          if (-not $nsis) {
+            $candidates = @(
+              'C:\Program Files (x86)\NSIS\makensis.exe',
+              'C:\Program Files\NSIS\makensis.exe',
+              (Join-Path $env:ChocolateyInstall 'bin\makensis.exe')
+            )
+            $nsis = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          }
+          if (-not $nsis) {
+            Write-Host 'NSIS 未预装，用 choco 安装 ...'
+            choco install nsis -y --no-progress
+            $nsis = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          }
+          if (-not (Test-Path $nsis)) { Write-Error "找不到 makensis.exe（已尝试 PATH / 常见目录 / choco）"; exit 1 }
+          Write-Host "使用 makensis: $nsis"
           $nsisArgs = @(
             "/DVERSION=$env:VERSION",
             "/DSRCDIR=build\windows\x64\runner\Release",

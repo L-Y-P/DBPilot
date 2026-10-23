@@ -179,14 +179,15 @@ jobs:
           }
           if (-not (Test-Path $nsis)) { Write-Error "找不到 makensis.exe（已尝试 PATH / 常见目录 / choco）"; exit 1 }
           Write-Host "使用 makensis: $nsis"
-          $args = @(
+          # makensis 按脚本目录解析相对路径，SRCDIR/OUTFILE 一律给绝对路径。
+          $root = (Get-Location).Path
+          $nsisArgs = @(
             "/DVERSION=$env:VERSION",
-            "/DSRCDIR=build\windows\x64\runner\Release",
-            "/DOUTFILE=DBPilot-$env:VERSION-windows-x64-setup.exe",
-            "/DAPP_ICON=windows\runner\resources\app_icon.ico",
+            "/DSRCDIR=$root\build\windows\x64\runner\Release",
+            "/DOUTFILE=$root\DBPilot-$env:VERSION-windows-x64-setup.exe",
             "packaging\windows\installer.nsi"
           )
-          & $nsis @args
+          & $nsis @nsisArgs
           if ($LASTEXITCODE -ne 0) { Write-Error "makensis 失败（$LASTEXITCODE）"; exit 1 }
           Get-Item "DBPilot-$env:VERSION-windows-x64-setup.exe" | Select-Object Name, Length | Format-List
 

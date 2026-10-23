@@ -32,6 +32,11 @@ Unicode true
   !error "缺少 /DOUTFILE=<输出安装包路径>"
 !endif
 
+; makensis 按**脚本所在目录**解析相对路径（不是当前工作目录），
+; 而脚本位于 packaging/windows/ 下，所以仓库根是 ../..。
+; 图标与许可证都走这个前缀，避免 CI 里 CWD 不同导致的找不到文件。
+!define REPO_ROOT       "..\.."
+
 !define APP_NAME        "DBPilot"
 !define APP_PUBLISHER   "L-Y-P"
 !define APP_URL         "https://github.com/L-Y-P/DBPilot"
@@ -65,11 +70,16 @@ VIAddVersionKey /LANG=2052 "LegalCopyright"  "MIT License"
 !include "FileFunc.nsh"
 
 !define MUI_ABORTWARNING
+; 未显式传 /DAPP_ICON 时用 runner 里的图标（相对 REPO_ROOT，绝对可靠）。
+!ifndef APP_ICON
+  !define APP_ICON "${REPO_ROOT}\windows\runner\resources\app_icon.ico"
+!endif
+
 !define MUI_ICON "${APP_ICON}"
 !define MUI_UNICON "${APP_ICON}"
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "LICENSE"
+!insertmacro MUI_PAGE_LICENSE "${REPO_ROOT}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH

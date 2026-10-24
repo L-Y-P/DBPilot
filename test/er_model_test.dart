@@ -547,4 +547,397 @@ void main() {
       expect(curve.control1.dx, greaterThan(230));
     });
   });
+
+  group('箭头几何', () {
+    final tables = <ErTable>[
+      table('a', <ErColumn>[column('id', type: 'INTEGER', primary: true)]),
+      table('b', <ErColumn>[column('id', type: 'INTEGER', primary: true)]),
+    ];
+    final layout = ErCanvasLayout(
+      tables: tables,
+      positions: <String, Offset>{
+        'a': const Offset(24, 24),
+        'b': const Offset(400, 24),
+      },
+    );
+
+    test('箭头尖端在曲线终点、沿终点切线、大小可调', () {
+      const relation = ErRelation(
+        localTable: 'a',
+        localColumn: 'id',
+        refTable: 'b',
+        refColumn: 'id',
+      );
+      final curve = relationCurve(layout, relation);
+      expect(curve, isNotNull);
+      final head = ErArrowHead.forCurve(curve!, length: 13, halfWidth: 6);
+      expect(head, isNotNull);
+      expect(head!.tip, curve.end);
+      expect(head.direction.distance, closeTo(1, 1e-9));
+      expect(head.length, closeTo(13, 0.0001));
+      expect(head.triangle.length, 3);
+      // 从左往右画：箭头底边在尖端左侧。
+      expect(head.base.dx, lessThan(head.tip.dx));
+      expect(head.left.dy, isNot(head.right.dy));
+    });
+
+    test('目标在左侧时箭头仍指向目标（底边在尖端左侧）', () {
+      final reversed = ErCanvasLayout(
+        tables: tables,
+        positions: <String, Offset>{
+          'a': const Offset(400, 24),
+          'b': const Offset(24, 24),
+        },
+      );
+      const relation = ErRelation(
+        localTable: 'a',
+        localColumn: 'id',
+        refTable: 'b',
+        refColumn: 'id',
+      );
+      final curve = relationCurve(reversed, relation)!;
+      final head = ErArrowHead.forCurve(curve)!;
+      expect(head.tip, curve.end);
+      expect(head.base.dx, lessThan(head.tip.dx));
+    });
+  });
+
+  group('中间表识别与多对多连线', () {
+    ErTable entity(String name) =>
+        table(name, <ErColumn>[column('id', type: 'INTEGER', primary: true)]);
+    ErTable junction() => table('order_items', <ErColumn>[
+      column('id', type: 'INTEGER', primary: true),
+      column('order_id', type: 'INTEGER', foreignKey: true),
+      column('product_id', type: 'INTEGER', foreignKey: true),
+    ]);
+    const toOrders = ErRelation(
+      localTable: 'order_items',
+      localColumn: 'order_id',
+      refTable: 'orders',
+      refColumn: 'id',
+      name: 'fk_order_items_order',
+    );
+    const toProducts = ErRelation(
+      localTable: 'order_items',
+      localColumn: 'product_id',
+      refTable: 'products',
+      refColumn: 'id',
+      name: 'fk_order_items_product',
+    );
+
+    test('恰好两个单列外键指向两张不同表 → 中间表', () {
+      final junctions = detectJunctionTables(
+        relationsByTable: <String, List<ErRelation>>{
+          'order_items': <ErRelation>[toOrders, toProducts],
+        },
+        tables: <String>{'orders', 'products', 'order_items'},
+      );
+      expect(junctions.length, 1);
+      final info = junctions['order_items']!;
+      expect(info.connects('orders', 'products'), isTrue);
+      expect(info.connects('products', 'orders'), isTrue);
+      final links = manyToManyLinks(junctions);
+      expect(links.single.junctionTable, 'order_items');
+      expect(links.single.key, 'm2m:order_items');
+      expect(links.single.syntheticRelation.origin, ErRelationOrigin.junction);
+    });
+
+    test('一个外键 / 两个外键指向同一张表 / 引用画布外都不算中间表', () {
+      final one = detectJunctionTables(
+        relationsByTable: <String, List<ErRelation>>{
+          'order_items': <ErRelation>[toOrders],
+        },
+        tables: <String>{'orders', 'products', 'order_items'},
+      );
+      expect(one, isEmpty);
+      final same = detectJunctionTables(
+        relationsByTable: <String, List<ErRelation>>{
+          'order_items': <ErRelation>[
+            toOrders,
+            const ErRelation(
+              localTable: 'order_items',
+              localColumn: 'order_id_2',
+              refTable: 'orders',
+              refColumn: 'id',
+            ),
+          ],
+        },
+        tables: <String>{'orders', 'products', 'order_items'},
+      );
+      expect(same, isEmpty);
+      final outside = detectJunctionTables(
+        relationsByTable: <String, List<ErRelation>>{
+          'order_items': <ErRelation>[toOrders, toProducts],
+        },
+        tables: <String>{'order_items', 'orders'},
+      );
+      expect(outside, isEmpty);
+    });
+
+    test('多对多连线锚在两张实体表的左右边缘中部', () {
+      final ordersTable = entity('orders');
+      final productsTable = entity('products');
+      final items = junction();
+      final layout = ErCanvasLayout(
+        tables: <ErTable>[ordersTable, productsTable, items],
+        positions: <String, Offset>{
+          'orders': const Offset(24, 24),
+          'products': const Offset(400, 24),
+          'order_items': const Offset(760, 24),
+        },
+      );
+      final junctions = detectJunctionTables(
+        relationsByTable: <String, List<ErRelation>>{
+          'order_items': <ErRelation>[toOrders, toProducts],
+        },
+        tables: <String>{'orders', 'products', 'order_items'},
+      );
+      final link = manyToManyLinks(junctions).single;
+      final curve = manyToManyCurve(layout, link);
+      expect(curve, isNotNull);
+      expect(curve!.start.dx, 24 + 230 - 1);
+      expect(curve.end.dx, 400);
+      expect(
+        curve.start.dy,
+        24 + const ErNodeMetrics().heightOf(ordersTable) / 2,
+      );
+      expect(curve.labelAnchor.dx, greaterThan(curve.start.dx));
+      expect(curve.labelAnchor.dx, lessThan(curve.end.dx));
+    });
+  });
+
+  group('自动带入关联表', () {
+    test('BFS 沿父/子两个方向扩展，循环不重复', () {
+      final expanded = expandRelatedTableNames(
+        added: <String>{'a'},
+        related: <String, List<String>>{
+          'a': <String>['b'],
+          'b': <String>['a', 'c'],
+          'c': <String>['b', 'd'],
+          'd': <String>['c', 'e'],
+          'e': <String>['d'],
+        },
+        excluded: <String>{},
+        maxTables: 5,
+      );
+      expect(expanded, <String>['b', 'c', 'd', 'e']);
+    });
+
+    test('上限截断（含已加入）', () {
+      final expanded = expandRelatedTableNames(
+        added: <String>{'a'},
+        related: <String, List<String>>{
+          'a': <String>['b'],
+          'b': <String>['a', 'c'],
+          'c': <String>['b', 'd'],
+        },
+        excluded: <String>{},
+        maxTables: 3,
+      );
+      expect(expanded, <String>['b', 'c']);
+    });
+
+    test('用户移除过的表不再自动加回', () {
+      final expanded = expandRelatedTableNames(
+        added: <String>{'a'},
+        related: <String, List<String>>{
+          'a': <String>['b', 'c'],
+          'c': <String>['a', 'd'],
+        },
+        excluded: <String>{'b'},
+        maxTables: 5,
+      );
+      expect(expanded, <String>['c', 'd']);
+    });
+
+    test('已加入表之间互相引用时没有候选', () {
+      final expanded = expandRelatedTableNames(
+        added: <String>{'a', 'b'},
+        related: <String, List<String>>{
+          'a': <String>['b'],
+          'b': <String>['a'],
+        },
+        excluded: <String>{},
+        maxTables: 5,
+      );
+      expect(expanded, isEmpty);
+    });
+  });
+
+  group('建议关系（列名推导）', () {
+    ErTable idTable(String name, [List<ErColumn> extra = const <ErColumn>[]]) =>
+        table(name, <ErColumn>[
+          column('id', type: 'INTEGER', primary: true),
+          ...extra,
+        ]);
+
+    List<ErTable> batch() => <ErTable>[
+      idTable('users', <ErColumn>[column('name', type: 'TEXT')]),
+      idTable('categories', <ErColumn>[column('name', type: 'TEXT')]),
+      idTable('products', <ErColumn>[
+        column('category_id', type: 'INTEGER'),
+        column('name', type: 'TEXT'),
+      ]),
+      idTable('orders', <ErColumn>[column('user_id', type: 'INTEGER')]),
+      idTable('order_items', <ErColumn>[
+        column('order_id', type: 'INTEGER'),
+        column('product_id', type: 'INTEGER'),
+      ]),
+    ];
+
+    test('列名模式：user_id / userId / userID / category_id，普通列不误判', () {
+      expect(suggestedForeignKeyBase('user_id'), 'user');
+      expect(suggestedForeignKeyBase('userId'), 'user');
+      expect(suggestedForeignKeyBase('userID'), 'user');
+      expect(suggestedForeignKeyBase('category_id'), 'category');
+      expect(suggestedForeignKeyBase('paid'), isNull);
+      expect(suggestedForeignKeyBase('valid'), isNull);
+      expect(suggestedForeignKeyBase('name'), isNull);
+      expect(suggestedForeignKeyBase('id'), isNull);
+    });
+
+    test('导入批次里按列名推出 4 条建议关系（y → ies 复数）', () {
+      final suggestions = suggestRelations(
+        tables: batch(),
+        relationsByTable: <String, List<ErRelation>>{},
+      );
+      final labels = <String>{
+        for (final relation in suggestions) erLabel(relation),
+      };
+      expect(labels, <String>{
+        'products.category_id→categories.id',
+        'orders.user_id→users.id',
+        'order_items.order_id→orders.id',
+        'order_items.product_id→products.id',
+      });
+      expect(
+        suggestions.every(
+          (relation) => relation.origin == ErRelationOrigin.suggested,
+        ),
+        isTrue,
+      );
+    });
+
+    test('默认最多 8 条建议边；可显式收紧', () {
+      final targets = <ErTable>[for (var i = 1; i <= 10; i++) idTable('t$i')];
+      final wide = table('wide', <ErColumn>[
+        column('id', type: 'INTEGER', primary: true),
+        for (var i = 1; i <= 10; i++) column('t${i}_id', type: 'INTEGER'),
+      ]);
+      final capped = suggestRelations(
+        tables: <ErTable>[wide, ...targets],
+        relationsByTable: <String, List<ErRelation>>{},
+      );
+      expect(capped.length, 8, reason: '默认上限 8 条，避免画布被虚线铺满');
+      final tighter = suggestRelations(
+        tables: batch(),
+        relationsByTable: <String, List<ErRelation>>{},
+        maxResults: 2,
+      );
+      expect(tighter.length, 2);
+    });
+
+    test('已有外键的表不再建议；缺目标表 / 复合主键目标也跳过', () {
+      final suggestions = suggestRelations(
+        tables: batch(),
+        relationsByTable: <String, List<ErRelation>>{
+          'orders': <ErRelation>[
+            const ErRelation(
+              localTable: 'orders',
+              localColumn: 'user_id',
+              refTable: 'users',
+              refColumn: 'id',
+              name: 'fk_orders_user',
+            ),
+          ],
+          'products': <ErRelation>[
+            const ErRelation(
+              localTable: 'products',
+              localColumn: 'category_id',
+              refTable: 'outside',
+              refColumn: 'id',
+            ),
+          ],
+        },
+      );
+      // orders / products 已有外键；只剩 order_items 的两条。
+      expect(suggestions.length, 2);
+      expect(
+        suggestions.every((relation) => relation.localTable == 'order_items'),
+        isTrue,
+      );
+      // 缺目标表：只有 products.category_id 时没有 categories 表。
+      final missing = suggestRelations(
+        tables: <ErTable>[
+          idTable('products', <ErColumn>[
+            column('category_id', type: 'INTEGER'),
+          ]),
+        ],
+        relationsByTable: <String, List<ErRelation>>{},
+      );
+      expect(missing, isEmpty);
+      // 复合主键目标不能作为建议外键目标。
+      final composite = suggestRelations(
+        tables: <ErTable>[
+          idTable('products', <ErColumn>[
+            column('category_id', type: 'INTEGER'),
+          ]),
+          table('categories', <ErColumn>[
+            column('a', type: 'INTEGER', primary: true),
+            column('b', type: 'INTEGER', primary: true),
+          ]),
+        ],
+        relationsByTable: <String, List<ErRelation>>{},
+      );
+      expect(composite, isEmpty);
+    });
+  });
+
+  group('唯一列解析', () {
+    test('单列主键 / 单列唯一索引；复合唯一索引不算单列唯一', () {
+      final unique = erUniqueColumns(<String, dynamic>{
+        'primary_key': <dynamic>['id'],
+        'indexes': <dynamic>[
+          <String, dynamic>{
+            'INDEX_NAME': 'PRIMARY',
+            'NON_UNIQUE': 0,
+            'COLUMN_NAME': 'id',
+          },
+          <String, dynamic>{
+            'INDEX_NAME': 'uq_email',
+            'NON_UNIQUE': 0,
+            'COLUMN_NAME': 'email',
+          },
+          <String, dynamic>{
+            'INDEX_NAME': 'idx_name',
+            'NON_UNIQUE': 1,
+            'COLUMN_NAME': 'name',
+          },
+          <String, dynamic>{
+            'INDEX_NAME': 'uq_pair',
+            'NON_UNIQUE': 0,
+            'COLUMN_NAME': 'a',
+          },
+          <String, dynamic>{
+            'INDEX_NAME': 'uq_pair',
+            'NON_UNIQUE': 0,
+            'COLUMN_NAME': 'b',
+          },
+        ],
+      });
+      expect(unique, <String>{'id', 'email'});
+    });
+
+    test('复合主键本身不产生单列唯一列', () {
+      final unique = erUniqueColumns(<String, dynamic>{
+        'primary_key': <dynamic>['a', 'b'],
+        'indexes': <dynamic>[],
+      });
+      expect(unique, isEmpty);
+    });
+  });
 }
+
+/// 测试辅助：关系的人读标签（模型没有 label 方法，用两端拼）。
+String erLabel(ErRelation relation) =>
+    '${relation.localTable}.${relation.localColumn}→${relation.refTable}.${relation.refColumn}';

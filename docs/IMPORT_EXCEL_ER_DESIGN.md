@@ -285,3 +285,32 @@ Future<void> showRelationDesigner(
 | Lead | 本文件、`i18n_literals.dart` 接线、集成冲突协调、全量验证、`HANDOVER_ROUND50.md`、提交 |
 
 > 交叉依赖：import-ux 的第 5 步与 quick-create 的第 4 步都 import `relation_designer.dart`；er-designer 第一件事先把 §5.1 接口骨架提交（可以函数体 TODO），并在完成后通知 Lead。
+
+## 8. 第 50 轮收尾补充（用户第二轮反馈，2026-10-24 晚）
+
+用户原话：
+> 处理遗留风险，所以导入使用流式，验证是流式读取验证。关系图中，导入一个表自动推导并导入与他关联的表，同时优化多对多的推导，同时连线没有箭头无法直观看到关系，同时给我一个多表Excel进行测试。
+
+### 8.1 Excel 流式（task-5 / rust-excel）
+
+- **preview / validate / probe / execute 全部流式拉行**：xlsx/xlsm 用 `zip` + `quick-xml` 逐行解析 sheet XML（sharedStrings 一次加载但不再物化单元格矩阵）；SpreadsheetML 流式 XML 扫描；ODS 流式（P1）；`xlsb` 暂留 calamine 兜底 + warning，**旧版 BIFF8 `.xls` 优先流式、否则明确标注兜底**。
+- **inspect 不再整表载入**：xlsx 读 `workbook.xml` + rels + 每表 `dimension`（表头只读前两行）；SpreadsheetML 单次扫描取表名/行数；`sheets[]/sheet/read.sheet/skip_rows/schema/fields.mode` 契约不变，可新增 `streaming: true|false` 与兜底 warning。
+- 进度保持按行（total 来自 dimension/扫描；未知时给已读行数）。
+- 验收：合成 2–5 万行 xlsx 的 preview/validate 行数与选表正确；旧 fixtures 全绿；`docs/EXPORT_IMPORT_CONTRACT.md` 增流式矩阵与兜底说明。
+
+### 8.2 E-R 图（task-6 / er-designer）
+
+1. **箭头**：所有关系边（已有/新建/建议）在目标端画清晰箭头（按贝塞尔切线方向），hover/选中高亮，命中逻辑不变。
+2. **自动带入关联表**：加入一张表（含导入第 5 步 seed）时，自动把已有外键的父/子表加入画布到 5 张上限；顶部提示「已自动加入关联表：…」+「撤销自动加入」；避免循环、用户移除后不立即加回。
+3. **多对多推导**：
+   - 中间表识别（恰好 2 个单列外键指向 2 张不同表）→ 节点徽标「中间表（多对多）」，并在两端实体表间画「多对多 · <中间表>」关系线（可折叠中间表节点）。
+   - 新建外键对话框增加「关系类型：多对一（默认）/ 多对多（自动建中间表）」，后者走既有 junction `createTable`。
+   - 再次在两表间建关系：已有中间表则提示不要重复；双方连接列都不唯一时默认建议中间表（保留直接添加）。
+   - 对同一批导入、尚无外键的表按列名推导「建议关系」：`<x>_id`/`<x>Id` → 表 `x`/`xs`/`xes` 单列主键；虚线建议边 + 工具栏「建立建议外键 (N)」批量应用。
+4. 测试文件：`desktop/rust/tests/fixtures/relational_multi.xlsx`（5 个工作表，≤5 限制）：
+   - `users` / `categories` / `products(category_id)` / `orders(user_id)` / `order_items(order_id, product_id)`；
+   - 预期建议：products.category_id→categories、orders.user_id→users、order_items.order_id→orders、order_items.product_id→products；
+   - `order_items` 恰好两个单列外键 → 识别为中间表，orders↔products 显示多对多。
+   - 生成脚本 `gen_relational_multi.py`；用户可直接用 `~/Downloads/DBPilot_多表测试.xlsx`。
+5. 英文文案进 `en_relations.dart`；保持 `RelationDesigner`/`showRelationDesigner` 公开接口不变。
+

@@ -25,6 +25,23 @@ const Map<String, String> enRelations = <String, String>{
   '加载失败': 'Loading failed',
   '重试': 'Retry',
   '关系已更新': 'Relations updated',
+  // ---- 第 50 轮收尾：箭头 / 自动带入 / 多对多 / 建议关系 ----------------
+  '中间表（多对多）': 'Junction table (many-to-many)',
+  '折叠中间表': 'Collapse junction table',
+  '展开中间表': 'Expand junction table',
+  '建议：': 'Suggested: ',
+  '撤销自动加入': 'Undo auto-add',
+  '两表之间已有中间表': 'A junction table already links these tables',
+  '仍然直接添加': 'Add directly anyway',
+  '仍然直接添加外键': 'Add a direct foreign key anyway',
+  '建议创建中间表': 'Junction table recommended',
+  '关系类型': 'Relation type',
+  '多对一（直接外键）': 'Many-to-one (direct foreign key)',
+  '多对多（自动创建中间表）': 'Many-to-many (creates a junction table)',
+  '两个连接字段都不是唯一列，直接外键的引用列可能不合法。建议创建中间表（多对多）；也可以仍然直接添加外键。': 'Neither connecting column is unique, so a direct foreign key may be invalid. Creating a junction table (many-to-many) is recommended; you can still add a direct foreign key instead.',
+  '点击建立这条建议外键': 'Click to create this suggested foreign key',
+  '按列名推导的建议关系批量建立外键':
+      'Create foreign keys for all suggestions derived from column names',
   // 动作文案主要由 pickText 生成；这里保留一份 en 映射，供将来别的入口复用中文键。
   '不操作': 'NO ACTION',
   '级联（一并删除子行）': 'ON DELETE CASCADE',

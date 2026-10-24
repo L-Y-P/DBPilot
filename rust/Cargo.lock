@@ -1990,6 +1990,7 @@ dependencies = [
  "futures",
  "hex",
  "percent-encoding",
+ "quick-xml",
  "russh",
  "russh-keys",
  "serde",
@@ -2000,6 +2001,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]

@@ -118,6 +118,38 @@ class _RelationDesignerState extends State<RelationDesigner> {
   int? _hoverRelation;
   String? _hoverDot;
 
+  /// 每张表里「单列唯一」的字段（单列主键 / 单列唯一索引），用于判断被引用列
+  /// 能不能独立作为外键目标；同时决定「双方都不唯一 → 默认建议中间表」。
+  final Map<String, Set<String>> _uniqueColumns = <String, Set<String>>{};
+
+  /// 最近一次自动带入的关联表（顶部提示 + 撤销）。
+  List<String> _autoAdded = <String>[];
+
+  /// 用户手动移除 / 撤销自动加入过的表，不再自动带回。
+  final Set<String> _userRemoved = <String>{};
+
+  /// 被折叠的中间表（节点隐藏，只保留两端多对多连线）。
+  final Set<String> _collapsedJunctions = <String>{};
+
+  /// 当前选中（点击打开过详情）的关系 key，画布上高亮。
+  String? _selectedRelationKey;
+
+  /// 批量建立建议外键时的错误 / 提示（就地显示在工具栏下方）。
+  String? _actionError;
+  bool _applyingSuggestions = false;
+  bool _expanding = false;
+
+  /// 中间表识别 / 建议关系的缓存版本号：表或外键变化时 +1，避免画布每帧或
+  /// 每次 hover 都重新扫描一遍关系图。
+  int _graphRevision = 0;
+  int _junctionCacheRevision = -1;
+  Map<String, ErJunctionInfo>? _junctionCache;
+  int _suggestionCacheRevision = -1;
+  List<ErRelation>? _suggestionCache;
+
+  /// 表 / 外键结构发生变化后调用（必须在 setState 里或之后再 build 之前）。
+  void _bumpGraph() => _graphRevision++;
+
   bool get _isSqlite => AppState.instance.isSqlite;
 
   ErDriver get _driver => ErDriver.fromName(AppState.instance.driver);
@@ -127,15 +159,47 @@ class _RelationDesignerState extends State<RelationDesigner> {
   /// 拖动时锁住画布滚动，避免滚动手势和拖拽抢指针。
   bool get _dragLocked => _drag != null || _dotPressed || _draggingNode != null;
 
-  /// 两端都已在画布上的外键（去重后）。
+  Set<String> get _addedNames => <String>{for (final t in _tables) t.name};
+
+  /// 画布上实际显示的表（折叠的中间表节点不显示）。
+  List<ErTable> get _visibleTables => <ErTable>[
+    for (final table in _tables)
+      if (!_collapsedJunctions.contains(table.name)) table,
+  ];
+
+  Set<String> get _visibleNames => <String>{
+    for (final table in _visibleTables) table.name,
+  };
+
+  /// 中间表识别（基于全部已加入表，折叠与否都算，这样连线不会消失）。
+  ///
+  /// 结果按 [_graphRevision] 缓存：5 张表的画布上每个节点表头都要读它，
+  /// 不缓存时一次 hover 重绘会重复扫描 5~6 次关系图。
+  Map<String, ErJunctionInfo> get _junctionInfos {
+    final cached = _junctionCache;
+    if (cached != null && _junctionCacheRevision == _graphRevision) {
+      return cached;
+    }
+    final computed = detectJunctionTables(
+      relationsByTable: _localRelations,
+      tables: _addedNames,
+    );
+    _junctionCache = computed;
+    _junctionCacheRevision = _graphRevision;
+    return computed;
+  }
+
+  List<ErManyToManyLink> get _m2mLinks => manyToManyLinks(_junctionInfos);
+
+  /// 两端都可见的外键（去重后）。
   List<ErRelation> get _relations {
-    final added = <String>{for (final table in _tables) table.name};
+    final visible = _visibleNames;
     final out = <ErRelation>[];
     final seen = <String>{};
-    for (final table in _tables) {
+    for (final table in _visibleTables) {
       final local = _localRelations[table.name] ?? const <ErRelation>[];
       for (final relation in local) {
-        if (!added.contains(relation.refTable)) continue;
+        if (!visible.contains(relation.refTable)) continue;
         if (!seen.add(relation.key)) continue;
         out.add(relation);
       }
@@ -143,8 +207,26 @@ class _RelationDesignerState extends State<RelationDesigner> {
     return out;
   }
 
-  ErCanvasLayout get _layout =>
-      ErCanvasLayout(tables: _tables, positions: _positions, metrics: _metrics);
+  /// 按列名推导的建议关系（虚线，尚未写库）；最多 8 条，防止宽表把画布铺满。
+  List<ErRelation> get _suggestions {
+    final cached = _suggestionCache;
+    if (cached != null && _suggestionCacheRevision == _graphRevision) {
+      return cached;
+    }
+    final computed = suggestRelations(
+      tables: _tables,
+      relationsByTable: _localRelations,
+    );
+    _suggestionCache = computed;
+    _suggestionCacheRevision = _graphRevision;
+    return computed;
+  }
+
+  ErCanvasLayout get _layout => ErCanvasLayout(
+    tables: _visibleTables,
+    positions: _positions,
+    metrics: _metrics,
+  );
 
   @override
   void initState() {
@@ -160,6 +242,10 @@ class _RelationDesignerState extends State<RelationDesigner> {
     setState(() {
       _loading = true;
       _loadError = null;
+      _autoAdded = <String>[];
+      _collapsedJunctions.clear();
+      _selectedRelationKey = null;
+      _actionError = null;
     });
     try {
       final schema = await Api.instance.builderSchema(widget.database);
@@ -177,10 +263,12 @@ class _RelationDesignerState extends State<RelationDesigner> {
       }
       final tables = <ErTable>[];
       final relations = <String, List<ErRelation>>{};
+      final unique = <String, Set<String>>{};
       for (final name in wanted) {
         final loaded = await _readTable(name, schemaRows[name]!);
         tables.add(loaded.table);
         relations[name] = loaded.relations;
+        unique[name] = loaded.uniqueColumns;
       }
       if (!mounted) return;
       _schemaRows = schemaRows;
@@ -189,9 +277,15 @@ class _RelationDesignerState extends State<RelationDesigner> {
         _localRelations
           ..clear()
           ..addAll(relations);
+        _uniqueColumns
+          ..clear()
+          ..addAll(unique);
         _positions.clear(); // 首帧用真实画布宽度自动布局
         _loading = false;
+        _bumpGraph();
       });
+      // seed 表（导入 / 快速建表）加入后，自动带入已有外键关联的父 / 子表。
+      await _expandRelated();
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -210,19 +304,22 @@ class _RelationDesignerState extends State<RelationDesigner> {
       final structure = await Api.instance.structure(widget.database, name);
       final table = ErTable.fromStructure(name, structure);
       final relations = ErRelation.fromStructure(name, structure);
+      final unique = erUniqueColumns(structure);
       if (table.columns.isEmpty) {
         return _LoadedTable(
           ErTable.fromSchema(<String, dynamic>{'name': name, ...schemaRow}),
           relations.isEmpty
               ? ErRelation.fromSchema(name, schemaRow)
               : relations,
+          unique,
         );
       }
-      return _LoadedTable(table, relations);
+      return _LoadedTable(table, relations, unique);
     } catch (_) {
       return _LoadedTable(
         ErTable.fromSchema(<String, dynamic>{'name': name, ...schemaRow}),
         ErRelation.fromSchema(name, schemaRow),
+        const <String>{},
       );
     }
   }
@@ -241,6 +338,8 @@ class _RelationDesignerState extends State<RelationDesigner> {
           if (table.name == tableName) loaded.table else table,
       ];
       _localRelations[tableName] = loaded.relations;
+      _uniqueColumns[tableName] = loaded.uniqueColumns;
+      _bumpGraph();
     });
   }
 
@@ -334,17 +433,27 @@ class _RelationDesignerState extends State<RelationDesigner> {
     if (wanted.isEmpty) return;
     final loadedTables = <ErTable>[];
     final loadedRelations = <String, List<ErRelation>>{};
+    final loadedUnique = <String, Set<String>>{};
     for (final name in wanted) {
       final row = _schemaRows[name] ?? <String, dynamic>{'name': name};
       final loaded = await _readTable(name, row);
       loadedTables.add(loaded.table);
       loadedRelations[name] = loaded.relations;
+      loadedUnique[name] = loaded.uniqueColumns;
+      // 用户重新手动加入曾经自动移除的表，说明这次是他主动要的。
+      _userRemoved.remove(name);
     }
     if (!mounted) return;
     setState(() {
       _tables = <ErTable>[..._tables, ...loadedTables];
       _localRelations.addAll(loadedRelations);
+      _uniqueColumns.addAll(loadedUnique);
+      for (final name in wanted) {
+        _autoAdded.remove(name);
+      }
+      _bumpGraph();
     });
+    await _expandRelated();
   }
 
   void _removeTable(String name) {
@@ -355,8 +464,151 @@ class _RelationDesignerState extends State<RelationDesigner> {
     setState(() {
       _tables = kept;
       _localRelations.remove(name);
+      _uniqueColumns.remove(name);
       _positions.remove(name);
+      _collapsedJunctions.remove(name);
+      _autoAdded.remove(name);
+      // 用户手动移除过的表不再自动加回；选中的关系也可能因此消失。
+      _userRemoved.add(name);
+      _selectedRelationKey = null;
+      _bumpGraph();
     });
+  }
+
+  // ------------------------------------------------------- 自动带入关联表
+
+  /// 「表 → 有外键关联的表名列表」（父表 + 子表两个方向，来自 builderSchema）。
+  Map<String, List<String>> _buildRelatedMap() {
+    final related = <String, List<String>>{};
+    void link(String a, String b) {
+      if (a == b) return;
+      final list = related.putIfAbsent(a, () => <String>[]);
+      if (!list.contains(b)) list.add(b);
+    }
+
+    for (final entry in _schemaRows.entries) {
+      for (final row in erRowsOf(entry.value['foreign_keys'])) {
+        final ref = erStringOf(row['ref_table']);
+        if (ref.isEmpty || !_schemaRows.containsKey(ref)) continue;
+        link(entry.key, ref);
+        link(ref, entry.key);
+      }
+    }
+    return related;
+  }
+
+  /// 沿已有外键自动带入关联表（最多到画布上限），并在顶部显示提示。
+  Future<void> _expandRelated() async {
+    if (_expanding || _loading || _loadError != null) return;
+    final added = _addedNames;
+    if (added.length >= widget.maxTables) return;
+    final candidates = expandRelatedTableNames(
+      added: added,
+      related: _buildRelatedMap(),
+      excluded: _userRemoved,
+      maxTables: widget.maxTables,
+    );
+    if (candidates.isEmpty) return;
+    _expanding = true;
+    try {
+      final loadedTables = <ErTable>[];
+      final loadedRelations = <String, List<ErRelation>>{};
+      final loadedUnique = <String, Set<String>>{};
+      final accepted = <String>[];
+      for (final name in candidates) {
+        final row = _schemaRows[name];
+        if (row == null) continue;
+        final loaded = await _readTable(name, row);
+        loadedTables.add(loaded.table);
+        loadedRelations[name] = loaded.relations;
+        loadedUnique[name] = loaded.uniqueColumns;
+        accepted.add(name);
+      }
+      if (!mounted || accepted.isEmpty) return;
+      setState(() {
+        _tables = <ErTable>[..._tables, ...loadedTables];
+        _localRelations.addAll(loadedRelations);
+        _uniqueColumns.addAll(loadedUnique);
+        _autoAdded = accepted;
+        _bumpGraph();
+      });
+    } finally {
+      _expanding = false;
+    }
+  }
+
+  /// 撤销最近一次自动加入：移除这些表，并记住不再自动带回。
+  void _undoAutoAdded() {
+    final remove = <String>{..._autoAdded};
+    if (remove.isEmpty) return;
+    setState(() {
+      _tables = <ErTable>[
+        for (final table in _tables)
+          if (!remove.contains(table.name)) table,
+      ];
+      for (final name in remove) {
+        _localRelations.remove(name);
+        _uniqueColumns.remove(name);
+        _positions.remove(name);
+        _collapsedJunctions.remove(name);
+      }
+      _userRemoved.addAll(remove);
+      _autoAdded = <String>[];
+      _selectedRelationKey = null;
+      _bumpGraph();
+    });
+  }
+
+  // ------------------------------------------------------- 建议关系（虚线）
+
+  /// 批量（或单条）建立按列名推导的建议外键；SQLite 不支持 ALTER 增删外键。
+  Future<void> _applySuggestions({ErRelation? only}) async {
+    if (_isSqlite || _applyingSuggestions) return;
+    final targets = <ErRelation>[if (only != null) only else ..._suggestions];
+    if (targets.isEmpty) return;
+    setState(() {
+      _applyingSuggestions = true;
+      _actionError = null;
+    });
+    final appliedTables = <String>{};
+    try {
+      for (final suggestion in targets) {
+        final existingNames = <String>{
+          for (final relation
+              in _localRelations[suggestion.localTable] ?? const <ErRelation>[])
+            if (relation.name.isNotEmpty) relation.name,
+        };
+        await Api.instance.alterTable(
+          widget.database,
+          suggestion.localTable,
+          <String, dynamic>{
+            'add_foreign_keys': <Map<String, dynamic>>[
+              foreignKeyPayload(
+                name: uniqueFkName(
+                  suggestion.localTable,
+                  suggestion.localColumn,
+                  existingNames,
+                ),
+                localColumn: suggestion.localColumn,
+                refTable: suggestion.refTable,
+                refColumn: suggestion.refColumn,
+              ),
+            ],
+          },
+        );
+        appliedTables.add(suggestion.localTable);
+      }
+    } catch (error) {
+      if (mounted) setState(() => _actionError = error.toString());
+    } finally {
+      for (final name in appliedTables) {
+        await _reloadTable(name);
+      }
+      if (mounted) {
+        setState(() => _applyingSuggestions = false);
+        if (appliedTables.isNotEmpty) await widget.onChanged?.call();
+      }
+    }
   }
 
   // ------------------------------------------------------------ 关系增删
@@ -368,10 +620,38 @@ class _RelationDesignerState extends State<RelationDesigner> {
     required String refColumn,
   }) async {
     if (refTable.columns.isEmpty) return;
-    // 同一对表之间已有关系 → 默认改为创建中间表（多对多）。
-    if (localTable.name != refTable.name &&
+    final differentTables = localTable.name != refTable.name;
+    // 1) 两表之间已经有中间表：多对多关系已经存在，提示不要重复创建。
+    if (differentTables) {
+      final existingJunction = _junctionConnecting(
+        localTable.name,
+        refTable.name,
+      );
+      if (existingJunction != null) {
+        final direct = await _warnExistingJunction(existingJunction);
+        if (!direct || !mounted) return;
+      }
+    }
+    // 2) 两表之间已有直接关系 → 默认改为创建中间表（多对多）。
+    if (differentTables &&
         hasRelationBetween(_relations, localTable.name, refTable.name)) {
-      final choice = await _offerJunction(localTable, refTable);
+      final choice = await _offerJunction(
+        localTable,
+        refTable,
+        reason: _JunctionReason.existingRelation,
+      );
+      if (choice != _JunctionChoice.direct) return;
+      if (!mounted) return;
+    }
+    // 3) 双方连接列都不唯一：直接外键的引用列可能不合法，默认建议中间表。
+    final localUnique = _isUniqueColumn(localTable, localColumn);
+    final refUnique = _isUniqueColumn(refTable, refColumn);
+    if (differentTables && !localUnique && !refUnique) {
+      final choice = await _offerJunction(
+        localTable,
+        refTable,
+        reason: _JunctionReason.notUnique,
+      );
       if (choice != _JunctionChoice.direct) return;
       if (!mounted) return;
     }
@@ -391,7 +671,10 @@ class _RelationDesignerState extends State<RelationDesigner> {
         initialLocalColumn: localColumn,
         initialRefColumn: refColumn,
         initialName: uniqueFkName(localTable.name, localColumn, existingNames),
+        driver: _driver,
+        existingTableNames: <String>{..._schemaRows.keys},
         onCreate: (payload) => _createForeignKey(localTable.name, payload),
+        onCreateJunction: _createJunction,
       ),
       actions: <Widget>[
         Builder(
@@ -400,7 +683,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
         ),
         Builder(
           builder: (context) => Btn(
-            '创建外键',
+            '创建',
             primary: true,
             onPressed: () => key.currentState?.submit(),
           ),
@@ -408,6 +691,51 @@ class _RelationDesignerState extends State<RelationDesigner> {
       ],
     );
     if (created == true && mounted) await widget.onChanged?.call();
+  }
+
+  /// 某张表的某个字段是否单列唯一（structure 读取失败时用单列主键兜底）。
+  bool _isUniqueColumn(ErTable table, String column) {
+    final unique = _uniqueColumns[table.name];
+    if (unique != null && unique.isNotEmpty) return unique.contains(column);
+    final primary = table.primaryColumns;
+    return primary.length == 1 && primary.first.name == column;
+  }
+
+  /// 连接 [a] 与 [b] 的中间表（没有则返回 null）。
+  ErJunctionInfo? _junctionConnecting(String a, String b) {
+    for (final info in _junctionInfos.values) {
+      if (info.connects(a, b)) return info;
+    }
+    return null;
+  }
+
+  /// 两表之间已经有中间表时的提示；返回 true 表示用户仍然要直接添加外键。
+  Future<bool> _warnExistingJunction(ErJunctionInfo info) async {
+    final junction = info.junctionTable;
+    final message = pickText(
+      '已存在中间表 $junction 表示这两张表的多对多关系，不需要再添加重复外键。',
+      'Junction table $junction already represents the many-to-many relation between these tables; adding another foreign key is unnecessary.',
+    );
+    final result = await showAppModal<bool>(
+      context: context,
+      title: '两表之间已有中间表',
+      builder: (context) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[Text(message, style: kSmallMuted)],
+      ),
+      actions: <Widget>[
+        Builder(
+          builder: (context) =>
+              Btn('取消', onPressed: () => Navigator.of(context).pop(false)),
+        ),
+        Builder(
+          builder: (context) =>
+              Btn('仍然直接添加', onPressed: () => Navigator.of(context).pop(true)),
+        ),
+      ],
+    );
+    return result == true;
   }
 
   Future<void> _createForeignKey(
@@ -435,11 +763,12 @@ class _RelationDesignerState extends State<RelationDesigner> {
     await _reloadTable(localTable);
   }
 
-  /// 两表已有关系时的中间表提示；返回用户的选择。
+  /// 两表已有关系 / 双方列都不唯一时的中间表提示；返回用户的选择。
   Future<_JunctionChoice> _offerJunction(
     ErTable localTable,
-    ErTable refTable,
-  ) async {
+    ErTable refTable, {
+    required _JunctionReason reason,
+  }) async {
     final existingNames = <String>{..._schemaRows.keys};
     final plan = planJunction(
       driver: _driver,
@@ -454,7 +783,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
     final key = GlobalKey<_JunctionDialogState>();
     final result = await showAppModal<String>(
       context: context,
-      title: '两表之间已存在关系',
+      title: reason == _JunctionReason.notUnique ? '建议创建中间表' : '两表之间已存在关系',
       builder: (context) => _JunctionDialog(
         key: key,
         plan: plan,
@@ -462,6 +791,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
         localTable: localTable,
         refTable: refTable,
         existingTableNames: existingNames,
+        reason: reason,
         onCreate: _createJunction,
       ),
       actions: <Widget>[
@@ -503,15 +833,27 @@ class _RelationDesignerState extends State<RelationDesigner> {
     }
     var table = ErTable(name: plan.name, columns: plan.columns);
     var relations = plan.relations;
+    var unique = <String>{plan.idColumn};
     if (row != null) {
       final loaded = await _readTable(plan.name, row);
       table = loaded.table;
       relations = loaded.relations;
+      unique = loaded.uniqueColumns;
     }
     if (!mounted) return;
     setState(() {
-      _tables = <ErTable>[..._tables, table];
+      _tables = <ErTable>[
+        for (final existing in _tables)
+          if (existing.name != plan.name) existing,
+        table,
+      ];
       _localRelations[plan.name] = relations;
+      _uniqueColumns[plan.name] = unique;
+      _userRemoved.remove(plan.name);
+      _autoAdded.remove(plan.name);
+      _collapsedJunctions.remove(plan.name);
+      _selectedRelationKey = null;
+      _bumpGraph();
     });
   }
 
@@ -649,8 +991,14 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   void _handleCanvasTap(Offset local, List<ErRelationCurve> curves) {
     final hit = hitTestRelationCurves(curves, local);
-    if (hit == null) return;
+    if (hit == null) {
+      if (_selectedRelationKey != null) {
+        setState(() => _selectedRelationKey = null);
+      }
+      return;
+    }
     final relation = curves[hit].relation;
+    setState(() => _selectedRelationKey = relation.key);
     _openRelationDialog(relation);
   }
 
@@ -674,6 +1022,18 @@ class _RelationDesignerState extends State<RelationDesigner> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             _toolbar(),
+            if (_autoAdded.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 6),
+              _autoAddedHint(),
+            ],
+            if (_actionError != null) ...<Widget>[
+              const SizedBox(height: 6),
+              AlertBox(
+                _actionError!,
+                tone: AlertTone.error,
+                onClose: () => setState(() => _actionError = null),
+              ),
+            ],
             if (_isSqlite) ...<Widget>[
               const SizedBox(height: 6),
               _sqliteHint(),
@@ -689,6 +1049,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
   Widget _toolbar() {
     final added = _tables.length;
     final max = widget.maxTables;
+    final suggestionCount = _suggestions.length;
     return Row(
       children: <Widget>[
         Expanded(
@@ -716,6 +1077,22 @@ class _RelationDesignerState extends State<RelationDesigner> {
               : _openAddTables,
         ),
         const SizedBox(width: 8),
+        if (suggestionCount > 0) ...<Widget>[
+          Btn(
+            pickText(
+              '建立建议外键 ($suggestionCount)',
+              'Create suggested FKs ($suggestionCount)',
+            ),
+            key: const ValueKey('er-apply-suggestions'),
+            small: widget.compact,
+            icon: Icons.auto_fix_high,
+            tooltip: _isSqlite ? 'SQLite 不支持用 ALTER 新增外键' : '按列名推导的建议关系批量建立外键',
+            onPressed: _isSqlite || _applyingSuggestions
+                ? null
+                : _applySuggestions,
+          ),
+          const SizedBox(width: 8),
+        ],
         Btn(
           '自动布局',
           key: const ValueKey('er-auto-layout'),
@@ -744,6 +1121,33 @@ class _RelationDesignerState extends State<RelationDesigner> {
             key: const ValueKey('er-sqlite-hint'),
             style: kSmallMuted,
           ),
+        ),
+      ],
+    );
+  }
+
+  /// 顶部提示：本次自动带入了哪些关联表，并提供撤销。
+  Widget _autoAddedHint() {
+    final names = _autoAdded.join(pickText('、', ', '));
+    return Row(
+      children: <Widget>[
+        Icon(Icons.link, size: 13, color: AppColors.infoText),
+        const SizedBox(width: 5),
+        Expanded(
+          child: Text(
+            pickText(
+              '已自动加入关联表：$names',
+              'Related tables added automatically: $names',
+            ),
+            key: const ValueKey('er-auto-added-hint'),
+            style: TextStyle(fontSize: 11.5, color: AppColors.infoText),
+          ),
+        ),
+        Btn(
+          '撤销自动加入',
+          key: const ValueKey('er-undo-auto'),
+          small: true,
+          onPressed: _undoAutoAdded,
         ),
       ],
     );
@@ -814,6 +1218,15 @@ class _RelationDesignerState extends State<RelationDesigner> {
         final layout = _layout;
         final relations = _relations;
         final curves = relationCurves(layout, relations);
+        final suggestionCurves = relationCurves(layout, _suggestions);
+        final m2mLinks = <ErManyToManyLink>[];
+        final m2mCurves = <ErRelationCurve>[];
+        for (final link in _m2mLinks) {
+          final curve = manyToManyCurve(layout, link);
+          if (curve == null) continue;
+          m2mLinks.add(link);
+          m2mCurves.add(curve);
+        }
         final content = layout.contentSize(viewport: viewport, margin: 40);
         final dropTarget = _drag == null ? null : layout.fieldAt(_drag!.point);
         final canvas = SizedBox(
@@ -834,20 +1247,30 @@ class _RelationDesignerState extends State<RelationDesigner> {
               child: Stack(
                 clipBehavior: Clip.none,
                 children: <Widget>[
+                  for (final table in _visibleTables) _node(table),
+                  // 边画在节点之上：箭头落在目标端边框上，不会被卡片盖住。
                   Positioned.fill(
-                    child: CustomPaint(
-                      painter: _ErCanvasPainter(
-                        layout: layout,
-                        curves: curves,
-                        drag: _drag,
-                        hoveredRelation: _hoverRelation,
-                        dropTarget: dropTarget,
+                    child: IgnorePointer(
+                      child: CustomPaint(
+                        painter: _ErCanvasPainter(
+                          layout: layout,
+                          curves: curves,
+                          suggestionCurves: suggestionCurves,
+                          m2mLinks: m2mLinks,
+                          m2mCurves: m2mCurves,
+                          drag: _drag,
+                          hoveredRelation: _hoverRelation,
+                          selectedRelationKey: _selectedRelationKey,
+                          dropTarget: dropTarget,
+                        ),
                       ),
                     ),
                   ),
-                  for (final table in _tables) _node(table),
                   for (var i = 0; i < curves.length; i++)
                     _relationLabel(curves[i], i),
+                  for (var i = 0; i < m2mCurves.length; i++)
+                    _manyToManyLabel(m2mLinks[i]),
+                  for (final curve in suggestionCurves) _suggestionLabel(curve),
                 ],
               ),
             ),
@@ -911,6 +1334,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
   Widget _nodeHeader(ErTable table, ErNodeMetrics metrics) {
     final tableName = table.name;
     final columnCount = table.columns.length;
+    final junction = _junctionInfos[tableName];
     final header = Container(
       height: metrics.headerHeight,
       padding: const EdgeInsets.only(left: 8, right: 2),
@@ -932,16 +1356,44 @@ class _RelationDesignerState extends State<RelationDesigner> {
               ),
             ),
           ),
-          Text(
-            pickText('$columnCount 列', '$columnCount cols'),
-            style: TextStyle(fontSize: 9, color: AppColors.muted),
-          ),
+          if (junction != null)
+            Tooltip(
+              message: '中间表（多对多）',
+              child: Container(
+                constraints: BoxConstraints(maxWidth: widget.compact ? 72 : 86),
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: AppColors.warnBg,
+                  border: Border.all(color: AppColors.warnBorder),
+                  borderRadius: BorderRadius.circular(3),
+                ),
+                child: Text(
+                  '中间表（多对多）',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 8, color: AppColors.warnText),
+                ),
+              ),
+            )
+          else
+            Text(
+              pickText('$columnCount 列', '$columnCount cols'),
+              style: TextStyle(fontSize: 9, color: AppColors.muted),
+            ),
+          if (junction != null)
+            IconBtn(
+              Icons.unfold_less,
+              key: ValueKey('er-collapse-$tableName'),
+              tooltip: '折叠中间表',
+              dimension: 22,
+              glyphSize: 13,
+              onPressed: () => _toggleJunction(tableName),
+            ),
           const SizedBox(width: 2),
           IconBtn(
             Icons.close,
             key: ValueKey('er-remove-$tableName'),
             tooltip: '移除表',
-            small: true,
             dimension: 22,
             glyphSize: 12,
             onPressed: () => _removeTable(tableName),
@@ -1099,10 +1551,149 @@ class _RelationDesignerState extends State<RelationDesigner> {
       ),
     );
   }
+
+  /// 折叠 / 展开中间表节点（折叠后只保留两端的多对多连线）。
+  void _toggleJunction(String junctionTable) {
+    setState(() {
+      if (!_collapsedJunctions.remove(junctionTable)) {
+        _collapsedJunctions.add(junctionTable);
+      }
+      _selectedRelationKey = null;
+    });
+  }
+
+  /// 两端实体表之间的「多对多 · 中间表」标签；点击折叠 / 展开中间表节点。
+  Widget _manyToManyLabel(ErManyToManyLink link) {
+    final junction = link.junctionTable;
+    final collapsed = _collapsedJunctions.contains(junction);
+    final hint = collapsed ? '展开中间表' : '折叠中间表';
+    final label = pickText('多对多 · $junction', 'many-to-many · $junction');
+    return _edgeLabel(
+      left: _m2mLabelAnchor(link),
+      tooltip: hint,
+      keyValue: 'er-m2m-$junction',
+      background: AppColors.infoBg,
+      borderColor: AppColors.infoBorder,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(Icons.link, size: 10, color: AppColors.infoText),
+          const SizedBox(width: 3),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 9.5, color: AppColors.infoText),
+            ),
+          ),
+        ],
+      ),
+      onTap: () => _toggleJunction(junction),
+    );
+  }
+
+  /// 建议关系的虚线标签；点击即建立这一条建议外键（SQLite 只读）。
+  Widget _suggestionLabel(ErRelationCurve curve) {
+    final relation = curve.relation;
+    final relationKey = relation.key;
+    return _edgeLabel(
+      left: curve.labelAnchor,
+      tooltip: _isSqlite ? 'SQLite 不支持用 ALTER 新增外键' : '点击建立这条建议外键',
+      keyValue: 'er-suggestion-$relationKey',
+      background: AppColors.warnBg,
+      borderColor: AppColors.warnBorder,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Text('建议：', style: TextStyle(fontSize: 9, color: AppColors.warnText)),
+          Flexible(
+            child: Text(
+              relation.displayLabel,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 9, color: AppColors.warnText),
+            ),
+          ),
+        ],
+      ),
+      onTap: _isSqlite ? null : () => _applySuggestions(only: relation),
+    );
+  }
+
+  /// 边标签的公共壳：按画布坐标定位，水平垂直居中。
+  Widget _edgeLabel({
+    required Offset left,
+    required String tooltip,
+    required String keyValue,
+    required Color background,
+    required Color borderColor,
+    required Widget child,
+    VoidCallback? onTap,
+  }) {
+    return Positioned(
+      left: left.dx,
+      top: left.dy,
+      child: FractionalTranslation(
+        translation: const Offset(-0.5, -0.5),
+        child: Tooltip(
+          message: tooltip,
+          waitDuration: const Duration(milliseconds: 300),
+          child: MouseRegion(
+            cursor: onTap == null
+                ? SystemMouseCursors.basic
+                : SystemMouseCursors.click,
+            child: GestureDetector(
+              key: ValueKey(keyValue),
+              onTap: onTap,
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: 210),
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: background,
+                  border: Border.all(color: borderColor),
+                  borderRadius: BorderRadius.circular(3),
+                ),
+                child: child,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 多对多标签锚点：两端实体表卡片中心连线的中点。
+  Offset _m2mLabelAnchor(ErManyToManyLink link) {
+    final layout = _layout;
+    final tableA = layout.tableNamed(link.tableA);
+    final tableB = layout.tableNamed(link.tableB);
+    final positionA = layout.positions[link.tableA];
+    final positionB = layout.positions[link.tableB];
+    if (tableA == null ||
+        tableB == null ||
+        positionA == null ||
+        positionB == null) {
+      return Offset.zero;
+    }
+    final metrics = layout.metrics;
+    final a = Offset(
+      positionA.dx + metrics.cardWidth / 2,
+      positionA.dy + metrics.heightOf(tableA) / 2,
+    );
+    final b = Offset(
+      positionB.dx + metrics.cardWidth / 2,
+      positionB.dy + metrics.heightOf(tableB) / 2,
+    );
+    return Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
+  }
 }
 
 /// 创建中间表 / 直接加第二个外键的选择。
 enum _JunctionChoice { junction, direct, cancel }
+
+/// 中间表提示的触发原因：两表已有关系 / 双方连接列都不唯一。
+enum _JunctionReason { existingRelation, notUnique }
 
 /// 拖拽中的临时连线。
 class _ConnectDrag {
@@ -1128,10 +1719,13 @@ class _ConnectDrag {
 
 /// 一张表的读取结果。
 class _LoadedTable {
-  const _LoadedTable(this.table, this.relations);
+  const _LoadedTable(this.table, this.relations, this.uniqueColumns);
 
   final ErTable table;
   final List<ErRelation> relations;
+
+  /// 单列唯一（单列主键 / 单列唯一索引）字段。
+  final Set<String> uniqueColumns;
 }
 
 /// 添加表弹窗里的候选项。
@@ -1147,29 +1741,81 @@ class _TableChoice {
 
 // ------------------------------------------------------------------ 画布绘制
 
-/// 画布绘制：网格背景、关系曲线 + 箭头、拖拽预览、放置目标高亮。
+/// 画布绘制：网格背景、三类关系曲线 + 目标端箭头、拖拽预览、放置目标高亮。
+///
+/// 三类边：真实外键（实线 + 箭头）、中间表多对多（��线 + 箭头）、按列名推导的
+/// 建议关系（虚线 + 箭头）。边层绘制在节点之上，箭头落在目标卡片边框上，
+/// 不会被卡片遮住。
 class _ErCanvasPainter extends CustomPainter {
   _ErCanvasPainter({
     required this.layout,
     required this.curves,
+    required this.suggestionCurves,
+    required this.m2mLinks,
+    required this.m2mCurves,
     required this.drag,
     required this.hoveredRelation,
+    required this.selectedRelationKey,
     required this.dropTarget,
   });
 
   final ErCanvasLayout layout;
   final List<ErRelationCurve> curves;
+  final List<ErRelationCurve> suggestionCurves;
+  final List<ErManyToManyLink> m2mLinks;
+  final List<ErRelationCurve> m2mCurves;
   final _ConnectDrag? drag;
   final int? hoveredRelation;
+  final String? selectedRelationKey;
   final ErFieldRef? dropTarget;
+
+  double get _arrowScale => layout.metrics.headerHeight <= 30 ? 0.85 : 1.0;
 
   @override
   void paint(Canvas canvas, Size size) {
     _paintGrid(canvas, size);
-    _paintDropTarget(canvas);
-    for (var i = 0; i < curves.length; i++) {
-      _paintCurve(canvas, curves[i], hovered: i == hoveredRelation);
+    // 建议关系在最底层（虚线、橙色），中间表多对多其次，真实外键最上层。
+    for (final curve in suggestionCurves) {
+      _paintDashedCurve(canvas, curve, AppColors.warnBorder);
+      _paintArrow(canvas, curve, AppColors.warnBorder, scale: _arrowScale);
     }
+    for (var i = 0; i < m2mCurves.length; i++) {
+      _paintSolidCurve(
+        canvas,
+        m2mCurves[i],
+        AppColors.accent,
+        width: 2.0,
+        highlighted: false,
+      );
+      _paintArrow(
+        canvas,
+        m2mCurves[i],
+        AppColors.accent,
+        scale: _arrowScale * 1.1,
+      );
+    }
+    for (var i = 0; i < curves.length; i++) {
+      final curve = curves[i];
+      final selected =
+          selectedRelationKey != null &&
+          curve.relation.key == selectedRelationKey;
+      final highlighted = i == hoveredRelation || selected;
+      final color = _colorFor(curve.relation.origin);
+      _paintSolidCurve(
+        canvas,
+        curve,
+        color,
+        width: highlighted ? 3.0 : 1.8,
+        highlighted: highlighted,
+      );
+      _paintArrow(
+        canvas,
+        curve,
+        color,
+        scale: _arrowScale * (highlighted ? 1.2 : 1.0),
+      );
+    }
+    _paintDropTarget(canvas);
     _paintDrag(canvas);
   }
 
@@ -1194,21 +1840,13 @@ class _ErCanvasPainter extends CustomPainter {
         return AppColors.ok;
       case ErRelationOrigin.junction:
         return AppColors.accent;
+      case ErRelationOrigin.suggested:
+        return AppColors.warnBorder;
     }
   }
 
-  void _paintCurve(
-    Canvas canvas,
-    ErRelationCurve curve, {
-    required bool hovered,
-  }) {
-    final color = _colorFor(curve.relation.origin);
-    final paint = Paint()
-      ..color = color
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = hovered ? 2.6 : 1.6
-      ..strokeCap = StrokeCap.round;
-    final path = Path()
+  Path _pathFor(ErRelationCurve curve) {
+    return Path()
       ..moveTo(curve.start.dx, curve.start.dy)
       ..cubicTo(
         curve.control1.dx,
@@ -1218,22 +1856,96 @@ class _ErCanvasPainter extends CustomPainter {
         curve.end.dx,
         curve.end.dy,
       );
-    canvas.drawPath(path, paint);
-    canvas.drawCircle(curve.start, 2.6, Paint()..color = color);
-    final direction = curve.endDirection;
-    final length = direction.distance;
-    if (length > 0) {
-      final unit = direction / length;
-      final normal = Offset(-unit.dy, unit.dx);
-      final tip = curve.end;
-      final base = tip - unit * 9;
-      final arrow = Path()
-        ..moveTo(tip.dx, tip.dy)
-        ..lineTo(base.dx + normal.dx * 4, base.dy + normal.dy * 4)
-        ..lineTo(base.dx - normal.dx * 4, base.dy - normal.dy * 4)
-        ..close();
-      canvas.drawPath(arrow, Paint()..color = color);
+  }
+
+  void _paintSolidCurve(
+    Canvas canvas,
+    ErRelationCurve curve,
+    Color color, {
+    required double width,
+    required bool highlighted,
+  }) {
+    if (highlighted) {
+      canvas.drawPath(
+        _pathFor(curve),
+        Paint()
+          ..color = color.withValues(alpha: 0.18)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = width + 6
+          ..strokeCap = StrokeCap.round,
+      );
     }
+    canvas.drawPath(
+      _pathFor(curve),
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = width
+        ..strokeCap = StrokeCap.round,
+    );
+    canvas.drawCircle(
+      curve.start,
+      highlighted ? 3.4 : 2.6,
+      Paint()..color = color,
+    );
+  }
+
+  /// 虚线：按采样折线交替画线段，建议关系用。
+  void _paintDashedCurve(Canvas canvas, ErRelationCurve curve, Color color) {
+    final points = curve.sample(segments: 48);
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6
+      ..strokeCap = StrokeCap.round;
+    const dash = 7.0;
+    const gap = 5.0;
+    var drawing = true;
+    var remaining = dash;
+    for (var i = 0; i + 1 < points.length; i++) {
+      var a = points[i];
+      final b = points[i + 1];
+      var segmentLength = (b - a).distance;
+      while (segmentLength > 0.0001) {
+        final step = math.min(remaining, segmentLength);
+        final t = step / segmentLength;
+        final next = Offset(a.dx + (b.dx - a.dx) * t, a.dy + (b.dy - a.dy) * t);
+        if (drawing) canvas.drawLine(a, next, paint);
+        a = next;
+        segmentLength -= step;
+        remaining -= step;
+        if (remaining <= 0.0001) {
+          drawing = !drawing;
+          remaining = drawing ? dash : gap;
+        }
+      }
+    }
+    canvas.drawCircle(curve.start, 2.4, Paint()..color = color);
+  }
+
+  /// 目标端箭头：尖端在曲线终点，沿贝塞尔终点切线方向回退成实心三角。
+  void _paintArrow(
+    Canvas canvas,
+    ErRelationCurve curve,
+    Color color, {
+    double scale = 1,
+  }) {
+    final head = ErArrowHead.forCurve(
+      curve,
+      length: 13 * scale,
+      halfWidth: 6 * scale,
+    );
+    if (head == null) return;
+    final triangle = Path()..addPolygon(head.triangle, true);
+    // 描一圈面板色，箭头压在卡片/网格上也能看清轮廓。
+    canvas.drawPath(
+      triangle,
+      Paint()
+        ..color = AppColors.panel.withValues(alpha: 0.9)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2,
+    );
+    canvas.drawPath(triangle, Paint()..color = color);
   }
 
   void _paintDrag(Canvas canvas) {
@@ -1439,7 +2151,10 @@ class _NewForeignKeyDialog extends StatefulWidget {
     required this.initialLocalColumn,
     required this.initialRefColumn,
     required this.initialName,
+    required this.driver,
+    required this.existingTableNames,
     required this.onCreate,
+    required this.onCreateJunction,
   });
 
   final ErTable localTable;
@@ -1447,7 +2162,10 @@ class _NewForeignKeyDialog extends StatefulWidget {
   final String initialLocalColumn;
   final String initialRefColumn;
   final String initialName;
+  final ErDriver driver;
+  final Set<String> existingTableNames;
   final Future<void> Function(Map<String, dynamic> payload) onCreate;
+  final Future<void> Function(ErJunctionPlan plan) onCreateJunction;
 
   @override
   State<_NewForeignKeyDialog> createState() => _NewForeignKeyDialogState();
@@ -1459,11 +2177,20 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
   late final TextEditingController _name;
   String _onDelete = '';
   String _onUpdate = '';
+  bool _manyToMany = false;
   String? _error;
   bool _busy = false;
 
   bool get _localNullable =>
       widget.localTable.columnNamed(_localColumn)?.nullable ?? true;
+
+  /// 多对多模式下要创建的中间表（两表缺单列主键时为 null）。
+  ErJunctionPlan? get _junctionPlan => planJunction(
+    driver: widget.driver,
+    localTable: widget.localTable,
+    refTable: widget.refTable,
+    existingTableNames: widget.existingTableNames,
+  );
 
   @override
   void initState() {
@@ -1502,6 +2229,34 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
 
   Future<void> submit() async {
     if (_busy) return;
+    if (_manyToMany) {
+      final plan = _junctionPlan;
+      if (plan == null) {
+        setState(
+          () => _error = pickText(
+            '目标表没有主键，无法创建中间表',
+            'A target table has no primary key, so a junction table cannot be created',
+          ),
+        );
+        return;
+      }
+      setState(() {
+        _busy = true;
+        _error = null;
+      });
+      try {
+        await widget.onCreateJunction(plan);
+        if (!mounted) return;
+        Navigator.of(context).pop(true);
+      } catch (error) {
+        if (!mounted) return;
+        setState(() {
+          _busy = false;
+          _error = error.toString();
+        });
+      }
+      return;
+    }
     final name = _name.text.trim();
     if (name.isNotEmpty && !RegExp(r'^[0-9A-Za-z_]+$').hasMatch(name)) {
       setState(
@@ -1557,70 +2312,147 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
     final localColumns = widget.localTable.columns;
     final refColumns = widget.refTable.columns;
     final refTableName = widget.refTable.name;
+    final localTableName = widget.localTable.name;
     final hint = defaultFkName(widget.localTable.name, _localColumn);
+    final plan = _manyToMany ? _junctionPlan : null;
+    final junctionName = plan?.name ?? '';
+    final junctionId = plan?.idColumn ?? '';
+    final junctionColumnA = plan?.columnA ?? '';
+    final junctionTableA = plan?.tableA ?? '';
+    final junctionPrimaryA = plan?.primaryColumnA ?? '';
+    final junctionColumnB = plan?.columnB ?? '';
+    final junctionTableB = plan?.tableB ?? '';
+    final junctionPrimaryB = plan?.primaryColumnB ?? '';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
         FormRow(
-          label: '本表字段',
+          label: '关系类型',
           child: SelectBox<String>(
-            value: _localColumn,
-            onChanged: (value) => _pickLocalColumn(value ?? _localColumn),
+            value: _manyToMany ? 'many_to_many' : 'many_to_one',
+            onChanged: (value) => setState(() {
+              _manyToMany = value == 'many_to_many';
+              _error = null;
+            }),
             items: <DropdownMenuItem<String>>[
-              for (final column in localColumns)
-                DropdownMenuItem<String>(
-                  value: column.name,
-                  child: Text(column.name),
-                ),
+              DropdownMenuItem<String>(
+                value: 'many_to_one',
+                child: Text('多对一（直接外键）'),
+              ),
+              DropdownMenuItem<String>(
+                value: 'many_to_many',
+                child: Text('多对多（自动创建中间表）'),
+              ),
             ],
           ),
         ),
-        FormRow(
-          label: '引用表',
-          child: Text(refTableName, style: monoStyle(size: 12)),
-        ),
-        FormRow(
-          label: '引用字段',
-          child: SelectBox<String>(
-            value: _refColumn,
-            onChanged: (value) =>
-                setState(() => _refColumn = value ?? _refColumn),
-            items: <DropdownMenuItem<String>>[
-              for (final column in refColumns)
-                DropdownMenuItem<String>(
-                  value: column.name,
-                  child: Text(column.name),
-                ),
-            ],
+        if (_manyToMany) ...<Widget>[
+          FormRow(
+            label: '本表',
+            child: Text(localTableName, style: monoStyle(size: 12)),
           ),
-        ),
-        FormRow(
-          label: '删除时',
-          child: SelectBox<String>(
-            value: _onDelete,
-            onChanged: (value) => setState(() => _onDelete = value ?? ''),
-            items: _actionItems(onDelete: true),
+          FormRow(
+            label: '引用表',
+            child: Text(refTableName, style: monoStyle(size: 12)),
           ),
-        ),
-        FormRow(
-          label: '更新时',
-          child: SelectBox<String>(
-            value: _onUpdate,
-            onChanged: (value) => setState(() => _onUpdate = value ?? ''),
-            items: _actionItems(onDelete: false),
+          const SizedBox(height: 4),
+          if (plan == null)
+            Text('目标表没有主键，无法创建中间表', style: kSmallMuted)
+          else ...<Widget>[
+            Text(
+              pickText(
+                '将自动创建中间表 $junctionName，包含指向两端主键的两个外键。',
+                'A junction table $junctionName will be created, with two foreign keys pointing at both primary keys.',
+              ),
+              style: kSmallMuted,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              pickText(
+                '$junctionId：主键自增',
+                '$junctionId: auto-increment primary key',
+              ),
+              style: monoStyle(size: 11),
+            ),
+            Text(
+              erJunctionTarget(
+                junctionColumnA,
+                junctionTableA,
+                junctionPrimaryA,
+              ),
+              style: monoStyle(size: 11),
+            ),
+            Text(
+              erJunctionTarget(
+                junctionColumnB,
+                junctionTableB,
+                junctionPrimaryB,
+              ),
+              style: monoStyle(size: 11),
+            ),
+          ],
+        ] else ...<Widget>[
+          FormRow(
+            label: '本表字段',
+            child: SelectBox<String>(
+              value: _localColumn,
+              onChanged: (value) => _pickLocalColumn(value ?? _localColumn),
+              items: <DropdownMenuItem<String>>[
+                for (final column in localColumns)
+                  DropdownMenuItem<String>(
+                    value: column.name,
+                    child: Text(column.name),
+                  ),
+              ],
+            ),
           ),
-        ),
-        Field(
-          label: '约束名',
-          controller: _name,
-          hint: hint,
-          onChanged: (_) {
-            if (_error != null) setState(() => _error = null);
-          },
-        ),
-        const SizedBox(height: 2),
-        Text('外键名的默认值可以修改；MySQL 要求被引用的列必须有主键或唯一索引。', style: kSmallMuted),
+          FormRow(
+            label: '引用表',
+            child: Text(refTableName, style: monoStyle(size: 12)),
+          ),
+          FormRow(
+            label: '引用字段',
+            child: SelectBox<String>(
+              value: _refColumn,
+              onChanged: (value) =>
+                  setState(() => _refColumn = value ?? _refColumn),
+              items: <DropdownMenuItem<String>>[
+                for (final column in refColumns)
+                  DropdownMenuItem<String>(
+                    value: column.name,
+                    child: Text(column.name),
+                  ),
+              ],
+            ),
+          ),
+          FormRow(
+            label: '删除时',
+            child: SelectBox<String>(
+              value: _onDelete,
+              onChanged: (value) => setState(() => _onDelete = value ?? ''),
+              items: _actionItems(onDelete: true),
+            ),
+          ),
+          FormRow(
+            label: '更新时',
+            child: SelectBox<String>(
+              value: _onUpdate,
+              onChanged: (value) => setState(() => _onUpdate = value ?? ''),
+              items: _actionItems(onDelete: false),
+            ),
+          ),
+          Field(
+            label: '约束名',
+            controller: _name,
+            hint: hint,
+            onChanged: (_) {
+              if (_error != null) setState(() => _error = null);
+            },
+          ),
+          const SizedBox(height: 2),
+          Text('外键名的默认值可以修改；MySQL 要求被引用的列必须有主键或唯一索引。', style: kSmallMuted),
+        ],
         if (_error != null) ...<Widget>[
           const SizedBox(height: 8),
           AlertBox(_error!),
@@ -1737,6 +2569,7 @@ class _JunctionDialog extends StatefulWidget {
     required this.localTable,
     required this.refTable,
     required this.existingTableNames,
+    required this.reason,
     required this.onCreate,
   });
 
@@ -1745,6 +2578,7 @@ class _JunctionDialog extends StatefulWidget {
   final ErTable localTable;
   final ErTable refTable;
   final Set<String> existingTableNames;
+  final _JunctionReason reason;
   final Future<void> Function(ErJunctionPlan plan) onCreate;
 
   @override
@@ -1848,14 +2682,20 @@ class _JunctionDialogState extends State<_JunctionDialog> {
       preview.tableB,
       preview.primaryColumnB,
     );
+    final message = widget.reason == _JunctionReason.notUnique
+        ? pickText(
+            '两个连接字段都不是唯一列，直接外键的引用列可能不合法。建议创建中间表（多对多）；也可以仍然直接添加外键。',
+            'Neither connecting column is unique, so a direct foreign key may be invalid. Creating a junction table (many-to-many) is recommended; you can still add a direct foreign key instead.',
+          )
+        : pickText(
+            '同一对表之间再加一条外键会出现多条并存关系。建议自动创建中间表（多对多）；也可以仍然直接添加第二个外键。',
+            'Adding another foreign key between the same two tables would leave several relations side by side. A junction table (many-to-many) is recommended; you can still add a second direct foreign key instead.',
+          );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        Text(
-          '同一对表之间再加一条外键会出现多条并存关系。建议自动创建中间表（多对多）；也可以仍然直接添加第二个外键。',
-          style: kSmallMuted,
-        ),
+        Text(message, style: kSmallMuted),
         const SizedBox(height: 8),
         CheckBox(
           label: '创建中间表（推荐）',
@@ -1865,7 +2705,9 @@ class _JunctionDialogState extends State<_JunctionDialog> {
           },
         ),
         CheckBox(
-          label: '仍然直接添加第二个外键',
+          label: widget.reason == _JunctionReason.notUnique
+              ? '仍然直接添加外键'
+              : '仍然直接添加第二个外键',
           value: _direct,
           onChanged: (value) {
             if (value) setState(() => _direct = true);

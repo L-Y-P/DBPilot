@@ -54,6 +54,9 @@ enum ErRelationOrigin {
 
   /// 自动创建的中间表带出来的两个外键。
   junction,
+
+  /// 按列名推导出来的「建议」关系（只有虚线，尚未写入数据库）。
+  suggested,
 }
 
 /// 设计器的一张表。
@@ -86,6 +89,16 @@ class ErTable {
   }
 
   bool get hasPrimary => primaryColumn != null;
+
+  /// 全部主键列（复合主键时多于一个）。
+  List<ErColumn> get primaryColumns => <ErColumn>[
+    for (final c in columns)
+      if (c.primary) c,
+  ];
+
+  /// 单列主键；复合主键或没有主键时返回 null（建议关系 / 中间表只认单列主键）。
+  ErColumn? get singlePrimaryColumn =>
+      primaryColumns.length == 1 ? primaryColumns.first : null;
 
   /// 从 `Api.structure` 的返回解析节点。
   ///
@@ -973,6 +986,327 @@ int? hitTestRelationCurves(
     }
   }
   return best;
+}
+
+// ---------------------------------------------------------- 箭头几何 / 多对多
+
+/// 一条关系在目标端的箭头几何：尖端在曲线终点，沿终点切线方向回退。
+class ErArrowHead {
+  const ErArrowHead({
+    required this.tip,
+    required this.direction,
+    required this.base,
+    required this.left,
+    required this.right,
+  });
+
+  /// 尖端（曲线终点）。
+  final Offset tip;
+
+  /// 单位切线方向（指向目标表）。
+  final Offset direction;
+
+  /// 底边中点。
+  final Offset base;
+
+  /// 底边两端。
+  final Offset left;
+  final Offset right;
+
+  /// 填充三角形的三个顶点。
+  List<Offset> get triangle => <Offset>[tip, left, right];
+
+  /// 箭头长度（尖端到底边的距离）。
+  double get length => (tip - base).distance;
+
+  /// 按曲线终点切线方向生成箭头；退化曲线返回 null。
+  ///
+  /// [length] / [halfWidth] 由画布给值（普通 12/5.5，compact 稍小），这样
+  /// 箭头永远落在目标端且不会因为曲线方向反转而指错方向。
+  static ErArrowHead? forCurve(
+    ErRelationCurve curve, {
+    double length = 12,
+    double halfWidth = 5.5,
+  }) {
+    final tangent = curve.endDirection;
+    final total = tangent.distance;
+    if (total < 0.0001) return null;
+    final unit = tangent / total;
+    final normal = Offset(-unit.dy, unit.dx);
+    final base = curve.end - unit * length;
+    return ErArrowHead(
+      tip: curve.end,
+      direction: unit,
+      base: base,
+      left: base + normal * halfWidth,
+      right: base - normal * halfWidth,
+    );
+  }
+}
+
+/// 中间表识别结果：恰好两个单列外键，指向两张不同的实体表。
+class ErJunctionInfo {
+  const ErJunctionInfo({
+    required this.junctionTable,
+    required this.relationA,
+    required this.relationB,
+  });
+
+  final String junctionTable;
+  final ErRelation relationA;
+  final ErRelation relationB;
+
+  String get tableA => relationA.refTable;
+  String get tableB => relationB.refTable;
+
+  /// 这张中间表是否连着 [a] 与 [b]（任一方向）。
+  bool connects(String a, String b) =>
+      (tableA == a && tableB == b) || (tableA == b && tableB == a);
+}
+
+/// 识别中间表：一张已加入的表恰好有 2 个外键，指向 2 张不同的已加入表。
+///
+/// 只统计两端都在画布上的外键；指向画布外的外键不参与判断（否则用户只加入
+/// 中间表时会被误判）。
+Map<String, ErJunctionInfo> detectJunctionTables({
+  required Map<String, List<ErRelation>> relationsByTable,
+  required Set<String> tables,
+}) {
+  final out = <String, ErJunctionInfo>{};
+  for (final entry in relationsByTable.entries) {
+    if (!tables.contains(entry.key)) continue;
+    final local = <ErRelation>[
+      for (final relation in entry.value)
+        if (tables.contains(relation.refTable) &&
+            relation.refTable != entry.key)
+          relation,
+    ];
+    if (local.length != 2) continue;
+    if (local[0].refTable == local[1].refTable) continue;
+    out[entry.key] = ErJunctionInfo(
+      junctionTable: entry.key,
+      relationA: local[0],
+      relationB: local[1],
+    );
+  }
+  return out;
+}
+
+/// 多对多链路：中间表 + 它连接的两张实体表。
+class ErManyToManyLink {
+  const ErManyToManyLink({
+    required this.junctionTable,
+    required this.relationA,
+    required this.relationB,
+  });
+
+  final String junctionTable;
+  final ErRelation relationA;
+  final ErRelation relationB;
+
+  String get tableA => relationA.refTable;
+  String get tableB => relationB.refTable;
+
+  String get key => 'm2m:$junctionTable';
+
+  /// 画多对多连线用的合成关系（两端实体表之间，没有具体列）。
+  ErRelation get syntheticRelation => ErRelation(
+    localTable: tableA,
+    localColumn: '',
+    refTable: tableB,
+    refColumn: '',
+    origin: ErRelationOrigin.junction,
+  );
+}
+
+/// 从中间表识别结果生成多对多连线（一张中间表一条）。
+List<ErManyToManyLink> manyToManyLinks(Map<String, ErJunctionInfo> junctions) {
+  return <ErManyToManyLink>[
+    for (final info in junctions.values)
+      ErManyToManyLink(
+        junctionTable: info.junctionTable,
+        relationA: info.relationA,
+        relationB: info.relationB,
+      ),
+  ];
+}
+
+/// 两张实体表之间的多对多连线：从 A 卡片右边缘中部到 B 卡片左边缘中部。
+ErRelationCurve? manyToManyCurve(ErCanvasLayout layout, ErManyToManyLink link) {
+  final tableA = layout.tableNamed(link.tableA);
+  final tableB = layout.tableNamed(link.tableB);
+  final positionA = layout.positions[link.tableA];
+  final positionB = layout.positions[link.tableB];
+  if (tableA == null ||
+      tableB == null ||
+      positionA == null ||
+      positionB == null) {
+    return null;
+  }
+  final metrics = layout.metrics;
+  final start = Offset(
+    positionA.dx + metrics.cardWidth - metrics.borderInset,
+    positionA.dy + metrics.heightOf(tableA) / 2,
+  );
+  final end = Offset(positionB.dx, positionB.dy + metrics.heightOf(tableB) / 2);
+  final synthetic = link.syntheticRelation;
+  final dx = end.dx - start.dx;
+  if (dx >= 48) {
+    return ErRelationCurve(
+      relation: synthetic,
+      start: start,
+      end: end,
+      control1: start + Offset(dx / 2, 0),
+      control2: end - Offset(dx / 2, 0),
+    );
+  }
+  return ErRelationCurve(
+    relation: synthetic,
+    start: start,
+    end: end,
+    control1: start + const Offset(84, 0),
+    control2: end - const Offset(84, 0),
+  );
+}
+
+// -------------------------------------------------- 自动带入关联表
+
+/// 从已加入的表出发，沿已有外键（父表 + 子表两个方向）做 BFS，返回候选表名。
+///
+/// [related] 是「表 → 有外键关联的表名列表」；[excluded] 是用户手动移除 / 撤销
+/// 自动加入过的表，永远不会再被自动带回；[maxTables] 是画布上限（含已加入）。
+/// 结果按 BFS 顺序返回，调用方加载完再决定是否真的加入。
+List<String> expandRelatedTableNames({
+  required Set<String> added,
+  required Map<String, List<String>> related,
+  required Set<String> excluded,
+  required int maxTables,
+}) {
+  final out = <String>[];
+  final visited = <String>{...added};
+  final queue = <String>[...added];
+  while (queue.isNotEmpty && added.length + out.length < maxTables) {
+    final current = queue.removeAt(0);
+    for (final neighbor in related[current] ?? const <String>[]) {
+      if (!visited.add(neighbor)) continue;
+      if (excluded.contains(neighbor)) continue;
+      out.add(neighbor);
+      queue.add(neighbor);
+      if (added.length + out.length >= maxTables) break;
+    }
+  }
+  return out;
+}
+
+// -------------------------------------------------- 建议关系（列名推导）
+
+/// 从列名推导建议外键的基数部分：user_id / userId / userID -> user。
+///
+/// 以下划线 id 结尾时忽略大小写；驼峰 / 全大写 ID 也识别。普通列名（name、
+/// valid、paid）不会误判。
+String? suggestedForeignKeyBase(String column) {
+  final snake = RegExp(r'^(.+?)_id$', caseSensitive: false).firstMatch(column);
+  if (snake != null) return snake.group(1);
+  final camel = RegExp(r'^(.+?)Id$').firstMatch(column);
+  if (camel != null) return camel.group(1);
+  final upper = RegExp(r'^(.+?)ID$').firstMatch(column);
+  if (upper != null) return upper.group(1);
+  return null;
+}
+
+/// 按列名推导「建议关系」。
+///
+/// 只对还没有外键的表推导；列名 `x_id` / `xId` 指向画布上表 x / xs / xes
+/// （y -> ies）的单列主键。返回的 ErRelation 带 [ErRelationOrigin.suggested]，
+/// 由画布画成虚线，用户点「建立建议外键」后才会真正写库。
+///
+/// [maxResults] 限制虚线建议边数量（默认 8）：一批宽表可能推出几十条建议，
+/// 全画出来会让画布拥挤、命中检测变慢；剩下的可以在应用后重新推导。
+List<ErRelation> suggestRelations({
+  required List<ErTable> tables,
+  required Map<String, List<ErRelation>> relationsByTable,
+  int maxResults = 8,
+}) {
+  final byLowerName = <String, ErTable>{
+    for (final table in tables) table.name.toLowerCase(): table,
+  };
+  final limit = maxResults <= 0 ? 0 : maxResults;
+  final out = <ErRelation>[];
+  for (final table in tables) {
+    if (out.length >= limit) break;
+    final existing = relationsByTable[table.name] ?? const <ErRelation>[];
+    if (existing.isNotEmpty) continue; // 已有外键的表不再建议
+    for (final column in table.columns) {
+      if (out.length >= limit) break;
+      if (column.primary) continue;
+      final base = suggestedForeignKeyBase(column.name);
+      if (base == null) continue;
+      final target = _suggestedTarget(base, table, byLowerName);
+      if (target == null) continue;
+      final primary = target.singlePrimaryColumn;
+      if (primary == null) continue;
+      out.add(
+        ErRelation(
+          localTable: table.name,
+          localColumn: column.name,
+          refTable: target.name,
+          refColumn: primary.name,
+          origin: ErRelationOrigin.suggested,
+        ),
+      );
+    }
+  }
+  return out;
+}
+
+ErTable? _suggestedTarget(
+  String base,
+  ErTable local,
+  Map<String, ErTable> byLowerName,
+) {
+  final lower = base.toLowerCase();
+  final candidates = <String>[lower, '${lower}s', '${lower}es'];
+  if (lower.endsWith('y') && lower.length > 1) {
+    candidates.add('${lower.substring(0, lower.length - 1)}ies');
+  }
+  if (lower.endsWith('s') && lower.length > 1) {
+    candidates.add(lower.substring(0, lower.length - 1));
+  }
+  for (final candidate in candidates) {
+    final table = byLowerName[candidate];
+    if (table == null || table.name == local.name) continue;
+    if (table.singlePrimaryColumn != null) return table;
+  }
+  return null;
+}
+
+// -------------------------------------------------- structure 唯一列
+
+/// 从 Api.structure 的返回提取「单列唯一」字段（单列主键 / 单列唯一索引）。
+///
+/// 用来判断新建外键时被引用列能不能单独作为 FK 目标：复合唯一索引的每一列
+/// 都不是单独唯一的，所以只收集「该索引只包含一列」的情况。
+Set<String> erUniqueColumns(Map<String, dynamic> structure) {
+  final out = <String>{};
+  final primary = <String>[
+    for (final value in erListOf(structure['primary_key'])) erStringOf(value),
+  ].where((name) => name.isNotEmpty).toList();
+  if (primary.length == 1) out.add(primary.first);
+  final groups = <String, List<String>>{};
+  var anonymous = 0;
+  for (final row in erRowsOf(structure['indexes'])) {
+    final unique = erStringOf(row['NON_UNIQUE'] ?? row['non_unique']) == '0';
+    if (!unique) continue;
+    final column = erStringOf(row['COLUMN_NAME'] ?? row['column']);
+    if (column.isEmpty) continue;
+    var name = erStringOf(row['INDEX_NAME'] ?? row['name'] ?? row['KEY_NAME']);
+    if (name.isEmpty) name = '__${anonymous++}';
+    groups.putIfAbsent(name, () => <String>[]).add(column);
+  }
+  for (final columns in groups.values) {
+    if (columns.length == 1) out.add(columns.first);
+  }
+  return out;
 }
 
 // ------------------------------------------------------------ JSON 小工具

@@ -27,6 +27,8 @@ pub mod connections;
 pub mod drivers;
 /// Excel 数据文件读取与建表类型推断（import_inspect / import_preview 的内部实现）。
 pub(crate) mod excel_import;
+/// Excel 逐行流式读取层（xlsx/xlsm/ODS/SpreadsheetML；xls/xlsb 兜底）。
+pub(crate) mod excel_stream;
 pub mod exporters;
 pub mod history;
 pub mod importer;

@@ -182,8 +182,6 @@ pub fn detect(path: &str) -> AppResult<Option<ExcelKind>> {
 /// 一个工作表：行已裁掉末尾全空列、过滤全空行。
 #[derive(Clone, Debug)]
 pub struct ExcelSheet {
-    /// 可见工作表列表中的 0-based 位置（也是 inspect.sheets[].index / read.sheet 的数字形式）。
-    pub index: usize,
     pub name: String,
     /// 单元格值：空单元格是 Value::Null，日期/时间是格式化后的字符串。
     pub rows: Vec<Vec<Value>>,
@@ -191,36 +189,11 @@ pub struct ExcelSheet {
     pub cols: usize,
 }
 
-impl ExcelSheet {
-    /// inspect.sheets[] 里的条目。
-    pub fn brief(&self) -> Value {
-        json!({
-            "index": self.index,
-            "name": self.name,
-            "rows": self.rows.len(),
-            "cols": self.cols,
-        })
-    }
-}
-
-/// 整本工作簿（只含可见的普通工作表）。
-pub struct ExcelBook {
-    pub sheets: Vec<ExcelSheet>,
-    /// 被忽略的隐藏/图表工作表数量（用于 inspect 警告）。
-    pub hidden_sheets: usize,
-}
-
 /// 工作表目录（不含数据），用于「选表」与错误提示。
 #[derive(Clone, Debug)]
 pub struct SheetBrief {
     pub index: usize,
     pub name: String,
-}
-
-impl SheetBrief {
-    pub fn to_json(&self) -> Value {
-        json!({ "index": self.index, "name": self.name })
-    }
 }
 
 /// 扫描器需要的「单张表 + 表目录」。
@@ -334,7 +307,10 @@ pub fn read_selected(
     skip_rows: usize,
 ) -> AppResult<SelectedSheet> {
     if kind == ExcelKind::SpreadsheetMl {
-        return read_selected_spreadsheetml(path, selector, skip_rows);
+        // SpreadsheetML 已由 excel_stream 流式读取；这里只服务 xls/xlsb 兜底。
+        return Err(AppError::bad(
+            "SpreadsheetML 请使用流式读取路径（excel_stream）",
+        ));
     }
     let mut book = open_book(path, kind)?;
     let meta = sheet_metadata(&book);
@@ -354,7 +330,6 @@ pub fn read_selected(
     }
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let sheet = ExcelSheet {
-        index: selected,
         name: target.name.clone(),
         rows,
         cols,
@@ -362,38 +337,6 @@ pub fn read_selected(
     Ok(SelectedSheet {
         sheet,
         sheets: briefs,
-        hidden_sheets: meta.len().saturating_sub(visible.len()),
-    })
-}
-
-/// 读取整本工作簿（inspect 用：需要列出每张表的行数/列数）。
-pub fn read_book(path: &str, kind: ExcelKind) -> AppResult<ExcelBook> {
-    if kind == ExcelKind::SpreadsheetMl {
-        return read_book_spreadsheetml(path);
-    }
-    let mut book = open_book(path, kind)?;
-    let meta = sheet_metadata(&book);
-    let visible = visible_meta(&meta);
-    if visible.is_empty() {
-        return Err(AppError::bad("工作簿里没有可见的工作表"));
-    }
-    let mut sheets = Vec::with_capacity(visible.len());
-    for (index, sheet_meta) in visible.iter().enumerate() {
-        let range = book
-            .worksheet_range_at(sheet_meta.raw_index)
-            .ok_or_else(|| AppError::bad(format!("无法定位工作表「{}」", sheet_meta.name)))?
-            .map_err(|error| open_error(kind, error))?;
-        let rows = trim_rows(range_to_rows(range));
-        let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-        sheets.push(ExcelSheet {
-            index,
-            name: sheet_meta.name.clone(),
-            rows,
-            cols,
-        });
-    }
-    Ok(ExcelBook {
-        sheets,
         hidden_sheets: meta.len().saturating_sub(visible.len()),
     })
 }
@@ -540,147 +483,6 @@ pub fn trim_rows(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         row.resize(width, Value::Null);
     }
     rows
-}
-
-// ------------------------------------------------- SpreadsheetML（Excel 2003 XML）
-
-fn read_text(path: &str) -> AppResult<String> {
-    let bytes = std::fs::read(path).map_err(|e| AppError::bad(format!("无法读取文件: {e}")))?;
-    String::from_utf8(bytes).map_err(|_| {
-        AppError::bad("SpreadsheetML 文件不是 UTF-8 文本（Excel 2003 XML 通常是 UTF-8）")
-    })
-}
-
-/// 切出每个 Worksheet 的名字与表体。
-fn spreadsheetml_worksheets(text: &str) -> Vec<(String, String)> {
-    let mut sheets = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("<Worksheet") {
-        rest = &rest[start..];
-        let tag_end = match rest.find('>') {
-            Some(end) => end,
-            None => break,
-        };
-        let tag = &rest[..=tag_end];
-        if tag.ends_with("/>") {
-            // 没有数据的空工作表。
-            let name = spreadsheetml_sheet_name(tag, sheets.len());
-            sheets.push((name, String::new()));
-            rest = &rest[tag_end + 1..];
-            continue;
-        }
-        let (body, remaining) = match rest.find("</Worksheet>") {
-            Some(end) => (&rest[tag_end + 1..end], &rest[end + "</Worksheet>".len()..]),
-            None => (&rest[tag_end + 1..], ""),
-        };
-        let name = spreadsheetml_sheet_name(tag, sheets.len());
-        sheets.push((name, body.to_string()));
-        rest = remaining;
-    }
-    sheets
-}
-
-fn spreadsheetml_sheet_name(tag: &str, index: usize) -> String {
-    for attribute in ["ss:Name", "Name", "name"] {
-        if let Some(name) = crate::importer::attr_value(tag, attribute) {
-            let name = crate::importer::xml_unescape(name);
-            if !name.trim().is_empty() {
-                return name;
-            }
-        }
-    }
-    format!("Sheet{}", index + 1)
-}
-
-/// 解析一张表的 Row 列表；复用现有的 SpreadsheetML 单元格语义
-/// （空 Cell = NULL、ss:Type 区分 Number/String/Boolean、ss:Index 稀疏列）。
-fn spreadsheetml_rows(body: &str) -> Vec<Vec<Value>> {
-    let mut rows = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find("<Row") {
-        rest = &rest[start..];
-        let tag_end = match rest.find('>') {
-            Some(end) => end,
-            None => break,
-        };
-        if rest[..=tag_end].ends_with("/>") {
-            rest = &rest[tag_end + 1..];
-            continue;
-        }
-        let (segment, remaining) = match rest.find("</Row>") {
-            Some(end) => (&rest[..end], &rest[end + "</Row>".len()..]),
-            None => (rest, ""),
-        };
-        if let Ok(crate::importer::ParsedRow::Positional(values)) =
-            crate::importer::parse_spreadsheet_row(segment)
-        {
-            rows.push(values);
-        }
-        rest = remaining;
-    }
-    rows
-}
-
-fn read_book_spreadsheetml(path: &str) -> AppResult<ExcelBook> {
-    let text = read_text(path)?;
-    let worksheets = spreadsheetml_worksheets(&text);
-    if worksheets.is_empty() {
-        return Err(AppError::bad("SpreadsheetML 文件里没有 <Worksheet> 工作表"));
-    }
-    let mut sheets = Vec::with_capacity(worksheets.len());
-    for (index, (name, body)) in worksheets.into_iter().enumerate() {
-        let rows = trim_rows(spreadsheetml_rows(&body));
-        let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-        sheets.push(ExcelSheet {
-            index,
-            name,
-            rows,
-            cols,
-        });
-    }
-    Ok(ExcelBook {
-        sheets,
-        hidden_sheets: 0,
-    })
-}
-
-fn read_selected_spreadsheetml(
-    path: &str,
-    selector: Option<&str>,
-    skip_rows: usize,
-) -> AppResult<SelectedSheet> {
-    let text = read_text(path)?;
-    let worksheets = spreadsheetml_worksheets(&text);
-    if worksheets.is_empty() {
-        return Err(AppError::bad("SpreadsheetML 文件里没有 <Worksheet> 工作表"));
-    }
-    let briefs: Vec<SheetBrief> = worksheets
-        .iter()
-        .enumerate()
-        .map(|(index, (name, _))| SheetBrief {
-            index,
-            name: name.clone(),
-        })
-        .collect();
-    let selected = select_sheet(&briefs, selector)?;
-    let (name, body) = &worksheets[selected];
-    let mut rows = trim_rows(spreadsheetml_rows(body));
-    if skip_rows > 0 && skip_rows < rows.len() {
-        rows.drain(..skip_rows);
-    } else if skip_rows >= rows.len() {
-        rows.clear();
-    }
-    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-    Ok(SelectedSheet {
-        sheet: ExcelSheet {
-            index: selected,
-            name: name.clone(),
-            rows,
-            cols,
-        },
-        sheets: briefs,
-        hidden_sheets: 0,
-    })
 }
 
 // ---------------------------------------------------------------- 类型推断

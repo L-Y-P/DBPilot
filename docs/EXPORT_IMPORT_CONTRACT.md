@@ -57,16 +57,23 @@ SpreadsheetML 仍是 UTF-8 文本，`head` 返回 XML 片段。
   "sheet": "员工",                      // 默认选中：第一张可见工作表
   "read":  { "mode": "line", "sheet": "员工", "skip_rows": 0, "...": "..." },
   "fields": { "mode": "excel", "header": true, "...": "..." },
+  "streaming": true,                   // 本次识别是否走流式读取（xls/xlsb 兜底为 false）
   "warnings": ["检测到 2 个工作表：当前导入所选工作表；一次导入多个工作表请用「从文件建表」"]
 }
 ```
 
 - 表头启发式与 CSV 一致：首行**全是非空文本**且后面还有数据行时 `fields.header=true`。
-- 工作表整体载入内存；当总单元格数 > 10 万或文件 > 20 MB 时 `warnings` 会提示内存占用。
-- **大文件轻量识别**：文件 > 8 MB（`INSPECT_LIGHT_EXCEL_BYTES`）时，inspect 只解析第一张
-  可见工作表（默认 read/fields 与表头判定需要它），`sheets[]` 里其余工作表只返回
-  `{index, name}`（不带 `rows`/`cols`，选中该表后 preview 再加载），并在 `warnings` 里说明
-  「文件较大…」。UI 侧按契约「无 rows 只显示名字」处理即可。
+- **inspect 不再整表载入**（第 51 轮）：
+  - `xlsx/xlsm`：只读 `xl/workbook.xml` + `xl/_rels/workbook.xml.rels` + 每张表的
+    `<dimension>`（表头判定只解析默认表的前两行）；`sharedStrings.xml` 一次性加载
+    （xlsx 的字符串都引用它，这是唯一按字符串总量占内存的部分）。
+  - `SpreadsheetML / ODS`：单次顺序扫描 XML，只统计表名 / 行数 / 列数 + 默认表前两行，
+    不保存单元格；文件再大也只会占一个固定大小的读缓冲。
+  - `xls(BIFF8) / xlsb`：仍是 calamine 兜底——只加载**默认表**拿表头，其余表只给名字，
+    返回 `streaming:false` 且 warning 里明确写「暂未流式读取」。
+- `sheets[].rows/cols` 是「已知才给」：xlsx 来自 dimension，SpreadsheetML/ODS 来自扫描；
+  xls/xlsb 的非默认表、以及没有 dimension 的 xlsx 会省略这两个字段，
+  UI 按「无 rows 只显示名字」处理即可。
 
 ## 4. 读规则新增参数（preview / validate / execute / probe 通用）
 
@@ -88,8 +95,11 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 - 单元格保持 Excel 原类型：数字→整数/小数、布尔→bool、空单元格/公式错误→NULL、
   日期→`YYYY-MM-DD`、日期时间→`YYYY-MM-DD HH:MM:SS`、纯时间/时长→`HH:MM:SS`；
 - 映射、类型转换、批量 INSERT、取消/进度复用既有管线；
-- Excel 没有字节偏移，进度按行：`percent = 已读行 / 表总行数`，
-  `message = "工作表 <名> · 第 N/M 行"`，`bytes/total_bytes` 按行数等比缩放。
+- Excel 进度按行且保持流式：总行数来自 dimension / 扫描，
+  `percent = 已读行 / 表总行数`，`message = "工作表 <名> · 第 N/M 行"`；
+  总行数未知时（无 dimension 的 xlsx、SpreadsheetML、ODS）退化为
+  `percent = XML 字节进度`、`message = "工作表 <名> · 第 N 行"`，读完强制 100%。
+  `bytes/total_bytes` 按同一进度等比缩放（Dart 侧显示不会一直是 0）。
 
 ## 6. `importPreview` 新增 `schema`（类型推断，快速建表用）
 
@@ -125,12 +135,24 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 - `samples`：最多 3 个去重后的样本值（`1.0` 这类整数值会规范成 `1`）。
 - 非 Excel 格式同样返回 schema（CSV 数字列也能直接建表）。
 
-## 7. 已知边界
+## 7. 流式读取矩阵（第 51 轮）
 
-- **整表载入内存**：calamine 的 `worksheet_range` 一次读入所选工作表；超大工作簿
-  （百万行级）会占用较多内存，inspect 会给 warning。CSV 的「永不整文件读入」约束
-  不适用于 Excel 二进制格式。inspect 对 > 8 MB 的文件只加载第一张表（见 §3），
-  preview/validate/execute 仍会整表加载所选工作表。
+| 格式 | inspect | preview / validate / probe / execute | 说明 |
+| --- | --- | --- | --- |
+| `xlsx` / `xlsm` | 流式（workbook+rels+dimension+前两行） | **流式**（zip + quick-xml 逐 `<row>`） | sharedStrings 一次性加载；styles.xml 判日期格式；支持 inlineStr/s/b/e/n/d/公式缓存值；XML 在工作线程解析、有界 channel 送行，preview 只看几条时线程立即停止 |
+| `SpreadsheetML`（.xls XML） | 流式（单次扫描统计） | **流式**（quick-xml 逐 Worksheet/Row/Cell） | 多 Worksheet、ss:Index、ss:Type 语义不变 |
+| `ods` | 流式（content.xml 单次扫描） | **流式**（zip + quick-xml 逐 table-row/table-cell） | P1；支持 float/percentage/currency/boolean/date/time/string 与重复行列 |
+| `xls`（BIFF8） | calamine 兜底（只加载默认表） | calamine 兜底（整表载入所选工作表） | `streaming:false` + warning；正确性不变 |
+| `xlsb` | 同上 | 同上 | 同上 |
+
+- CSV/JSON/XML/HTML/Markdown 等文本格式本来就走流式字节读取，本轮不变。
+- 内存边界：xlsx 的峰值 ≈ sharedStrings（字符串总长度）+ 读缓冲 + 首个 128 行宽度探测
+  缓冲；SpreadsheetML/ODS 只占固定读缓冲；xls/xlsb 仍为「所选工作表整表」。
+- 流式读取会先缓冲最多 128 行确定有效列宽（等价于旧实现「裁掉末尾全空列」的语义）；
+  之后更宽的行按原样输出（保留数据，由列映射报字段数错误）。
+
+## 8. 已知边界
+
 - 只读：不支持写回 xlsx/xls/xlsb/ods；导出 Excel 仍是 SpreadsheetML 2003（.xls）。
 - 加密/损坏的工作簿在 inspect/preview 阶段返回中文错误（「无法读取 ... 文件可能已损坏、被密码保护」）。
 - 公式单元格读取 Excel 缓存的计算结果；没有缓存时为 NULL。
@@ -140,12 +162,20 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 - Excel 的时间单元格是「一天内的比例」，calamine 会落在 1899-12-31，读取层据此输出
   `HH:MM:SS`；跨天时长（`[h]:mm:ss`）也输出 `HH:MM:SS`（小时可超过 24）。
 
-## 8. 测试与 fixtures
+## 9. 测试与 fixtures
 
 - fixtures：`desktop/rust/tests/fixtures/excel_multi.xlsx`、`excel_multi.xls`
-  （3 个可见表 + 隐藏表；数字/日期/时间/布尔/中文/NULL）。生成脚本与复现命令见
-  [fixtures/README.md](../rust/tests/fixtures/README.md)。
+  （3 个可见表 + 隐藏表；数字/日期/时间/布尔/中文/NULL），以及 Lead 的多表
+  `relational_multi.xlsx`（users/categories/products/orders/order_items）。
+  生成脚本与复现命令见 [fixtures/README.md](../rust/tests/fixtures/README.md)。
 - Rust 单测：`cd desktop/rust && cargo test --offline --lib`，Excel 用例在
-  `importer.rs` 的 `excel_tests`（inspect 识别、选表、skip_rows、原生类型预览、
-  schema 推断、SpreadsheetML 多表、validate/probe、SQLite 真库 execute + 按行进度）。
+  `importer.rs` 的 `excel_tests`：
+  - 旧版：inspect 识别、选表、skip_rows、原生类型预览、schema 推断、SpreadsheetML
+    多表、validate/probe、SQLite 真库 execute + 按行进度；
+  - 第 51 轮流式：测试内用 zip writer 合成 2 万行 xlsx（inspect/preview/validate
+    行数与进度、sheet 选择、schema）+ execute 2000 行到 SQLite；合成 ODS 预览/选表；
+    SpreadsheetML 大文件（8 MB+）单次扫描统计；无 dimension 的 xlsx 进度退化；
+    xls 兜底标记 `streaming:false` + warning。
 - 集成用例：`cargo test --offline --test data_import --test export_import_round_trip`。
+- 手工验证（本轮）：用户真实 `student_course.xls`（SpreadsheetML，8 行数据）与
+  `relational_multi.xlsx`（5 表）inspect/preview/validate 均为流式且行数/类型正确。

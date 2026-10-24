@@ -85,6 +85,20 @@ void main() {
       'CREATE TABLE people (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, score INTEGER)',
       'CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER)',
       'CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+      // 链式外键：c1 <- c2 <- c3 <- c4 <- c5 <- c6（测自动带入上限）。
+      'CREATE TABLE c1 (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE c2 (id INTEGER PRIMARY KEY AUTOINCREMENT, c1_id INTEGER REFERENCES c1(id))',
+      'CREATE TABLE c3 (id INTEGER PRIMARY KEY AUTOINCREMENT, c2_id INTEGER REFERENCES c2(id))',
+      'CREATE TABLE c4 (id INTEGER PRIMARY KEY AUTOINCREMENT, c3_id INTEGER REFERENCES c3(id))',
+      'CREATE TABLE c5 (id INTEGER PRIMARY KEY AUTOINCREMENT, c4_id INTEGER REFERENCES c4(id))',
+      'CREATE TABLE c6 (id INTEGER PRIMARY KEY AUTOINCREMENT, c5_id INTEGER REFERENCES c5(id))',
+      // 中间表：order_items 恰好两个外键指向 orders / products（多对多）。
+      'CREATE TABLE categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+      'CREATE TABLE products (id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER REFERENCES categories(id), name TEXT)',
+      'CREATE TABLE order_items (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER REFERENCES orders(id), product_id INTEGER REFERENCES products(id))',
+      // 没有外键、但列名暗示关系的表（建议关系）。
+      'CREATE TABLE shops (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+      'CREATE TABLE members (id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER, name TEXT)',
     ];
     for (final sql in fixtures) {
       await Api.instance.query(sql);
@@ -171,7 +185,7 @@ void main() {
     expect(find.text('已加入 0/5'), findsOneWidget);
   });
 
-  testWidgets('添加表弹窗：搜索 + 复选 + 加入', (tester) async {
+  testWidgets('seed 表自动带入关联表；可撤销且不自动加回', (tester) async {
     await setSurface(tester);
     await tester.pumpWidget(
       host(
@@ -183,14 +197,140 @@ void main() {
       ),
     );
     await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-node-books')), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-node-reviews')), findsOneWidget);
+    expect(find.text('已加入 3/5'), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-auto-added-hint')), findsOneWidget);
+    expect(find.text('已自动加入关联表：books、reviews'), findsOneWidget);
+    // 自动带入的外键直接画出来。
+    expect(find.text('books.author_id → authors.id'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('er-undo-auto')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
+    expect(find.byKey(const ValueKey('er-node-reviews')), findsNothing);
+    expect(find.byKey(const ValueKey('er-auto-added-hint')), findsNothing);
+    expect(find.text('已加入 1/5'), findsOneWidget);
+
+    // 手动再加一张无外键的表：撤销掉的关联表不能被自动带回来。
+    await tester.tap(find.byKey(const ValueKey('er-add-table')));
+    await settle(tester, rounds: 4);
+    await tester.enterText(find.byType(TextField).last, 't1');
+    await settle(tester, rounds: 3);
+    await tester.tap(find.byKey(const ValueKey('er-picker-t1')));
+    await settle(tester, rounds: 3);
+    await tester.tap(find.byKey(const ValueKey('er-picker-join')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-t1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
+    expect(find.byKey(const ValueKey('er-node-reviews')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('自动带入最多到画布上限 5 张', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['c1'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    for (final name in <String>['c1', 'c2', 'c3', 'c4', 'c5']) {
+      expect(find.byKey(ValueKey('er-node-$name')), findsOneWidget);
+    }
+    expect(find.byKey(const ValueKey('er-node-c6')), findsNothing);
+    expect(find.text('已加入 5/5'), findsOneWidget);
+    expect(find.text('已自动加入关联表：c2、c3、c4、c5'), findsOneWidget);
+  });
+
+  testWidgets('中间表徽标、多对多连线与折叠 / 展开', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>[
+            'orders',
+            'products',
+            'categories',
+            'order_items',
+          ],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-order_items')), findsOneWidget);
+    expect(find.text('中间表（多对多）'), findsOneWidget);
+    expect(find.text('多对多 · order_items'), findsOneWidget);
+
+    // 折叠：节点和它的两条 FK 边隐藏，两端多对多连线保留。
+    await tester.tap(find.byKey(const ValueKey('er-collapse-order_items')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-order_items')), findsNothing);
+    expect(find.text('多对多 · order_items'), findsOneWidget);
+
+    // 点多对多标签展开。
+    await tester.tap(find.byKey(const ValueKey('er-m2m-order_items')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-order_items')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('列名建议关系：虚线标签 + 建立建议外键按钮（SQLite 禁用）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['members', 'shops'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-members')), findsOneWidget);
+    expect(find.text('建议：'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('er-suggestion-members.shop_id>shops.id')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('er-apply-suggestions')), findsOneWidget);
+    expect(find.text('建立建议外键 (1)'), findsOneWidget);
+    // SQLite 不能 ALTER 加外键 → 批量按钮禁用（建议只读展示）。
+    final applyButton = tester.widget<Btn>(
+      find.byKey(const ValueKey('er-apply-suggestions')),
+    );
+    expect(applyButton.onPressed, isNull);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('添加表弹窗：搜索 + 复选 + 加入（之后自动带入关联表）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['people'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
     expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
 
     await tester.tap(find.byKey(const ValueKey('er-add-table')));
     await settle(tester, rounds: 4);
-    expect(find.byKey(const ValueKey('er-picker-books')), findsOneWidget);
     // 已在画布上的表仍然列出，但不可再勾选（灰显 + 已加入）。
+    await tester.enterText(find.byType(TextField).last, 'people');
+    await settle(tester, rounds: 3);
     final existing = tester.widget<InkWell>(
-      find.byKey(const ValueKey('er-picker-authors')),
+      find.byKey(const ValueKey('er-picker-people')),
     );
     expect(existing.onTap, isNull);
     expect(find.text('已加入'), findsOneWidget);
@@ -206,7 +346,11 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('er-picker-join')));
     await settle(tester);
     expect(find.byKey(const ValueKey('er-node-books')), findsOneWidget);
+    // 加入 books 后自动带入关联的 authors / reviews，外键自动画出来。
+    expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-node-reviews')), findsOneWidget);
     expect(find.text('books.author_id → authors.id'), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-auto-added-hint')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -280,6 +424,10 @@ void main() {
     expect(find.byKey(ValueKey('er-node-${plan.name}')), findsOneWidget);
     expect(find.text('orders_users.orders_id → orders.id'), findsOneWidget);
     expect(find.text('orders_users.users_id → users.id'), findsOneWidget);
+    // 恰好两个外键指向两张实体表 → 徽标 + 两端多对多连线。
+    // （自动带入的关联表也可能成为中间表，所以徽标数量用 findsWidgets。）
+    expect(find.text('中间表（多对多）'), findsWidgets);
+    expect(find.text('多对多 · orders_users'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -375,7 +523,13 @@ void main() {
     await settle(tester);
     expect(find.text('E-R diagram'), findsOneWidget);
     expect(find.text('+ Add table'), findsOneWidget);
-    expect(find.text('Added 2/5'), findsOneWidget);
+    // authors/books + 自动带入的 reviews。
+    expect(find.text('Added 3/5'), findsOneWidget);
+    expect(
+      find.text('Related tables added automatically: reviews'),
+      findsOneWidget,
+    );
+    expect(find.text('Undo auto-add'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
     // 表名 / 列名 / 箭头标签是数据，其它可见文案必须是英文。
     final offenders = <String>{};
@@ -389,6 +543,47 @@ void main() {
     }
     expect(offenders, isEmpty, reason: '未翻译的中文: $offenders');
     expect(find.text('books.author_id → authors.id'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('英文模式：多对多徽标与建议关系文案', (tester) async {
+    I18n.setLang(AppLang.en);
+    addTearDown(() => I18n.setLang(AppLang.zh));
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: UniqueKey(),
+          database: 'main',
+          initialTables: const <String>[
+            'orders',
+            'products',
+            'categories',
+            'order_items',
+          ],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.text('Junction table (many-to-many)'), findsWidgets);
+    expect(find.text('many-to-many · order_items'), findsOneWidget);
+
+    // 建议关系：虚线标签与批量按钮也都是英文。
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: UniqueKey(),
+          database: 'main',
+          initialTables: const <String>['members', 'shops'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.text('Suggested: '), findsOneWidget);
+    expect(find.text('Create suggested FKs (1)'), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

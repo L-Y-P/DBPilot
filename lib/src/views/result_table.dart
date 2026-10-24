@@ -7,6 +7,7 @@ import '../api.dart';
 import '../i18n_literals.dart';
 import '../notice.dart';
 import '../paging.dart';
+import '../row_changes.dart';
 import '../sqlite_sources.dart' show pickSavePath;
 import '../theme.dart';
 import '../widgets.dart';
@@ -29,6 +30,7 @@ class ResultTable extends StatelessWidget {
     this.database,
     required this.notice,
     this.onRefresh,
+    this.onPaged,
     this.rowLimit,
   });
 
@@ -51,6 +53,9 @@ class ResultTable extends StatelessWidget {
   final String? database;
   final Notice notice;
   final void Function(int index)? onRefresh;
+
+  /// Called when the user flips a result page (query-metrics signal only).
+  final void Function()? onPaged;
   /// S-08: server-side cap for one statement, used in the truncation notice.
   final int? rowLimit;
 
@@ -122,6 +127,7 @@ class ResultTable extends StatelessWidget {
             truncated: result['truncated'] == true,
             editable: editable,
             notice: notice,
+            onPaged: onPaged,
             onDeleteSelected: editable
                 ? (indices) =>
                     _deleteRows(context, index, columns, rows, indices)
@@ -129,6 +135,10 @@ class ResultTable extends StatelessWidget {
             onSaveCell: editable
                 ? (rowIndex, column, value, isNull) => _saveCell(context, index,
                     columns, rows, rowIndex, column, value, isNull)
+                : null,
+            onApplyEdits: editable
+                ? (edits) =>
+                    _applyDirtyEdits(context, index, columns, rows, edits)
                 : null,
           )
         else
@@ -213,6 +223,42 @@ class ResultTable extends StatelessWidget {
     }
   }
 
+  /// Save every staged cell edit of the current result page in one transaction.
+  ///
+  /// Result rows have no declared primary key, so [buildRowChanges] keys each
+  /// row by all of its columns and sets `limit_one` — the same rule
+  /// [_saveCell] uses for a single-cell edit.
+  Future<bool> _applyDirtyEdits(
+    BuildContext context,
+    int resultIndex,
+    List<Json> columns,
+    List<List<dynamic>> rows,
+    List<DirtyCell> edits,
+  ) async {
+    final table = inferSingleTable(
+      (results[resultIndex]['statement'] ?? '').toString(),
+      columns,
+    );
+    if (table == null || database == null) return false;
+    final changes = buildRowChanges(
+      columns: columns,
+      rows: rows,
+      primaryKey: const <String>[],
+      edits: edits,
+    );
+    try {
+      final result =
+          await Api.instance.applyRowChanges(database!, table, changes);
+      final applied = (result['rows_affected'] as num?)?.toInt() ?? 0;
+      notice.show('已保存 $applied 行');
+      onRefresh?.call(resultIndex);
+      return true;
+    } catch (e) {
+      notice.show('保存失败：$e');
+      return false;
+    }
+  }
+
   Future<void> _saveCell(
     BuildContext context,
     int resultIndex,
@@ -268,8 +314,10 @@ class _RowsResultView extends StatefulWidget {
     required this.truncated,
     required this.editable,
     required this.notice,
+    this.onPaged,
     this.onDeleteSelected,
     this.onSaveCell,
+    this.onApplyEdits,
   });
 
   final List<Json> columns;
@@ -281,9 +329,13 @@ class _RowsResultView extends StatefulWidget {
   final bool truncated;
   final bool editable;
   final Notice notice;
+  final void Function()? onPaged;
   final void Function(List<int> indices)? onDeleteSelected;
   final void Function(int rowIndex, String column, Object? value, bool isNull)?
       onSaveCell;
+
+  /// Batch-edit sink; row indices are already mapped back to [rows].
+  final Future<bool> Function(List<DirtyCell> edits)? onApplyEdits;
 
   @override
   State<_RowsResultView> createState() => _RowsResultViewState();
@@ -496,6 +548,17 @@ class _RowsResultViewState extends State<_RowsResultView> {
               ? null
               : (rowIndex, column, value, isNull) => widget.onSaveCell!(
                   base + rowIndex, column, value, isNull),
+          onApplyEdits: widget.onApplyEdits == null
+              ? null
+              : (edits) => widget.onApplyEdits!([
+                    for (final edit in edits)
+                      DirtyCell(
+                        rowIndex: base + edit.rowIndex,
+                        column: edit.column,
+                        value: edit.value,
+                        isNull: edit.isNull,
+                      ),
+                  ]),
         ),
         if (rows.isNotEmpty)
           TablePager(
@@ -503,7 +566,10 @@ class _RowsResultViewState extends State<_RowsResultView> {
             pages: pages,
             total: rows.length,
             visible: pageRows.length,
-            onPage: (next) => setState(() => _page = next),
+            onPage: (next) {
+              setState(() => _page = next);
+              widget.onPaged?.call();
+            },
             keyPrefix: 'result-pager-${widget.resultIndex}',
           ),
       ],

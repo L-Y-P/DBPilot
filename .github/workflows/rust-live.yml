@@ -101,6 +101,12 @@ jobs:
         working-directory: rust
         run: cargo fetch
 
+      # FRB codegen 会把 crate::api 里所有 item 的类型收集成绑定；db 类型混入
+      # api 模块会让生成文件引用未 import 的裸类型。这个守卫也校验 Rust 的
+      # kind 码常量与 Dart 手写常量一致。
+      - name: API surface and kind-code guard
+        run: python3 tools/check_api_surface.py
+
       - name: Hermetic and live suites
         run: bash tools/run_live_tests.sh --no-wait
 

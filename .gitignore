@@ -87,3 +87,6 @@ app.*.map.json
 
 # 打包产物（DMG / zip 走 GitHub Release，不入库）
 /dist/
+
+# 性能测试产物（数据集 SQL / 1GB CSV / 采集报告，可由 tools/perf 重新生成）
+/out/

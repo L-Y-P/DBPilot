@@ -10,7 +10,7 @@ pub mod driver;
 
 use crate::core::connection::ConnectionHandle;
 use crate::core::dialect::DatabaseDialect;
-use crate::db::{ColumnMeta, ResultSet, ScanStats};
+use crate::db::{ResultBatch, ResultSet, ScanStats};
 use crate::drivers::{bytes_json, column_json, qi, qualify, quote_str_for, CreateTableSpec, DriverKind};
 use crate::error::{AppError, AppResult};
 
@@ -207,17 +207,9 @@ pub async fn run_one_owned(
     if wants_rows {
         let result = match sqlx::query(stmt.as_str()).fetch_all(&mut *conn).await {
             Ok(rows) => {
-                let columns: Vec<ColumnMeta> = rows
+                let columns = rows
                     .first()
-                    .map(|r| {
-                        r.columns()
-                            .iter()
-                            .map(|c| ColumnMeta {
-                                name: c.name().to_string(),
-                                type_name: c.type_info().name().to_string(),
-                            })
-                            .collect()
-                    })
+                    .map(|row| crate::drivers::columns_meta(row))
                     .unwrap_or_default();
                 let values: Vec<Vec<Value>> = rows
                     .iter()
@@ -319,17 +311,9 @@ pub async fn run_one_limited_owned(
     if let Some(e) = failure {
         return (error_set(stmt, e), false, conn);
     }
-    let columns: Vec<ColumnMeta> = rows
+    let columns = rows
         .first()
-        .map(|r| {
-            r.columns()
-                .iter()
-                .map(|c| ColumnMeta {
-                    name: c.name().to_string(),
-                    type_name: c.type_info().name().to_string(),
-                })
-                .collect()
-        })
+        .map(|row| crate::drivers::columns_meta(row))
         .unwrap_or_default();
     let values: Vec<Vec<Value>> = rows
         .iter()
@@ -346,6 +330,185 @@ pub async fn run_one_limited_owned(
         truncated,
     };
     (result, truncated, conn)
+}
+
+/// Streaming variant of [run_one_limited_owned] (optimisation layer 3).
+///
+/// Same contract as the MySQL implementation in
+/// `drivers/mysql/exec.rs::run_one_limited_batched_owned`, which is the
+/// reference for the docs below:
+///
+/// * rows are decoded with [value_to_json] and handed to `on_batch` as soon as
+///   `batch_size` of them have been read, so a large SQL-console result never
+///   materialises as a whole;
+/// * a statement that does not return rows reuses [run_one_limited_owned]
+///   verbatim (one `affected` batch, `last_insert_rowid()` included);
+/// * reading stops at `max_rows`, `truncated` is set and the caller closes the
+///   connection (never drain/decode the rest);
+/// * `on_batch` returning `false` stops the scan immediately; the caller closes
+///   the connection, which also resets the in-process statement.
+///
+/// The returned [ResultSet] carries metadata only (`rows` is empty — the rows
+/// travelled through the callback). The connection is moved in and returned for
+/// the same rustc/`Send` reason documented on [run_one_limited_owned].
+pub async fn run_one_limited_batched_owned(
+    conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    stmt: String,
+    max_rows: usize,
+    batch_size: usize,
+    on_batch: &mut (dyn FnMut(ResultBatch) -> bool + Send),
+) -> (
+    ResultSet,
+    bool,
+    bool,
+    sqlx::pool::PoolConnection<sqlx::Sqlite>,
+) {
+    if !crate::db::returns_rows(&stmt) {
+        let (result, truncated, conn) = run_one_limited_owned(conn, stmt, max_rows).await;
+        return (result, truncated, false, conn);
+    }
+    let mut conn = conn;
+    let batch_size = batch_size.max(1);
+    let mut columns: Vec<crate::db::ColumnMeta> = Vec::new();
+    let mut buffered: Vec<Vec<Value>> = Vec::with_capacity(batch_size.min(max_rows.max(1)));
+    let mut row_count: usize = 0;
+    let mut truncated = false;
+    let mut stopped = false;
+    let mut failure: Option<sqlx::Error> = None;
+    {
+        let mut stream = sqlx::query(stmt.as_str()).fetch(&mut *conn);
+        loop {
+            match stream.next().await {
+                Some(Ok(row)) => {
+                    if row_count >= max_rows {
+                        truncated = true;
+                        break;
+                    }
+                    if columns.is_empty() {
+                        columns = crate::drivers::columns_meta(&row);
+                    }
+                    buffered.push((0..row.len()).map(|i| value_to_json(&row, i)).collect());
+                    row_count += 1;
+                    if buffered.len() >= batch_size {
+                        let batch = ResultBatch {
+                            columns: columns.clone(),
+                            rows: std::mem::take(&mut buffered),
+                            truncated: false,
+                        };
+                        if !on_batch(batch) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    failure = Some(e);
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+    if let Some(e) = failure {
+        return (error_set(stmt, e), false, false, conn);
+    }
+    if !stopped {
+        if !buffered.is_empty() {
+            let batch = ResultBatch {
+                columns: columns.clone(),
+                rows: std::mem::take(&mut buffered),
+                truncated,
+            };
+            if !on_batch(batch) {
+                stopped = true;
+            }
+        } else if truncated {
+            // The cap was reached exactly on a batch boundary: emit a trailing
+            // empty batch so the consumer still observes `truncated`.
+            let batch = ResultBatch {
+                columns: columns.clone(),
+                rows: Vec::new(),
+                truncated: true,
+            };
+            if !on_batch(batch) {
+                stopped = true;
+            }
+        }
+    }
+    let result = ResultSet {
+        columns,
+        rows: Vec::new(),
+        row_count: row_count as u64,
+        last_insert_id: 0,
+        statement: stmt,
+        kind: "rows".to_string(),
+        error: None,
+        truncated,
+    };
+    (result, truncated, stopped, conn)
+}
+
+/// Execute `statements` inside **one transaction**, one affected result each.
+///
+/// Transaction control goes through sqlx's transaction manager; the first
+/// failing statement rolls the whole batch back. SQLite is in-process, so no
+/// protocol fallback is involved, but the same helper keeps the batched row-edit
+/// path driver-agnostic.
+///
+/// INSERT detection mirrors [run_one_owned]: SQLite's `last_insert_rowid()` is
+/// per connection and must be read on the same transaction connection.
+/// The failing statement's 1-based index is part of the error message.
+pub async fn run_transaction(
+    pool: &SqlitePool,
+    statements: Vec<String>,
+) -> AppResult<Vec<ResultSet>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::bad(crate::error::database_message(&e)))?;
+    let mut results = Vec::with_capacity(statements.len());
+    for (index, stmt) in statements.into_iter().enumerate() {
+        let is_insert = stmt.trim_start().to_ascii_lowercase().starts_with("insert");
+        match sqlx::query(stmt.as_str()).execute(&mut *tx).await {
+            Ok(result) => {
+                let mut last_insert_id = 0u64;
+                if is_insert {
+                    if let Ok(row) = sqlx::query("SELECT last_insert_rowid()")
+                        .fetch_one(&mut *tx)
+                        .await
+                    {
+                        last_insert_id =
+                            row.try_get::<i64, _>(0).unwrap_or(0).max(0) as u64;
+                    }
+                }
+                results.push(ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count: result.rows_affected(),
+                    last_insert_id,
+                    statement: stmt,
+                    kind: "affected".to_string(),
+                    error: None,
+                    truncated: false,
+                });
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(AppError::bad(format!(
+                    "第 {} 条改动失败，整批已回滚：{}",
+                    index + 1,
+                    crate::error::database_message(&e)
+                )));
+            }
+        }
+    }
+    tx.commit().await.map_err(|e| {
+        AppError::bad(format!(
+            "提交事务失败：{}",
+            crate::error::database_message(&e)
+        ))
+    })?;
+    Ok(results)
 }
 
 fn error_set(stmt: String, e: sqlx::Error) -> ResultSet {
@@ -386,14 +549,7 @@ pub async fn scan_rows<'a>(
             match item {
                 Ok(row) => {
                     if stats.columns.is_empty() {
-                        stats.columns = row
-                            .columns()
-                            .iter()
-                            .map(|c| ColumnMeta {
-                                name: c.name().to_string(),
-                                type_name: c.type_info().name().to_string(),
-                            })
-                            .collect();
+                        stats.columns = crate::drivers::columns_meta(&row);
                     }
                     let values: Vec<Value> =
                         (0..row.len()).map(|i| value_to_json(&row, i)).collect();
@@ -1425,5 +1581,226 @@ mod size_tests {
         pool.close().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&aux);
+    }
+}
+
+/// Driver-level behaviour of the streaming console path (optimisation layer 3).
+///
+/// `ScriptSession::run_batched` -> `run_one_limited_batched_owned` must hand
+/// rows over in `batch_size` chunks instead of materialising the whole result
+/// set, mark truncation only on the last delivered batch, and stop reading when
+/// the consumer returns `false` (Dart cancelled the stream).
+#[cfg(test)]
+mod batch_stream_tests {
+    use super::*;
+    use serde_json::json;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    async fn temp_pool(tag: &str) -> (SqlitePool, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "rma-sqlite-stream-{}-{}-{}.sqlite",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_file(&path);
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("open the temp database");
+        (pool, path)
+    }
+
+    /// Pool whose `t` table holds `rows` consecutive integers.
+    async fn pool_with_rows(rows: i64) -> (SqlitePool, std::path::PathBuf) {
+        let (pool, path) = temp_pool("rows").await;
+        sqlx::query("CREATE TABLE t (x INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {rows})              INSERT INTO t (x) SELECT x FROM c"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        (pool, path)
+    }
+
+    fn sizes(batches: &[ResultBatch]) -> Vec<usize> {
+        batches.iter().map(|batch| batch.rows.len()).collect()
+    }
+
+    fn flags(batches: &[ResultBatch]) -> Vec<bool> {
+        batches.iter().map(|batch| batch.truncated).collect()
+    }
+
+    async fn cleanup(pool: SqlitePool, path: std::path::PathBuf) {
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn reads_1200_rows_in_three_batches_without_truncating() {
+        let (pool, path) = pool_with_rows(1200).await;
+        let conn = pool.acquire().await.unwrap();
+        let mut batches: Vec<ResultBatch> = Vec::new();
+        let (result, truncated, stopped, conn) = run_one_limited_batched_owned(
+            conn,
+            "SELECT x FROM t ORDER BY x".to_string(),
+            10_000,
+            500,
+            &mut |batch| {
+                batches.push(batch);
+                true
+            },
+        )
+        .await;
+
+        assert_eq!(sizes(&batches), vec![500, 500, 200]);
+        // Under the cap: no batch may carry the truncation flag.
+        assert_eq!(flags(&batches), vec![false, false, false]);
+        assert_eq!(
+            batches[0].rows.first().and_then(|row| row.first()),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            batches[2].rows.last().and_then(|row| row.first()),
+            Some(&json!(1200))
+        );
+        // Column metadata is repeated on every batch.
+        assert!(batches.iter().all(|batch| batch.columns.len() == 1));
+
+        // Rows only travelled through the callback; the ResultSet is metadata.
+        assert!(result.rows.is_empty());
+        assert_eq!(result.row_count, 1200);
+        assert_eq!(result.columns.len(), 1);
+        assert!(!result.truncated);
+        assert!(!truncated);
+        assert!(!stopped);
+        let _ = conn.close().await;
+        cleanup(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn truncation_marks_only_the_last_batch() {
+        let (pool, path) = pool_with_rows(1200).await;
+        let conn = pool.acquire().await.unwrap();
+
+        // 1,200 rows under a 1,100-row cap: 500 + 500 + 100, the final batch
+        // (the one that hit the cap) is flagged, the earlier ones are not.
+        let mut batches: Vec<ResultBatch> = Vec::new();
+        let (result, truncated, stopped, conn) = run_one_limited_batched_owned(
+            conn,
+            "SELECT x FROM t ORDER BY x".to_string(),
+            1_100,
+            500,
+            &mut |batch| {
+                batches.push(batch);
+                true
+            },
+        )
+        .await;
+        assert_eq!(sizes(&batches), vec![500, 500, 100]);
+        assert_eq!(flags(&batches), vec![false, false, true]);
+        assert_eq!(result.row_count, 1_100);
+        assert!(result.truncated);
+        assert!(truncated);
+        assert!(!stopped);
+
+        // A truncated scan stops in the middle of the sqlite statement; the
+        // caller contract is to close that connection instead of reusing it
+        // (ScriptSession::run_batched does exactly that). Reusing it here hangs.
+        let _ = conn.close().await;
+        let conn = pool.acquire().await.unwrap();
+
+        // The cap lands exactly on a batch boundary (1,000 rows read, row 1,001
+        // stops the scan): a trailing empty batch still reports the cap, the same
+        // contract as the MySQL driver.
+        let mut batches: Vec<ResultBatch> = Vec::new();
+        let (result, truncated, stopped, conn) = run_one_limited_batched_owned(
+            conn,
+            "SELECT x FROM t ORDER BY x".to_string(),
+            1_000,
+            500,
+            &mut |batch| {
+                batches.push(batch);
+                true
+            },
+        )
+        .await;
+        assert_eq!(sizes(&batches), vec![500, 500, 0]);
+        assert_eq!(flags(&batches), vec![false, false, true]);
+        assert_eq!(result.row_count, 1_000);
+        assert!(result.truncated);
+        assert!(truncated);
+        assert!(!stopped);
+        let _ = conn.close().await;
+        cleanup(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn consumer_stop_ends_the_scan() {
+        let (pool, path) = pool_with_rows(1200).await;
+        let conn = pool.acquire().await.unwrap();
+        let mut batches: Vec<ResultBatch> = Vec::new();
+        let (result, truncated, stopped, conn) = run_one_limited_batched_owned(
+            conn,
+            "SELECT x FROM t ORDER BY x".to_string(),
+            10_000,
+            300,
+            &mut |batch| {
+                batches.push(batch);
+                false
+            },
+        )
+        .await;
+
+        // The callback refused the first batch: the scan must stop immediately.
+        assert_eq!(sizes(&batches), vec![300]);
+        assert!(stopped);
+        assert!(!truncated);
+        assert_eq!(result.row_count, 300);
+        assert!(!result.truncated);
+        // `stopped` tells the caller to close the connection (it is not reused).
+        let _ = conn.close().await;
+        cleanup(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn non_row_statement_reports_one_affected_result() {
+        let (pool, path) = pool_with_rows(1).await;
+        let conn = pool.acquire().await.unwrap();
+        let mut calls = 0usize;
+        let (result, truncated, stopped, conn) = run_one_limited_batched_owned(
+            conn,
+            "INSERT INTO t (x) VALUES (2)".to_string(),
+            10,
+            500,
+            &mut |_batch| {
+                calls += 1;
+                true
+            },
+        )
+        .await;
+
+        // Affected statements go through the ResultSet (kind "affected"), exactly
+        // like the MySQL driver: the caller is told once via statement_done.
+        assert_eq!(calls, 0, "no row batch for a non-row statement");
+        assert_eq!(result.kind, "affected");
+        assert_eq!(result.row_count, 1);
+        assert!(result.error.is_none());
+        assert!(!truncated);
+        assert!(!stopped);
+        let _ = conn.close().await;
+        cleanup(pool, path).await;
     }
 }

@@ -11,6 +11,7 @@ import '../i18n_literals.dart';
 import '../import_rules.dart';
 import '../nav.dart';
 import '../notice.dart';
+import '../row_changes.dart';
 import '../sql_highlight.dart';
 import '../sqlite_sources.dart';
 import '../theme.dart';
@@ -97,6 +98,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   List<Json> _sqlResults = <Json>[];
   String? _error;
   String? _sqlError;
+  bool _sqlRunning = false;
   bool _loading = true;
   /// SQL-file import runs as a Rust job; this polls its progress.
   bool _importing = false;
@@ -664,6 +666,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           onDelete: _deleteRow,
           onDeleteSelected: _deleteRows,
           onSaveCell: _saveCell,
+          onApplyEdits: _applyDirtyEdits,
         ),
         const SizedBox(height: 8),
         _pager(),
@@ -729,6 +732,31 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       keys[name] = i < row.length ? row[i] : null;
     }
     return keys;
+  }
+
+  /// Save every staged cell edit of the current page in **one transaction**.
+  ///
+  /// Unlike [_saveCell] (one immediate UPDATE per cell), the grid stages edits
+  /// and hands them over together; the Rust side validates all of them before
+  /// opening the transaction and rolls the whole batch back on the first error.
+  Future<bool> _applyDirtyEdits(List<DirtyCell> edits) async {
+    final changes = buildRowChanges(
+      columns: _columns,
+      rows: _rows,
+      primaryKey: _primaryKey,
+      edits: edits,
+    );
+    try {
+      final result =
+          await Api.instance.applyRowChanges(widget.db, widget.table, changes);
+      final applied = (result['rows_affected'] as num?)?.toInt() ?? 0;
+      widget.notice.show('已保存 $applied 行');
+      await _reloadAfterWrite();
+      return true;
+    } catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+      return false;
+    }
   }
 
   Future<void> _saveCell(
@@ -1764,8 +1792,21 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
               Wrap(
                 spacing: 8,
                 children: [
-                  Btn(t('run'), primary: true, onPressed: _runSql),
-                  Btn('EXPLAIN', onPressed: _explainSql),
+                  Btn(
+                    t('run'),
+                    primary: true,
+                    busy: _sqlRunning,
+                    onPressed: _sqlRunning ? null : _runSql,
+                  ),
+                  Btn(
+                    '取消',
+                    key: const ValueKey('table-sql-cancel'),
+                    tooltip: AppState.instance.isSqlite
+                        ? 'SQLite 在应用进程内执行查询，无法安全取消'
+                        : '取消正在执行的查询（MySQL KILL / PostgreSQL pg_cancel_backend）',
+                    onPressed: _sqlRunning ? _cancelSql : null,
+                  ),
+                  Btn('EXPLAIN', onPressed: _sqlRunning ? null : _explainSql),
                 ],
               ),
             ],
@@ -1787,7 +1828,11 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   }
 
   Future<void> _runSql() async {
-    setState(() => _sqlError = null);
+    if (_sqlRunning) return;
+    setState(() {
+      _sqlError = null;
+      _sqlRunning = true;
+    });
     try {
       final res = await Api.instance.query(_sqlText, widget.db);
       setState(() => _sqlResults = _resultsOf(res['results']));
@@ -1796,16 +1841,43 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       await _reloadAfterWrite();
     } catch (e) {
       if (mounted) setState(() => _sqlError = describeDbError(e));
+    } finally {
+      if (mounted) setState(() => _sqlRunning = false);
+    }
+  }
+
+  /// Same semantics as the console cancel button: stop the server-side
+  /// statement; the in-flight request returns the rewritten error.
+  Future<void> _cancelSql() async {
+    try {
+      final res = await Api.instance.cancelQuery();
+      final cancelled = (res['cancelled'] as num?)?.toInt() ?? 0;
+      final reconnected = res['reconnected'] == true;
+      if (cancelled <= 0) {
+        widget.notice.show('没有找到正在执行的查询（可能已结束）');
+      } else if (reconnected) {
+        widget.notice.show('已中断查询连接，下一次查询会自动重连');
+      } else {
+        widget.notice.show('已发送取消请求');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _sqlError = describeDbError(e));
     }
   }
 
   Future<void> _rerunSql() async {
-    setState(() => _sqlError = null);
+    if (_sqlRunning) return;
+    setState(() {
+      _sqlError = null;
+      _sqlRunning = true;
+    });
     try {
       final res = await Api.instance.query(_sqlText, widget.db);
       setState(() => _sqlResults = _resultsOf(res['results']));
     } catch (e) {
       if (mounted) setState(() => _sqlError = describeDbError(e));
+    } finally {
+      if (mounted) setState(() => _sqlRunning = false);
     }
   }
 

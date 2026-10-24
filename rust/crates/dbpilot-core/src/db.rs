@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -7,7 +8,7 @@ pub const DQ: char = '\u{22}';
 pub const BS: char = '\u{5c}';
 pub const NL: char = '\u{a}';
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct ColumnMeta {
     pub name: String,
     pub type_name: String,
@@ -27,6 +28,147 @@ pub struct ResultSet {
     /// other caller (table browsing is paged, import/backup are not row
     /// queries) leaves this false.
     pub truncated: bool,
+}
+
+/// One chunk of a streaming result set (optimisation layer 3).
+///
+/// `SessionHandle::run_batched` hands rows to the caller in batches so a large
+/// SQL-console result never has to be materialised in full. `columns` is
+/// repeated on every batch; observers forward it only with the first event.
+/// `truncated` marks the batch after which the row cap stopped the scan.
+#[derive(Debug, Clone, Default)]
+pub struct ResultBatch {
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<Value>>,
+    pub truncated: bool,
+}
+
+/// One cell decoded straight from a driver row, before the typed DTO conversion.
+///
+/// The SQL-console typed/streaming path uses this to skip the intermediate
+/// `serde_json::Value` representation that the legacy `run_query` JSON contract
+/// was built around: that tree is built per cell only to be decoded again into
+/// the typed cell DTO by the engine, so for a large result set it is pure
+/// overhead. The legacy JSON response is still produced from the typed cells.
+
+///
+/// The variants mirror the typed cell kinds plus [RawCell::UInt], which MySQL's
+/// `BIGINT UNSIGNED` needs above `i64::MAX`. [RawCell::into_legacy_json] keeps
+/// such a value a JSON number (exactly like the pre-typed `value_to_json`
+/// output); the DTO conversion in the main crate turns it into text, exactly
+/// like `CellValue::from_json` always did for u64 values above i64::MAX.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawCell {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl RawCell {
+    /// Inverse of the drivers' `value_to_json`: turn a legacy JSON cell back
+    /// into a [RawCell].
+    ///
+    /// This is the fallback for drivers that have no raw decoder yet
+    /// (PostgreSQL / SQLite): the engine still receives [RawCell]s, but they go
+    /// through the legacy representation first. The rules must stay the exact
+    /// mirror of the MySQL decoder *and* of `CellValue::from_json` in the main
+    /// crate:
+    ///
+    /// * `null` -> [RawCell::Null];
+    /// * booleans -> [RawCell::Bool];
+    /// * integers -> [RawCell::Int], positive integers above `i64::MAX` ->
+    ///   [RawCell::UInt], other numbers -> [RawCell::Float];
+    /// * strings -> [RawCell::Text];
+    /// * `{"__binary__": <base64>, "len": <n>}` -> [RawCell::Bytes];
+    /// * a malformed binary marker or any other object/array -> [RawCell::Text]
+    ///   holding its JSON text (the same lossless-ish fallback as
+    ///   `CellValue::from_json`; drivers never produce those shapes).
+    pub fn from_legacy_json(value: Value) -> Self {
+        match value {
+            Value::Null => RawCell::Null,
+            Value::Bool(value) => RawCell::Bool(value),
+            Value::Number(number) => {
+                if let Some(value) = number.as_i64() {
+                    RawCell::Int(value)
+                } else if let Some(value) = number.as_u64() {
+                    // Only reachable above i64::MAX (as_i64 covers the rest).
+                    RawCell::UInt(value)
+                } else if let Some(value) = number.as_f64() {
+                    RawCell::Float(value)
+                } else {
+                    RawCell::Text(number.to_string())
+                }
+            }
+            Value::String(value) => RawCell::Text(value),
+            Value::Object(map) => match map.get("__binary__").and_then(Value::as_str) {
+                Some(encoded) => match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    Ok(bytes) => RawCell::Bytes(bytes),
+                    // Same rule as CellValue::from_json: a malformed marker is
+                    // preserved as text, never silently turned into NULL.
+                    Err(_) => RawCell::Text(Value::Object(map).to_string()),
+                },
+                None => RawCell::Text(Value::Object(map).to_string()),
+            },
+            Value::Array(items) => RawCell::Text(Value::Array(items).to_string()),
+        }
+    }
+
+    /// Back to the legacy JSON cell shape (`value_to_json` output).
+    ///
+    /// Consumes the cell so text and bytes payloads move instead of being
+    /// cloned. `UInt` stays a JSON number here: that is what the pre-typed
+    /// driver path produced, and it is what keeps the documented legacy
+    /// contract recoverable byte for byte.
+    pub fn into_legacy_json(self) -> Value {
+        match self {
+            RawCell::Null => Value::Null,
+            RawCell::Bool(value) => Value::Bool(value),
+            RawCell::Int(value) => Value::Number(value.into()),
+            RawCell::UInt(value) => Value::Number(value.into()),
+            // Non-finite floats are not representable in JSON; the legacy
+            // `json!(f64)` also produced null for them.
+            RawCell::Float(value) => serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
+            RawCell::Text(value) => Value::String(value),
+            RawCell::Bytes(bytes) => serde_json::json!({
+                "__binary__": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                "len": bytes.len(),
+            }),
+        }
+    }
+}
+
+/// One chunk of a raw streaming result set (optimisation layer 3, raw variant).
+///
+/// Same contract as [ResultBatch], but rows are [RawCell]s: the SQL-console
+/// typed/streaming path never builds `serde_json::Value` for them, while the
+/// legacy `run_query` JSON response is still produced from the typed cells.
+#[derive(Debug, Clone, Default)]
+pub struct RawResultBatch {
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<RawCell>>,
+    pub truncated: bool,
+}
+
+impl RawResultBatch {
+    /// Default (JSON fallback) batch conversion used by drivers without a raw
+    /// decoder: mirrors [ResultBatch] into [RawResultBatch] cell by cell.
+    pub fn from_result_batch(batch: ResultBatch) -> Self {
+        Self {
+            columns: batch.columns,
+            rows: batch
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().map(RawCell::from_legacy_json).collect())
+                .collect(),
+            truncated: batch.truncated,
+        }
+    }
 }
 
 /// Outcome of a streaming row scan used by the export path.
@@ -344,5 +486,133 @@ pub fn returns_rows(stmt: &str) -> bool {
         "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "WITH" | "TABLE" | "VALUES"
             | "CALL" | "ANALYZE" | "CHECK" | "OPTIMIZE" | "REPAIR" | "HELP" | "PRAGMA"
     )
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn binary_cell(bytes: &[u8]) -> Value {
+        json!({
+            "__binary__": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "len": bytes.len(),
+        })
+    }
+
+    #[test]
+    fn raw_cell_round_trips_the_legacy_json_cell_shapes() {
+        for value in [
+            Value::Null,
+            json!(true),
+            json!(false),
+            json!(-7),
+            json!(42),
+            json!(i64::MAX),
+            // MySQL BIGINT UNSIGNED above i64::MAX: the legacy shape is a
+            // JSON number, so the raw cell must keep the number here.
+            json!(u64::MAX),
+            json!(9_223_372_036_854_775_808u64),
+            json!(1.25),
+            json!("text"),
+            json!(""),
+            binary_cell(&[0, 1, 254, 255]),
+            binary_cell(&[]),
+        ] {
+            let raw = RawCell::from_legacy_json(value.clone());
+            assert_eq!(
+                raw.clone().into_legacy_json(),
+                value,
+                "raw round trip changed the legacy cell for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_cell_uses_uint_only_above_i64_max() {
+        assert_eq!(RawCell::from_legacy_json(json!(0)), RawCell::Int(0));
+        assert_eq!(
+            RawCell::from_legacy_json(json!(i64::MAX)),
+            RawCell::Int(i64::MAX)
+        );
+        assert_eq!(
+            RawCell::from_legacy_json(json!(u64::MAX)),
+            RawCell::UInt(u64::MAX)
+        );
+        // The legacy JSON number is preserved, not rounded through f64.
+        assert_eq!(
+            RawCell::UInt(u64::MAX).into_legacy_json(),
+            json!(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn raw_cell_keeps_the_binary_marker_contract() {
+        assert_eq!(
+            RawCell::from_legacy_json(binary_cell(&[0, 255])),
+            RawCell::Bytes(vec![0, 255])
+        );
+        assert_eq!(
+            RawCell::Bytes(vec![0, 255]).into_legacy_json(),
+            binary_cell(&[0, 255])
+        );
+        // Empty payloads stay bytes, not NULL.
+        assert_eq!(
+            RawCell::from_legacy_json(binary_cell(&[])),
+            RawCell::Bytes(Vec::new())
+        );
+        // A malformed marker degrades to text instead of becoming NULL.
+        let malformed = json!({ "__binary__": "not base64!!", "len": 3 });
+        assert_eq!(
+            RawCell::from_legacy_json(malformed.clone()),
+            RawCell::Text(malformed.to_string())
+        );
+        // A plain object/array has no raw variant: text, like CellValue::from_json.
+        assert_eq!(
+            RawCell::from_legacy_json(json!({ "a": 1 })),
+            RawCell::Text("{\"a\":1}".to_string())
+        );
+        assert_eq!(
+            RawCell::from_legacy_json(json!([1, 2])),
+            RawCell::Text("[1,2]".to_string())
+        );
+    }
+
+    #[test]
+    fn non_finite_floats_degrade_to_null_like_json_macro() {
+        assert_eq!(RawCell::Float(f64::NAN).into_legacy_json(), Value::Null);
+        assert_eq!(RawCell::Float(f64::INFINITY).into_legacy_json(), Value::Null);
+        assert_eq!(
+            RawCell::Float(1.5).into_legacy_json(),
+            json!(1.5),
+            "finite floats must stay numbers"
+        );
+    }
+
+    #[test]
+    fn from_result_batch_converts_every_cell_and_preserves_meta() {
+        let batch = ResultBatch {
+            columns: vec![ColumnMeta {
+                name: "id".to_string(),
+                type_name: "BIGINT".to_string(),
+            }],
+            rows: vec![
+                vec![json!(1), binary_cell(&[7])],
+                vec![Value::Null, json!(u64::MAX)],
+            ],
+            truncated: true,
+        };
+        let raw = RawResultBatch::from_result_batch(batch);
+        assert_eq!(raw.columns.len(), 1);
+        assert!(raw.truncated);
+        assert_eq!(
+            raw.rows,
+            vec![
+                vec![RawCell::Int(1), RawCell::Bytes(vec![7])],
+                vec![RawCell::Null, RawCell::UInt(u64::MAX)],
+            ]
+        );
+    }
 }
 

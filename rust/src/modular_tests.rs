@@ -298,18 +298,21 @@ fn source(relative: &str) -> String {
 #[test]
 fn p3_session_abstraction_is_wired() {
     // api 只认 core trait，不再点名具体会话类型（注释里解释历史不算）。
+    // 控制台引擎已搬到 src/query_engine.rs（FRB 只扫描 crate::api，引擎里的
+    // dbpilot-core 类型不能让 codegen 看见），固定会话在这边打开。
     let query = without_line_comments(&source("src/api/query.rs"));
     assert!(
         !query.contains("script_session"),
         "api/query.rs 又出现了 Db::script_session"
     );
+    let engine = without_line_comments(&source("src/query_engine.rs"));
     assert!(
-        query.contains("SessionHandle"),
-        "api/query.rs 应通过 core::SessionHandle 开会话"
+        engine.contains("SessionHandle"),
+        "query_engine.rs 应通过 core::SessionHandle 开会话"
     );
     assert!(
-        query.contains("open_session"),
-        "api/query.rs 应通过 AppState::open_session 开会话"
+        engine.contains("open_session"),
+        "query_engine.rs 应通过 AppState::open_session 开会话"
     );
     // 旧门面上的 pub 构造入口必须保持删除状态。
     let facade = source("src/drivers/mod.rs");
@@ -320,6 +323,34 @@ fn p3_session_abstraction_is_wired() {
     // core 必须提供 trait 与驱动 / 池两端的接线。
     assert!(source("crates/dbpilot-core/src/session.rs").contains("pub trait SessionHandle"));
     assert!(source("crates/dbpilot-core/src/driver.rs").contains("async fn session("));
+}
+
+#[test]
+fn p3_db_types_stay_out_of_the_api_surface() {
+    // flutter_rust_bridge parses every item under `crate::api` (including
+    // private traits / pub(crate) helpers, and #[frb(ignore)] does NOT stop the
+    // type collection) and generates codecs for the types in their signatures.
+    // dbpilot-core's ResultSet / ColumnMeta / ResultBatch are opaque to it, so
+    // codegen emitted bare `ColumnMeta` impls without imports and the generated
+    // file stopped compiling (23x E0425). Keep those types out of the api module
+    // tree; the engine that needs them lives in src/query_engine.rs.
+    // Only the files whose FRB-visible signatures caused the failure: other api
+    // files may use ResultSet in local variables (codegen does not parse bodies).
+    for file in ["src/api/query.rs", "src/api/query_types.rs", "src/api/mod.rs"] {
+        let text = without_line_comments(&source(file)).replace("ResultSetDto", "");
+        for needle in ["ColumnMeta", "ResultSet", "ResultBatch"] {
+            assert!(
+                !text.contains(needle),
+                "{file} 不应引用 dbpilot-core 的 {needle}（会被 FRB 收集成裸类型并生成无法编译的代码）"
+            );
+        }
+    }
+    // The engine is where those types belong.
+    let engine = source("src/query_engine.rs");
+    assert!(
+        engine.contains("ColumnMeta") && engine.contains("ResultSet"),
+        "query_engine.rs 应持有 dbpilot-core 结果类型的转换"
+    );
 }
 
 #[test]

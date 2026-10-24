@@ -17,6 +17,9 @@ analyzer:
     - linux/**
 
     - rust_builder/cargokit/**
+    # codegen 产物（flutter_rust_bridge 生成）：不参与格式/分析噪声；
+    # 它们仍会被 flutter test / build 编译验证。格式化见 tools/format.sh。
+    - lib/src/rust/**
 linter:
   # The lint rules applied to this project can be customized in the
   # section below to disable rules from the `package:flutter_lints/flutter.yaml`

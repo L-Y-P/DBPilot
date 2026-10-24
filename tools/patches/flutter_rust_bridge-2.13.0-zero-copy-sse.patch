@@ -1,0 +1,74 @@
+diff --git a/lib/src/codec/sse.dart b/lib/src/codec/sse.dart
+--- a/lib/src/codec/sse.dart
++++ b/lib/src/codec/sse.dart
+@@ -38,12 +38,14 @@ class SseCodec<S, E extends Object> extends BaseCodec<S, E> {
+     if (raw is! Uint8List) {
+       return _decodeObjectOfOtherType(raw);
+     }
+ 
+-    return _decode(raw);
++    // Ownership of an async SSE message is handed to the Dart VM
++    // (ExternalTypedData); the decoded view keeps the backing store alive, so
++    // the per-message memcpy can be skipped here.
++    return _decode(raw, copy: false);
+   }
+ 
+   @override
+   S decodeWireSyncType(WireSyncRust2DartSse raw) =>
+-      _decode(wireSyncRust2DartSseAsUint8ListView(raw));
++      // Sync calls free the Rust wire buffer as soon as the call returns.
++      _decode(wireSyncRust2DartSseAsUint8ListView(raw), copy: true);
+ 
+-  S _decode(Uint8List bytes) {
+-    final deserializer = SseDeserializer(bytes.buffer.asByteData());
++  S _decode(Uint8List bytes, {required bool copy}) {
++    final deserializer =
++        SseDeserializer(bytes.buffer.asByteData(), copy: copy);
+     final action = deserializer.buffer.getUint8();
+@@ -98,7 +100,8 @@ class SseDeserializer {
+   final ReadBuffer buffer;
+ 
+   /// {@macro flutter_rust_bridge.only_for_generated_code}
+-  SseDeserializer(ByteData data) : buffer = ReadBuffer(data);
++  SseDeserializer(ByteData data, {bool copy = true})
++      : buffer = ReadBuffer(data, copy: copy);
+ }
+diff --git a/lib/src/third_party/flutter_foundation_serialization/read_buffer.dart b/lib/src/third_party/flutter_foundation_serialization/read_buffer.dart
+--- a/lib/src/third_party/flutter_foundation_serialization/read_buffer.dart
++++ b/lib/src/third_party/flutter_foundation_serialization/read_buffer.dart
+@@ -11,10 +11,17 @@ import 'package:flutter_rust_bridge/src/generalized_typed_data/generalized_typed_
+ class ReadBuffer {
+   /// Creates a [ReadBuffer] for reading from the specified [data].
+-  ReadBuffer(this.data);
++  ///
++  /// [copy] must stay true for the synchronous FFI path (Rust frees the wire
++  /// buffer as soon as the call returns). Asynchronous SSE messages own their
++  /// buffer through ExternalTypedData, so a view is safe there and saves one
++  /// full memcpy per message.
++  ReadBuffer(this.data, {required this.copy});
+ 
+   /// The underlying data being read.
+   final ByteData data;
++
++  /// Whether byte slices must be copied out of [data] before returning them.
++  final bool copy;
+ 
+   /// The position to read next.
+   int _position = 0;
+@@ -103,10 +110,12 @@ class ReadBuffer {
+     final Uint8List listView = data.buffer.asUint8List(
+       data.offsetInBytes + _position,
+       length,
+     );
+     _position += length;
+-    // NOTE: Must copy when in `sync` mode, because the underlying buffer
+-    // is a Rust pointer and will be freed later
+-    // (but in non-sync mode, we can optimize this and do not copy)
+-    return Uint8List.fromList(listView);
++    // Must copy when in `sync` mode, because the underlying buffer is a Rust
++    // pointer and will be freed as soon as the call returns. In async mode the
++    // buffer is owned by the Dart VM, so a view is both safe and zero-copy.
++    return copy ? Uint8List.fromList(listView) : listView;
+   }
+ 
+   /// Reads the given number of Uint16s from the buffer.

@@ -9,7 +9,7 @@ import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `parse`, `session_error_result`, `session_result`, `state`, `strip_leading_comments`, `switch_database_for_use`, `use_statement_target`
+// These functions are ignored because they are not marked as `pub`: `parse`, `state`, `strip_leading_comments`, `switch_database_for_use`, `use_statement_target`
 
 /// Initialize the Rust core. `data_dir` comes from Dart's `path_provider`
 /// so the Rust side never has to guess a platform-specific location; when it

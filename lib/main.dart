@@ -11,6 +11,7 @@ import 'src/app_state.dart';
 import 'src/app_version.dart';
 import 'src/cu_input.dart';
 import 'src/dpi_scale.dart';
+import 'src/frame_trace.dart';
 import 'src/i18n_literals.dart';
 import 'src/settings_channel.dart';
 import 'src/shell.dart';
@@ -19,6 +20,11 @@ import 'src/theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 应用内帧耗时采样：只在 DBPILOT_FRAME_TRACE=1 时注册回调并周期性打印
+  // FRAME_TRACE 统计行（默认关闭，零开销）。用环境变量而不是设置项，是因为它只服务于
+  // 自动化/性能排查，且必须在首帧之前生效（见 src/frame_trace.dart 顶部注释）。
+  FrameTrace.instance.maybeStart();
 
   // Computer-Use 文本注入桥（默认关闭）：只有 RMA_CU_INPUT=1 时才启动，
   // 监听全局焦点并允许本机回环 HTTP 往当前 EditableText 的 controller 写文本。

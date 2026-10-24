@@ -29,6 +29,8 @@ pub mod exporters;
 pub mod history;
 pub mod importer;
 pub mod pools;
+/// Internal SQL-console engine (outside the FRB `api` scan).
+mod query_engine;
 pub mod privileges;
 pub mod secure;
 pub mod ssh;
@@ -75,4 +77,6 @@ mod modular_tests;
 #[cfg(test)]
 mod security_tests;
 
+#[allow(deprecated)]
+#[rustfmt::skip]
 mod frb_generated;

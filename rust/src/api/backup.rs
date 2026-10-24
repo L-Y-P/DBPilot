@@ -4,6 +4,8 @@
 //! its creator or an admin; a desktop app has one user, so every backup is
 //! accessible. The dump content is still written 0600 through `BackupStore`.
 
+use std::io::Write;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -24,6 +26,13 @@ struct CreateBackupRequest {
 }
 
 /// Dump a whole database (or one table) into a new backup file.
+///
+/// The dump is **streamed** into a private temp file in the backup directory
+/// (one multi-row INSERT per 500 rows via [super::export::table_sql_stream]),
+/// then committed with one atomic rename. The old implementation built each
+/// table's whole dump as a `String` — and the whole database dump as one giant
+/// `String` — which for a large table meant holding every row in memory at
+/// once (backup of a 500k-row table could add hundreds of MB of RSS).
 pub async fn create_backup(body: Value) -> anyhow::Result<Value> {
     let state = state()?;
     let req: CreateBackupRequest = parse("backup", body)?;
@@ -39,44 +48,71 @@ pub async fn create_backup(body: Value) -> anyhow::Result<Value> {
         None
     };
     let table = req.table.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let mut body = format!(
-        "-- DBPilot backup\n-- Driver: {}\n-- Database: {}\n-- Server database: {}\n-- Created: {}\n\n",
-        driver.label(),
-        database,
-        server_database.as_deref().unwrap_or("-"),
-        chrono::Utc::now().to_rfc3339()
-    );
-    match table {
-        Some(name) => {
-            body.push_str(
-                &super::export::table_sql(driver.as_ref(), &conn, &database, name, true, true, true)
-                    .await?,
-            );
+    // Which tables to dump (the explicit one, or every base table).
+    let table_names: Vec<String> = match table {
+        Some(name) => vec![name.to_string()],
+        None => driver
+            .list_tables(&conn, &database)
+            .await?
+            .into_iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("BASE TABLE"))
+            .filter_map(|t| {
+                t.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|name| !name.is_empty())
+            })
+            .collect(),
+    };
+
+    let temp = state.backups.temp_dump_path().await?;
+    let written: anyhow::Result<()> = async {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(|e| AppError::Internal(format!("无法创建备份文件: {e}")))?;
+        // 1 MiB buffer: rows are written in 500-row batches, so a bigger buffer
+        // only delays the first flush without helping throughput.
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+        write!(
+            writer,
+            "-- DBPilot backup\n-- Driver: {}\n-- Database: {}\n-- Server database: {}\n-- Created: {}\n\n",
+            driver.label(),
+            database,
+            server_database.as_deref().unwrap_or("-"),
+            chrono::Utc::now().to_rfc3339()
+        )?;
+        for name in &table_names {
+            super::export::table_sql_stream(
+                driver.as_ref(),
+                &conn,
+                &database,
+                name,
+                true,
+                true,
+                true,
+                &mut writer,
+                0,
+            )
+            .await?;
         }
-        None => {
-            let tables = driver.list_tables(&conn, &database).await?;
-            for t in tables {
-                if t.get("type").and_then(|v| v.as_str()) != Some("BASE TABLE") {
-                    continue;
-                }
-                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if name.is_empty() {
-                    continue;
-                }
-                body.push_str(
-                    &super::export::table_sql(driver.as_ref(), &conn, &database, &name, true, true, true)
-                        .await?,
-                );
-            }
-        }
+        writer.flush()?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = written {
+        // Do not leave a half-written dump in the backup directory.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
     }
     let meta = state
         .backups
-        .create(
+        .create_from_path(
             driver.id(),
             &database,
             table,
-            body,
+            &temp,
             server_database.as_deref(),
         )
         .await?;
@@ -91,28 +127,46 @@ pub async fn read_backup(id: String) -> anyhow::Result<Value> {
 }
 
 /// Execute every statement in a backup against its original database.
+///
+/// The dump runs through **one pinned connection** and consecutive DML
+/// statements are grouped into transactions (see
+/// [dbpilot_core::ops::restore_sql]): a 500k-row dump pays a handful of commits
+/// instead of one autocommit per INSERT. Failure reporting is unchanged — one
+/// entry per dump statement, the first 20 errors are returned — and a failed
+/// batch is rolled back and replayed so every other statement is still
+/// attempted.
 pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
     let state = state()?;
     let (meta, content) = state.backups.read(&id).await?;
+    let driver = state.driver_for_active().await?;
     // PostgreSQL backups record the physical database; without it (an older
     // backup) the schema-only restore keeps using the active database.
-    let driver = state.driver_for_active().await?;
-    let conn = match meta.server_database.as_deref() {
+    let target_database = match meta.server_database.as_deref() {
         Some(database) => {
-            let conn = state.connection_for_database(database).await?;
             if driver.kind() == crate::drivers::DriverKind::Postgres {
                 state.set_active_database(Some(database.to_string())).await;
             }
-            conn
+            Some(database.to_string())
         }
-        None => state.connection_for(Some(&meta.database)).await?,
+        // MySQL / SQLite: the backup database is the namespace to restore into.
+        None => Some(meta.database.clone()),
     };
-    let results = driver.run_sql(&conn, &content).await;
-    let statements = results.len();
-    let failed = results.iter().filter(|r| r.error.is_some()).count();
-    let errors: Vec<Value> = results
+    // Pinned connection: consecutive statements share session state, which is
+    // what lets the DML batches run in a transaction (and makes a dump's
+    // USE / SET FOREIGN_KEY_CHECKS actually apply to the next statement).
+    let mut session = state.open_session(target_database.as_deref()).await?;
+    let report = dbpilot_core::ops::restore_sql(session.as_mut(), &content).await;
+    drop(session);
+    let statements = report.statements();
+    let failed = report.failed();
+    let errors: Vec<Value> = report
+        .results
         .iter()
-        .filter_map(|r| r.error.as_ref().map(|e| json!({ "statement": r.statement, "error": e })))
+        .filter_map(|r| {
+            r.error
+                .as_ref()
+                .map(|e| json!({ "statement": r.statement, "error": e }))
+        })
         .take(20)
         .collect();
     Ok(json!({
@@ -120,6 +174,12 @@ pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
         "statements": statements,
         "failed": failed,
         "errors": errors,
+        // Additive diagnostics: how the restore was batched. MySQL DDL
+        // implicitly commits, so statements_in_transactions covers only the
+        // consecutive DML runs; a dump is never atomic as a whole on MySQL.
+        "transaction_batches": report.transaction_batches,
+        "statements_in_transactions": report.statements_in_transactions,
+        "round_trips": report.round_trips,
     }))
 }
 
@@ -128,3 +188,4 @@ pub async fn delete_backup(id: String) -> anyhow::Result<Value> {
     let removed = state.backups.remove(&id).await?;
     Ok(json!({ "ok": true, "removed": removed }))
 }
+

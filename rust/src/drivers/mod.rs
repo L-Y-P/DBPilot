@@ -11,10 +11,10 @@ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use sqlx::{MySql, Postgres, Sqlite};
+use sqlx::{Column, MySql, Postgres, Row, Sqlite, TypeInfo};
 
 use crate::core::account::AccountAdmin;
-use crate::db::{returns_rows, split_statements, ResultSet};
+use crate::db::{returns_rows, split_statements, RawResultBatch, ResultBatch, ResultSet};
 use crate::error::{AppError, AppResult};
 
 // P2-1：DriverKind / ConnSpec 已搬进 core::config；这里保留旧路径的再导出，
@@ -303,6 +303,17 @@ pub async fn connect_full(
 /// pool; pool eviction releases it together with the pool. The returned
 /// [TunnelInfo] is a copy of what was registered, so the caller can report it
 /// without opening another tunnel.
+/// Pool size for one database. 10 concurrent tabs used to fight over five
+/// connections (tail latency); 8 is the default and DBPILOT_POOL_SIZE lets a
+/// power user raise it without a rebuild.
+fn configured_pool_size() -> u32 {
+    std::env::var("DBPILOT_POOL_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(8)
+        .clamp(2, 32)
+}
+
 pub async fn connect_via(
     spec: &ConnSpec,
     database: Option<&str>,
@@ -315,6 +326,36 @@ pub async fn connect_via(
         port: tunnel.local_addr.port(),
         fingerprint: tunnel.host_key_fingerprint.clone(),
     });
+    // Dead hosts used to cost 15s per pool attempt (the connect/admin fallback
+    // made it 30s). A refused port / unresolvable name is deterministic, so a
+    // short TCP preflight can report it immediately; a slow-but-real server
+    // (timeout / other errors) still goes through the pool with its normal
+    // timeout and localized error.
+    if matches!(spec.driver, DriverKind::Mysql | DriverKind::Postgres) {
+        let check_host = host.trim();
+        if !check_host.is_empty() && !check_host.starts_with('/') {
+            let preflight = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect((check_host, port)),
+            )
+            .await;
+            if let Ok(Err(error)) = preflight {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) {
+                    let reason = if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                        "连接被拒绝（服务未启动或端口错误）"
+                    } else {
+                        "主机名无法解析"
+                    };
+                    return Err(AppError::bad(format!(
+                        "无法连接 {check_host}:{port}：{reason}"
+                    )));
+                }
+            }
+        }
+    }
     if let Some(tunnel) = target.tunnel {
         crate::pools::register_tunnel(port, tunnel);
     }
@@ -328,7 +369,7 @@ pub async fn connect_via(
             let mut opts = mysql::connect_options(spec, database)?;
             opts = opts.ssl_mode(mysql::ssl_mode_for(spec));
             let pool = MySqlPoolOptions::new()
-                .max_connections(5)
+                .max_connections(configured_pool_size())
                 .acquire_timeout(Duration::from_secs(15))
                 // Fix the string-escaping contract for this pool. The app
                 // renders literals by doubling backslashes, which is only
@@ -408,7 +449,7 @@ pub async fn connect_via(
                 opts = opts.database(db);
             }
             let pool = PgPoolOptions::new()
-                .max_connections(5)
+                .max_connections(configured_pool_size())
                 .acquire_timeout(Duration::from_secs(15))
                 .connect_with(opts)
                 .await
@@ -448,7 +489,7 @@ pub async fn connect_via(
                 ));
             }
             let mut pool_opts = SqlitePoolOptions::new()
-                .max_connections(5)
+                .max_connections(configured_pool_size())
                 .acquire_timeout(Duration::from_secs(15));
             if !attach.is_empty() {
                 pool_opts = pool_opts.after_connect(move |conn, _meta| {
@@ -534,6 +575,24 @@ impl crate::core::connection::SqlSession for PoolSession {
 
     async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// 一个事务内执行多条语句（批量保存：全部成功才提交，否则整批回滚）。
+    ///
+    /// 事务控制由各驱动用 sqlx 的 transaction API 发出。**不要**在这里执行
+    /// 文本 `BEGIN`：MySQL 的 prepared-statement 协议拒绝它（1295），而
+    /// 单语句执行路径对这类错误会回退到池里另一条连接。
+    async fn execute_transaction(
+        &self,
+        statements: Vec<String>,
+    ) -> AppResult<Vec<ResultSet>> {
+        match &self.pool {
+            Pool::MySql(pool) => {
+                crate::drivers::mysql::exec::run_transaction(pool, statements).await
+            }
+            Pool::Postgres(pool) => postgres::run_transaction(pool, statements).await,
+            Pool::Sqlite(pool) => sqlite::run_transaction(pool, statements).await,
+        }
     }
 
     fn tunnel(&self) -> Option<TunnelInfo> {
@@ -697,6 +756,182 @@ impl ScriptSession {
         result
     }
 
+    /// Streaming variant of [ScriptSession::run_limited] (optimisation layer 3).
+    ///
+    /// All three drivers stream rows through `sqlx`'s fetch loop and hand a
+    /// batch to `on_batch` as soon as it is full (no full materialisation).
+    /// They share the row-cap / batching / close policy below; each keeps its
+    /// own cell-to-JSON decoding.
+    ///
+    /// The connection is closed instead of being returned to the pool when the
+    /// row cap was hit or the consumer stopped early: sqlx would otherwise drain
+    /// (and decode) the rest of the result set before reusing the connection.
+    pub async fn run_batched(
+        &mut self,
+        stmt: String,
+        max_rows: usize,
+        batch_size: usize,
+        on_batch: &mut (dyn FnMut(ResultBatch) -> bool + Send),
+    ) -> ResultSet {
+        let conn = match self.conn.take() {
+            Some(conn) => conn,
+            None => match ScriptSession::acquire(&self.db).await {
+                Ok(conn) => conn,
+                Err(error) => return session_error_result(stmt, error.to_string()),
+            },
+        };
+        // Every driver reports both the row-cap hit (`truncated`) and a
+        // consumer-side stop (Dart cancelled the stream), so the "close the
+        // connection" decision is made once after dispatch.
+        let (result, conn) = match conn {
+            SessionConn::MySql(conn) => {
+                let raw_pool = match &self.db.pool {
+                    Pool::MySql(pool) => pool,
+                    // Unreachable: the connection variant and the driver agree.
+                    _ => {
+                        let _ = conn.close().await;
+                        return session_error_result(
+                            stmt,
+                            "内部错误：MySQL 会话与连接池类型不一致".to_string(),
+                        );
+                    }
+                };
+                let (result, truncated, stopped, conn) =
+                    crate::drivers::mysql::exec::run_one_limited_batched_owned(
+                        conn,
+                        raw_pool,
+                        stmt,
+                        max_rows,
+                        batch_size,
+                        on_batch,
+                    )
+                    .await;
+                (
+                    result,
+                    (SessionConn::MySql(conn), truncated || stopped),
+                )
+            }
+            SessionConn::Postgres(conn) => {
+                let (result, truncated, stopped, conn) =
+                    postgres::run_one_limited_batched_owned(
+                        conn,
+                        stmt,
+                        max_rows,
+                        batch_size,
+                        on_batch,
+                    )
+                    .await;
+                (
+                    result,
+                    (SessionConn::Postgres(conn), truncated || stopped),
+                )
+            }
+            SessionConn::Sqlite(conn) => {
+                let (result, truncated, stopped, conn) =
+                    sqlite::run_one_limited_batched_owned(
+                        conn,
+                        stmt,
+                        max_rows,
+                        batch_size,
+                        on_batch,
+                    )
+                    .await;
+                (
+                    result,
+                    (SessionConn::Sqlite(conn), truncated || stopped),
+                )
+            }
+        };
+        let (conn, needs_close) = conn;
+        if needs_close {
+            match conn {
+                SessionConn::MySql(c) => {
+                    let _ = c.close().await;
+                }
+                SessionConn::Postgres(c) => {
+                    let _ = c.close().await;
+                }
+                SessionConn::Sqlite(c) => {
+                    let _ = c.close().await;
+                }
+            }
+        } else {
+            self.conn = Some(conn);
+        }
+        result
+    }
+
+
+    /// Raw-cell streaming variant of [ScriptSession::run_batched]
+    /// (optimisation layer 4).
+    ///
+    /// MySQL decodes rows straight into [crate::db::RawCell]s
+    /// (`run_one_limited_batched_raw_owned`), so the SQL-console typed/streaming
+    /// path never builds a `serde_json::Value` per cell. PostgreSQL / SQLite
+    /// have no raw decoder yet: they reuse the existing value path and convert
+    /// each batch with [RawResultBatch::from_result_batch] (same semantics, same
+    /// row cap, same close policy).
+    pub async fn run_batched_raw(
+        &mut self,
+        stmt: String,
+        max_rows: usize,
+        batch_size: usize,
+        on_batch: &mut (dyn FnMut(RawResultBatch) -> bool + Send),
+    ) -> ResultSet {
+        // Clone the pool handle (Arc) before touching `self.conn`: the raw
+        // executor needs it for the prepared-protocol fallback, and holding a
+        // borrow of `self.db` while re-assigning `self.conn` would not compile.
+        let raw_pool = match &self.db.pool {
+            Pool::MySql(pool) => pool.clone(),
+            _ => {
+                // PostgreSQL / SQLite: default value -> raw conversion.
+                let mut convert = |batch: ResultBatch| -> bool {
+                    on_batch(RawResultBatch::from_result_batch(batch))
+                };
+                return ScriptSession::run_batched(self, stmt, max_rows, batch_size, &mut convert)
+                    .await;
+            }
+        };
+        let conn = match self.conn.take() {
+            Some(conn) => conn,
+            None => match ScriptSession::acquire(&self.db).await {
+                Ok(conn) => conn,
+                Err(error) => return session_error_result(stmt, error.to_string()),
+            },
+        };
+        let conn = match conn {
+            SessionConn::MySql(conn) => conn,
+            other => {
+                // Unreachable: the connection variant agrees with the pool type.
+                // Fall back to the value path rather than failing the query.
+                self.conn = Some(other);
+                let mut convert = |batch: ResultBatch| -> bool {
+                    on_batch(RawResultBatch::from_result_batch(batch))
+                };
+                return ScriptSession::run_batched(self, stmt, max_rows, batch_size, &mut convert)
+                    .await;
+            }
+        };
+        let (result, truncated, stopped, conn) =
+            crate::drivers::mysql::exec::run_one_limited_batched_raw_owned(
+                conn,
+                &raw_pool,
+                stmt,
+                max_rows,
+                batch_size,
+                on_batch,
+            )
+            .await;
+        if truncated || stopped {
+            // Same policy as run_batched: a capped / cancelled scan closes the
+            // socket so sqlx does not drain (and decode) the rest of the result.
+            let _ = conn.close().await;
+        } else {
+            self.conn = Some(SessionConn::MySql(conn));
+        }
+        result
+    }
+
     /// Default schema of the pinned session.
     ///
     /// PostgreSQL's `SET search_path` lives on the session, so reading it from
@@ -734,6 +969,26 @@ impl crate::core::session::SessionHandle for ScriptSession {
         ScriptSession::run_limited(self, statement, max_rows).await
     }
 
+    async fn run_batched(
+        &mut self,
+        statement: String,
+        max_rows: usize,
+        batch_size: usize,
+        on_batch: &mut (dyn FnMut(ResultBatch) -> bool + Send),
+    ) -> ResultSet {
+        ScriptSession::run_batched(self, statement, max_rows, batch_size, on_batch).await
+    }
+
+    async fn run_batched_raw(
+        &mut self,
+        statement: String,
+        max_rows: usize,
+        batch_size: usize,
+        on_batch: &mut (dyn FnMut(RawResultBatch) -> bool + Send),
+    ) -> ResultSet {
+        ScriptSession::run_batched_raw(self, statement, max_rows, batch_size, on_batch).await
+    }
+
     async fn search_path(&mut self) -> String {
         ScriptSession::search_path(self).await
     }
@@ -754,6 +1009,23 @@ fn session_error_result(stmt: String, message: String) -> ResultSet {
         error: Some(message),
         truncated: false,
     }
+}
+
+/// Column metadata for one row, shared by every driver.
+///
+/// PostgreSQL / SQLite used to duplicate this closure in their
+/// `run_one_owned` / `run_one_limited_owned` / `scan_rows`; the batched
+/// streaming path needs it too, so it lives here once (MySQL keeps its
+/// driver-specific `row::columns_meta`, which also carries the row decoding
+/// helpers).
+pub(crate) fn columns_meta<R: Row>(row: &R) -> Vec<crate::db::ColumnMeta> {
+    row.columns()
+        .iter()
+        .map(|column| crate::db::ColumnMeta {
+            name: column.name().to_string(),
+            type_name: column.type_info().name().to_string(),
+        })
+        .collect()
 }
 
 pub fn bytes_json(bytes: &[u8]) -> Value {

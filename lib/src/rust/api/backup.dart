@@ -15,6 +15,13 @@ Future<Object?> listBackups() =>
     RustLib.instance.api.crateApiBackupListBackups();
 
 /// Dump a whole database (or one table) into a new backup file.
+///
+/// The dump is **streamed** into a private temp file in the backup directory
+/// (one multi-row INSERT per 500 rows via [super::export::table_sql_stream]),
+/// then committed with one atomic rename. The old implementation built each
+/// table's whole dump as a `String` — and the whole database dump as one giant
+/// `String` — which for a large table meant holding every row in memory at
+/// once (backup of a 500k-row table could add hundreds of MB of RSS).
 Future<Object?> createBackup({required Object? body}) =>
     RustLib.instance.api.crateApiBackupCreateBackup(body: body);
 
@@ -23,6 +30,14 @@ Future<Object?> readBackup({required String id}) =>
     RustLib.instance.api.crateApiBackupReadBackup(id: id);
 
 /// Execute every statement in a backup against its original database.
+///
+/// The dump runs through **one pinned connection** and consecutive DML
+/// statements are grouped into transactions (see
+/// [dbpilot_core::ops::restore_sql]): a 500k-row dump pays a handful of commits
+/// instead of one autocommit per INSERT. Failure reporting is unchanged — one
+/// entry per dump statement, the first 20 errors are returned — and a failed
+/// batch is rolled back and replayed so every other statement is still
+/// attempted.
 Future<Object?> restoreBackup({required String id}) =>
     RustLib.instance.api.crateApiBackupRestoreBackup(id: id);
 

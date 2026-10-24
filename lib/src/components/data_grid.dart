@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import '../api.dart';
 import '../app_state.dart';
+import '../row_changes.dart';
 import '../theme.dart';
 import '../widgets.dart';
 
@@ -75,6 +76,7 @@ class DataGrid extends StatefulWidget {
     this.onFilters,
     this.onDeleteSelected,
     this.onSaveCell,
+    this.onApplyEdits,
     this.exportActions,
   });
 
@@ -95,6 +97,13 @@ class DataGrid extends StatefulWidget {
   final void Function(int rowIndex, String column, Object? value, bool isNull)?
       onSaveCell;
 
+  /// Batch-edit sink: called with every staged cell edit when the user presses
+  /// "保存全部改动". Non-null switches the grid from "save each cell at once"
+  /// to "stage cells, apply them in one transaction"; returning true clears the
+  /// staged edits (the caller reloads the rows), false keeps them so the user
+  /// can retry.
+  final Future<bool> Function(List<DirtyCell> edits)? onApplyEdits;
+
   /// Optional replacement for the built-in "导出 CSV / 导出 JSON" buttons.
   ///
   /// The result tables pass a single format menu here so their export controls
@@ -109,6 +118,12 @@ class DataGrid extends StatefulWidget {
 class _DataGridState extends State<DataGrid> {
   late List<GridFilter> _filters;
   final Set<int> _selected = <int>{};
+
+  /// Staged cell edits (rowIndex -> column -> edit) while [DataGrid.onApplyEdits]
+  /// is set. These are applied together, in one transaction, by "保存全部改动".
+  final Map<int, Map<String, DirtyCell>> _dirtyCells =
+      <int, Map<String, DirtyCell>>{};
+
   final Set<String> _hidden = <String>{};
   bool _showFilters = false;
   bool _showChooser = false;
@@ -198,8 +213,17 @@ class _DataGridState extends State<DataGrid> {
     if (oldWidget.columns.length != widget.columns.length) {
       _filters = List.generate(widget.columns.length, (_) => GridFilter());
     }
-    if (oldWidget.rows != widget.rows) _selected.clear();
+    if (oldWidget.rows != widget.rows) {
+      _selected.clear();
+      // A reload / page flip replaces the rendered rows: staged edits index into
+      // the old list, so keeping them would write to the wrong row.
+      _dirtyCells.clear();
+    }
   }
+
+  List<DirtyCell> get _dirtyEdits => <DirtyCell>[
+        for (final row in _dirtyCells.values) ...row.values,
+      ];
 
   bool get _rowOps => widget.rowOps || widget.primaryKey.isNotEmpty;
   bool get _selectable => widget.selectable && _rowOps;
@@ -210,6 +234,22 @@ class _DataGridState extends State<DataGrid> {
     Future<void>.delayed(const Duration(milliseconds: 1500), () {
       if (mounted) setState(() => _flash = null);
     });
+  }
+
+  /// Send every staged cell edit to the caller's batch endpoint.
+  ///
+  /// The caller owns the transaction (Rust applies all changes atomically and
+  /// reloads the rows on success), so this only manages the local staged state.
+  Future<void> _applyDirtyEdits() async {
+    final apply = widget.onApplyEdits;
+    final edits = _dirtyEdits;
+    if (apply == null || edits.isEmpty) return;
+    final keepGoing = await apply(edits);
+    if (!mounted) return;
+    if (keepGoing) {
+      setState(_dirtyCells.clear);
+      _flashMessage('已保存 ${edits.length} 个改动');
+    }
   }
 
   /// Emit the active filters in the order the backend expects.
@@ -277,6 +317,17 @@ class _DataGridState extends State<DataGrid> {
                     ? null
                     : () => widget.onDeleteSelected?.call(_selected.toList())),
             Text('已选 ${_selected.length}', style: kSmallMuted),
+          ],
+          if (widget.onApplyEdits != null && _dirtyCells.isNotEmpty) ...[
+            Btn('保存全部改动 (${_dirtyEdits.length})',
+                key: const ValueKey('grid-apply-dirty'),
+                small: true,
+                primary: true,
+                onPressed: _applyDirtyEdits),
+            Btn('撤销改动',
+                key: const ValueKey('grid-discard-dirty'),
+                small: true,
+                onPressed: () => setState(_dirtyCells.clear)),
           ],
           const SizedBox(width: 12),
           Text('本页 ${widget.rows.length} 行', style: kSmallMuted),
@@ -926,6 +977,7 @@ class _DataGridState extends State<DataGrid> {
     final name = _columnNames[columnIndex];
     final value = columnIndex < row.length ? row[columnIndex] : null;
     final binary = isBinaryCell(value);
+    final dirty = _dirtyCells[rowIndex]?.containsKey(name) ?? false;
     Widget content;
     if (value == null) {
       content = Text('NULL',
@@ -985,6 +1037,8 @@ class _DataGridState extends State<DataGrid> {
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
         decoration: BoxDecoration(
           border: Border(left: BorderSide(color: AppColors.border)),
+          // Staged cell edits get a tint so "保存全部改动" has a visible target.
+          color: dirty ? AppColors.chipBg : null,
         ),
         child: content,
       ),
@@ -1015,7 +1069,8 @@ class _DataGridState extends State<DataGrid> {
   Future<void> _showCellDialog(int rowIndex, String column, Object? value) async {
     final controller = TextEditingController(text: displayCell(value));
     var isNull = value == null;
-    final canEdit = _editable && widget.onSaveCell != null;
+    final canEdit =
+        _editable && (widget.onSaveCell != null || widget.onApplyEdits != null);
     final result = await showAppModal<bool>(
       context: context,
       title: column,
@@ -1060,12 +1115,25 @@ class _DataGridState extends State<DataGrid> {
       ],
     );
     if (result == true && canEdit) {
-      widget.onSaveCell!(
-        rowIndex,
-        column,
-        isNull ? null : controller.text,
-        isNull,
-      );
+      if (widget.onApplyEdits != null) {
+        // Batch mode: keep the edit in the grid until "保存全部改动".
+        setState(() {
+          (_dirtyCells[rowIndex] ??= <String, DirtyCell>{})[column] = DirtyCell(
+            rowIndex: rowIndex,
+            column: column,
+            value: controller.text,
+            isNull: isNull,
+          );
+        });
+        _flashMessage('已暂存，点「保存全部改动」生效');
+      } else {
+        widget.onSaveCell!(
+          rowIndex,
+          column,
+          isNull ? null : controller.text,
+          isNull,
+        );
+      }
     }
   }
 

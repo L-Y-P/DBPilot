@@ -501,6 +501,9 @@ class BuilderDataSourcePanel extends StatefulWidget {
 }
 
 class _BuilderDataSourcePanelState extends State<BuilderDataSourcePanel> {
+  /// Height of one un-expanded table tile (also used as the list item extent).
+  static const double _tableRowHeight = 30;
+
   final TextEditingController _search = TextEditingController();
   final ScrollController _scroll = ScrollController();
   final Set<String> _expanded = <String>{};
@@ -525,14 +528,57 @@ class _BuilderDataSourcePanelState extends State<BuilderDataSourcePanel> {
   bool _active(String table) =>
       table == widget.primaryTable || widget.participating.contains(table);
 
-  List<BuilderTable> get _visibleTables {
+  /// Cached filtered table list for the current search text.
+  ///
+  /// A 5000-table schema is scanned on every keystroke; caching the result by
+  /// (tables identity, query) also keeps expand / collapse setState calls from
+  /// re-running that scan.
+  List<BuilderTable>? _filterSource;
+  String _filterQuery = '';
+  List<BuilderTable> _filteredTables = const <BuilderTable>[];
+
+  List<BuilderTable> _visibleTables() {
     final query = _search.text.trim().toLowerCase();
     if (query.isEmpty) return widget.tables;
-    return widget.tables.where((table) {
-      if (table.name.toLowerCase().contains(query)) return true;
-      return table.columns
-          .any((column) => column.name.toLowerCase().contains(query));
-    }).toList();
+    if (identical(_filterSource, widget.tables) && _filterQuery == query) {
+      return _filteredTables;
+    }
+    final matches = <BuilderTable>[];
+    for (final table in widget.tables) {
+      if (table.name.toLowerCase().contains(query) ||
+          table.columns.any(
+              (column) => column.name.toLowerCase().contains(query))) {
+        matches.add(table);
+      }
+    }
+    _filterSource = widget.tables;
+    _filterQuery = query;
+    _filteredTables = matches;
+    return matches;
+  }
+
+  /// Cached grouped-tree plan: database header strings interleaved with tables.
+  ///
+  /// The grouped counterpart of the plain index lookup. It stores references
+  /// only (no widgets), so a 5000-table schema costs a few thousand pointers
+  /// per search instead of 5000 inflated tile subtrees.
+  List<Object>? _groupPlan;
+  List<BuilderTable>? _groupPlanSource;
+
+  List<Object> _groupedRows(List<BuilderTable> tables) {
+    if (identical(_groupPlanSource, tables)) return _groupPlan!;
+    final groups = <String, List<BuilderTable>>{};
+    for (final table in tables) {
+      groups.putIfAbsent(table.database, () => <BuilderTable>[]).add(table);
+    }
+    final rows = <Object>[];
+    for (final entry in groups.entries) {
+      rows.add(entry.key);
+      rows.addAll(entry.value);
+    }
+    _groupPlan = rows;
+    _groupPlanSource = tables;
+    return rows;
   }
 
   @override
@@ -673,38 +719,42 @@ class _BuilderDataSourcePanelState extends State<BuilderDataSourcePanel> {
         text: trLiteral('该数据源没有数据表'),
       );
     }
-    final tables = _visibleTables;
+    final tables = _visibleTables();
     if (tables.isEmpty) {
       return BuilderEmptyHint(
         icon: Icons.search_off,
         text: trLiteral('没有匹配的表或字段'),
       );
     }
-    final items = <Widget>[];
-    if (widget.groupByDatabase) {
-      final groups = <String, List<BuilderTable>>{};
-      for (final table in tables) {
-        groups.putIfAbsent(table.database, () => <BuilderTable>[]).add(table);
-      }
-      for (final entry in groups.entries) {
-        items.add(_databaseHeader(entry.key));
-        for (final table in entry.value) {
-          items.add(_tableTile(table));
-        }
-      }
-    } else {
-      for (final table in tables) {
-        items.add(_tableTile(table));
-      }
-    }
+    // Build only what the viewport asks for. The old version pre-built every
+    // table tile (Material + InkWell + EllipsisText + tags) into an items list,
+    // so a 5000-table schema built 5000 widget subtrees on every search
+    // keystroke — that was the builder's freeze. The itemBuilder now builds a
+    // tile on demand; grouped mode only precomputes a lightweight header/table
+    // reference plan.
+    final grouped = widget.groupByDatabase;
+    final rows = grouped ? _groupedRows(tables) : const <Object>[];
+    final itemCount = grouped ? rows.length : tables.length;
+    // Un-grouped with nothing expanded: every tile is exactly [_tableRowHeight],
+    // so hand the list a fixed item extent. That skips per-frame row measurement
+    // and keeps a scrollbar jump / drag towards the end O(1) — without it Flutter
+    // has to materialise the intermediate rows once to learn their offsets.
+    final itemExtent = !grouped && _expanded.isEmpty ? _tableRowHeight : null;
     return Scrollbar(
       controller: _scroll,
       thumbVisibility: true,
       child: ListView.builder(
         controller: _scroll,
         padding: const EdgeInsets.only(bottom: 8),
-        itemCount: items.length,
-        itemBuilder: (context, index) => items[index],
+        itemExtent: itemExtent,
+        itemCount: itemCount,
+        itemBuilder: (context, index) {
+          if (!grouped) return _tableTile(tables[index]);
+          final row = rows[index];
+          return row is String
+              ? _databaseHeader(row)
+              : _tableTile(row as BuilderTable);
+        },
       ),
     );
   }
@@ -747,7 +797,7 @@ class _BuilderDataSourcePanelState extends State<BuilderDataSourcePanel> {
         hoverColor: AppColors.chipBg,
         onTap: widget.enabled ? () => widget.onToggleTable(key) : null,
         child: SizedBox(
-          height: 30,
+          height: _tableRowHeight,
           child: Row(
             children: [
               BuilderGlyphButton(

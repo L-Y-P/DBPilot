@@ -167,7 +167,7 @@ fn payload(filename: String, content_type: &str, content: String) -> Value {
 /// the process never holds more than one batch in memory. `max_data_rows` = 0
 /// means "every row" (file export); a positive value stops the scan early and
 /// reports truncation (preview).
-async fn table_sql_stream<W: Write + Send>(
+pub(crate) async fn table_sql_stream<W: Write + Send>(
     driver: &dyn crate::core::driver::DatabaseDriver,
     conn: &crate::core::connection::ConnectionHandle,
     ns: &str,
@@ -477,7 +477,7 @@ pub async fn import_sql(database: String, sql: String) -> anyhow::Result<Value> 
     }
     let mut current_database = database;
     let mut conn = state.connection_for(Some(&current_database)).await?;
-    let mut results: Vec<crate::db::ResultSet> = Vec::new();
+    let mut results = Vec::new();
     let mut last_use: Option<String> = None;
     // P4：按方言切分（与 SQL 控制台同一条路径）。
     let splitter = state.driver_for_active().await?;
@@ -492,18 +492,24 @@ pub async fn import_sql(database: String, sql: String) -> anyhow::Result<Value> 
                         conn = updated;
                         last_use = Some(target.clone());
                         current_database = target.clone();
-                        results.push(super::session_result(
+                        results.push(crate::query_engine::session_result(
                             &statement,
                             &format!("已切换到数据库：{}", target),
                         ));
                     }
                     Err(e) => {
-                        results.push(super::session_error_result(&statement, &e.to_string()));
+                        results.push(crate::query_engine::session_error_result(
+                            &statement,
+                            &e.to_string(),
+                        ));
                         break;
                     }
                 },
                 Err(e) => {
-                    results.push(super::session_error_result(&statement, &e.to_string()));
+                    results.push(crate::query_engine::session_error_result(
+                            &statement,
+                            &e.to_string(),
+                        ));
                     break;
                 }
             }

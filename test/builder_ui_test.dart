@@ -131,7 +131,7 @@ void main() {
 
   /// Renders a fresh BuilderView at each `content` area and returns the layout
   /// skeleton of each render. Every render must take the FIXED page layout: no
-  /// page scroller, the wide 12px padding and the wide 300px data source panel.
+  /// page scroller, the standard page padding and the wide 300px data source panel.
   Future<Map<Size, String>> skeletonsAt(
     WidgetTester tester,
     List<Size> areas,
@@ -155,8 +155,8 @@ void main() {
         300.0,
         reason: 'narrow data source panel at ' + label,
       );
-      expect(pagePadding(tester), const EdgeInsets.all(12),
-          reason: 'narrow page padding at ' + label);
+      expect(pagePadding(tester), const EdgeInsets.all(16),
+          reason: 'standard page padding at ' + label);
       expect(tester.takeException(), isNull, reason: 'exception at ' + label);
       skeletons[content] = layoutSkeleton(tester);
     }

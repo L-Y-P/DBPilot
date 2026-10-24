@@ -227,6 +227,12 @@ impl PoolRegistry {
                 match self.get(spec, None).await {
                     Ok(conn) => Ok((conn, spec.database().map(str::to_string))),
                     Err(first) => {
+                        // A refused port / bad host will fail the same way without a
+                        // default schema; retrying only doubles the wait (30s).
+                        let text = first.to_string();
+                        if text.contains("连接被拒绝") || text.contains("无法解析") {
+                            return Err(first);
+                        }
                         let mut admin = spec.clone();
                         admin.database = None;
                         match self.get(&admin, None).await {

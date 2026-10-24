@@ -13,11 +13,12 @@ use serde_json::{json, Map, Value};
 
 use crate::config::DriverKind;
 use crate::connection::ConnectionHandle;
-use crate::db::{split_statements, ResultSet};
+use crate::db::{split_statements, strip_leading_comments, ResultSet};
 use crate::driver::DatabaseDriver;
 use crate::error::{AppError, AppResult};
 use crate::paging::{page_plan, DataPage};
 use crate::spec::{fk_parts, AlterTableSpec, CreateTableSpec};
+use crate::session::SessionHandle;
 use crate::sql::{create_database_sql, safe_type};
 
 fn scalar_i64(rs: &ResultSet) -> i64 {
@@ -284,6 +285,302 @@ pub(crate) async fn run_sql<D: DatabaseDriver + ?Sized>(
     out
 }
 
+
+// ------------------------------------------------------------ backup restore
+
+/// Largest number of DML statements wrapped into one restore transaction.
+const RESTORE_BATCH_STATEMENTS: usize = 500;
+/// Largest amount of DML SQL text wrapped into one restore transaction.
+///
+/// A dump INSERT is normally one 500-row statement, so 16 MB groups dozens of
+/// them; the point is fewer commits (and therefore fewer fsyncs), not fewer
+/// round trips. Keep the group well below the server's undo-log / packet
+/// comfort zone.
+const RESTORE_BATCH_BYTES: usize = 16 * 1024 * 1024;
+/// Row cap used when a restore statement unexpectedly returns rows.
+///
+/// A dump never does, but `run_limited` needs a limit; this keeps a hand-edited
+/// dump from materialising an unbounded result set.
+const RESTORE_MAX_ROWS: usize = 1_000_000;
+
+/// Outcome of [restore_sql].
+pub struct RestoreReport {
+    /// One entry per dump statement, in dump order (same shape as [run_sql]).
+    pub results: Vec<ResultSet>,
+    /// DML batches that finished with a COMMIT (diagnostics).
+    pub transaction_batches: u64,
+    /// Statements committed inside those batches (diagnostics).
+    pub statements_in_transactions: u64,
+    /// Round trips sent to the server (diagnostics).
+    pub round_trips: u64,
+}
+
+impl RestoreReport {
+    pub fn statements(&self) -> usize {
+        self.results.len()
+    }
+
+    pub fn failed(&self) -> usize {
+        self.results.iter().filter(|r| r.error.is_some()).count()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RestoreGroup {
+    /// A statement that must run alone (DDL, session directive, ...).
+    Single(usize),
+    /// A run of DML statements that can share one transaction.
+    Batch { start: usize, end: usize },
+}
+
+/// True when a dump statement is DML and can share one transaction.
+///
+/// Everything else (DDL, `SET`, `USE`, `LOCK TABLES`, ...) is a barrier:
+///
+/// * MySQL implicitly commits the active transaction on DDL, and a
+///   `LOCK TABLES` would be released by a commit, so grouping them is wrong;
+/// * PostgreSQL / SQLite have transactional DDL, but keeping DDL outside the
+///   batching means a failed DML batch can be rolled back and replayed without
+///   touching schema changes, and the old per-statement semantics for those
+///   statements stay exactly the same.
+fn is_transactional_restore_statement(statement: &str) -> bool {
+    let first = strip_leading_comments(statement)
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    matches!(
+        first.to_ascii_uppercase().as_str(),
+        "INSERT" | "REPLACE" | "UPDATE" | "DELETE"
+    )
+}
+
+/// Partition the dump into executable units, preserving statement order.
+fn restore_groups(statements: &[String]) -> Vec<RestoreGroup> {
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while index < statements.len() {
+        if !is_transactional_restore_statement(&statements[index]) {
+            groups.push(RestoreGroup::Single(index));
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut bytes = 0usize;
+        while index < statements.len()
+            && is_transactional_restore_statement(&statements[index])
+            && index - start < RESTORE_BATCH_STATEMENTS
+            && (index == start || bytes + statements[index].len() <= RESTORE_BATCH_BYTES)
+        {
+            bytes += statements[index].len();
+            index += 1;
+        }
+        groups.push(RestoreGroup::Batch { start, end: index });
+    }
+    groups
+}
+
+/// Transaction-control SQL for one driver.
+struct RestoreTx {
+    begin: &'static str,
+    commit: &'static str,
+    rollback: &'static str,
+    /// Restores the pre-restore autocommit mode (see [restore_tx_for]).
+    reset: Option<&'static str>,
+}
+
+/// Transaction control has to match what the server's **prepared** protocol
+/// accepts, because the pinned session executes everything through
+/// `run_limited`:
+///
+/// * MySQL rejects `START TRANSACTION` / `BEGIN` in the prepared protocol
+///   (error 1295), so a batch starts with `SET autocommit = 0` and ends with
+///   `COMMIT`; autocommit is switched back so the barrier statements that
+///   follow keep the old behaviour. DDL still implicitly commits (documented
+///   in the restore report): a MySQL dump is never atomic as a whole.
+/// * PostgreSQL and SQLite accept `BEGIN` / `COMMIT` / `ROLLBACK` in their
+///   extended protocols, and their DDL is transactional, but the dump keeps DDL
+///   outside the batching anyway (see [is_transactional_restore_statement]).
+fn restore_tx_for(driver_id: &str) -> RestoreTx {
+    if driver_id == "mysql" {
+        RestoreTx {
+            begin: "SET autocommit = 0",
+            commit: "COMMIT",
+            rollback: "ROLLBACK",
+            reset: Some("SET autocommit = 1"),
+        }
+    } else {
+        RestoreTx {
+            begin: "BEGIN",
+            commit: "COMMIT",
+            rollback: "ROLLBACK",
+            reset: None,
+        }
+    }
+}
+
+fn restore_ok_result(statement: &str) -> ResultSet {
+    ResultSet {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        row_count: 0,
+        last_insert_id: 0,
+        statement: statement.to_string(),
+        kind: "affected".to_string(),
+        error: None,
+        truncated: false,
+    }
+}
+
+/// Execute one statement on the pinned session and count the round trip.
+async fn run_restore_statement(
+    session: &mut (dyn SessionHandle + Send),
+    statement: &str,
+    report: &mut RestoreReport,
+) -> ResultSet {
+    report.round_trips += 1;
+    session
+        .run_limited(statement.to_string(), RESTORE_MAX_ROWS)
+        .await
+}
+
+/// Run a whole batch one statement at a time in autocommit mode.
+///
+/// Used when transaction control itself is unavailable (the driver refused
+/// `BEGIN` / `SET autocommit = 0`) and to replay a rolled-back prefix.
+async fn run_restore_autocommit(
+    session: &mut (dyn SessionHandle + Send),
+    statements: &[String],
+    start: usize,
+    end: usize,
+    report: &mut RestoreReport,
+) {
+    for index in start..end {
+        let result = run_restore_statement(session, &statements[index], report).await;
+        report.results.push(result);
+    }
+}
+
+/// Run one DML run inside a transaction.
+///
+/// Happy path: one BEGIN, N statements, one COMMIT, so N autocommits become a
+/// single fsync. Error path keeps the old per-statement outcome exactly: the
+/// transaction is rolled back, its successful prefix is replayed in autocommit
+/// mode (so those statements stay applied, as they did before the optimisation),
+/// the failing statement is recorded, and the remaining statements run in
+/// autocommit mode so later failures are still reported individually.
+async fn run_restore_batch(
+    session: &mut (dyn SessionHandle + Send),
+    statements: &[String],
+    start: usize,
+    end: usize,
+    report: &mut RestoreReport,
+) {
+    let tx = restore_tx_for(session.driver_id());
+    let begin = run_restore_statement(session, tx.begin, report).await;
+    if begin.error.is_some() {
+        // No usable transaction control: keep the old behaviour instead of
+        // failing the restore.
+        run_restore_autocommit(session, statements, start, end, report).await;
+        return;
+    }
+    let mut failed_at: Option<(usize, String)> = None;
+    for index in start..end {
+        let result = run_restore_statement(session, &statements[index], report).await;
+        if let Some(error) = result.error {
+            failed_at = Some((index, error));
+            break;
+        }
+    }
+    match failed_at {
+        None => {
+            let commit = run_restore_statement(session, tx.commit, report).await;
+            if commit.error.is_none() {
+                for index in start..end {
+                    report
+                        .results
+                        .push(restore_ok_result(&statements[index]));
+                }
+                report.transaction_batches += 1;
+                report.statements_in_transactions += (end - start) as u64;
+                if let Some(reset) = tx.reset {
+                    let _ = run_restore_statement(session, reset, report).await;
+                }
+            } else {
+                // COMMIT itself failed: undo, then replay one by one so every
+                // statement is still attempted exactly like the old path.
+                let _ = run_restore_statement(session, tx.rollback, report).await;
+                if let Some(reset) = tx.reset {
+                    let _ = run_restore_statement(session, reset, report).await;
+                }
+                run_restore_autocommit(session, statements, start, end, report).await;
+            }
+        }
+        Some((index, error)) => {
+            let _ = run_restore_statement(session, tx.rollback, report).await;
+            if let Some(reset) = tx.reset {
+                let _ = run_restore_statement(session, reset, report).await;
+            }
+            // The rollback undid the successful prefix; replay it in
+            // autocommit mode (the old path had applied it immediately).
+            for replay in start..index {
+                let result =
+                    run_restore_statement(session, &statements[replay], report).await;
+                report.results.push(result);
+            }
+            let mut failed = restore_ok_result(&statements[index]);
+            failed.kind = "error".to_string();
+            failed.error = Some(error);
+            report.results.push(failed);
+            run_restore_autocommit(session, statements, index + 1, end, report).await;
+        }
+    }
+}
+
+/// Execute a backup dump through one pinned session (backup restore).
+///
+/// This replaces the old `driver.run_sql` loop (one prepared statement per
+/// call, autocommit) for the restore path:
+///
+/// * consecutive DML statements share one transaction, so a 500k-row dump pays
+///   a handful of commits instead of one per INSERT — that is the dominant
+///   restore cost on InnoDB;
+/// * statements are executed on the **same pinned connection**, so session
+///   state written by one dump statement (`USE`, `SET FOREIGN_KEY_CHECKS`,
+///   `SET search_path`) still applies to the next one;
+/// * failure reporting is unchanged: [RestoreReport::results] still has one
+///   entry per dump statement, and a failed batch is rolled back and replayed
+///   so every other statement is attempted exactly once.
+pub async fn restore_sql(
+    session: &mut (dyn SessionHandle + Send),
+    sql: &str,
+) -> RestoreReport {
+    let statements = split_statements(sql);
+    let mut report = RestoreReport {
+        results: Vec::with_capacity(statements.len()),
+        transaction_batches: 0,
+        statements_in_transactions: 0,
+        round_trips: 0,
+    };
+    for group in restore_groups(&statements) {
+        match group {
+            RestoreGroup::Single(index) => {
+                let result =
+                    run_restore_statement(session, &statements[index], &mut report).await;
+                report.results.push(result);
+            }
+            RestoreGroup::Batch { start, end } if end - start == 1 => {
+                let result =
+                    run_restore_statement(session, &statements[start], &mut report).await;
+                report.results.push(result);
+            }
+            RestoreGroup::Batch { start, end } => {
+                run_restore_batch(session, &statements, start, end, &mut report).await;
+            }
+        }
+    }
+    report
+}
+
 // ------------------------------------------------------------- 数据浏览/编辑
 
 pub(crate) async fn data<D: DatabaseDriver + ?Sized>(
@@ -425,16 +722,23 @@ pub(crate) async fn data<D: DatabaseDriver + ?Sized>(
     }))
 }
 
-pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
+/// Build — but do not execute — the SQL for one row-level change.
+///
+/// Shared by [change_row] and the batched apply path
+/// (`DatabaseDriver::change_row_sql` -> `api::explorer::apply_row_changes`), so
+/// both quote identifiers/literals and validate keys/values exactly the same
+/// way. Keeping it pure also lets the batched path validate every change
+/// *before* it opens a transaction, so a malformed item never leaves a
+/// half-executed transaction behind.
+pub(crate) fn change_row_sql<D: DatabaseDriver + ?Sized>(
     driver: &D,
-    conn: &ConnectionHandle,
     ns: &str,
     table: &str,
     action: &str,
     keys: &Map<String, Value>,
     values: &Map<String, Value>,
     limit_one: bool,
-) -> AppResult<Value> {
+) -> AppResult<String> {
     let dialect = driver.dialect();
     let target = dialect.qualify(ns, table);
     let wheres = keys
@@ -464,7 +768,7 @@ pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
     } else {
         (wheres.clone(), "")
     };
-    let sql = match action {
+    Ok(match action {
         "insert" => {
             if values.is_empty() {
                 return Err(AppError::bad("insert requires at least one column"));
@@ -504,8 +808,20 @@ pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
             format!("DELETE FROM {} WHERE {}{}", target, cond, tail)
         }
         other => return Err(AppError::bad(format!("unknown row action '{}'", other))),
-    };
+    })
+}
 
+pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
+    driver: &D,
+    conn: &ConnectionHandle,
+    ns: &str,
+    table: &str,
+    action: &str,
+    keys: &Map<String, Value>,
+    values: &Map<String, Value>,
+    limit_one: bool,
+) -> AppResult<Value> {
+    let sql = change_row_sql(driver, ns, table, action, keys, values, limit_one)?;
     let result = conn.run_one(sql).await;
     if let Some(err) = result.error {
         return Err(AppError::bad(err));
@@ -517,3 +833,131 @@ pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
         "last_insert_id": result.last_insert_id,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_transactional_restore_statement, restore_groups, restore_tx_for, RestoreGroup,
+        RESTORE_BATCH_BYTES, RESTORE_BATCH_STATEMENTS,
+    };
+
+    fn statements(sql_parts: &[&str]) -> Vec<String> {
+        sql_parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_dml_joins_a_restore_transaction() {
+        for dml in [
+            "INSERT INTO t VALUES (1)",
+            "  insert into t values (1)",
+            "REPLACE INTO t VALUES (1)",
+            "UPDATE t SET x = 1",
+            "DELETE FROM t",
+            "-- comment\nINSERT INTO t VALUES (1)",
+        ] {
+            assert!(
+                is_transactional_restore_statement(dml),
+                "{dml} should be transactional"
+            );
+        }
+        for barrier in [
+            "DROP TABLE IF EXISTS t",
+            "CREATE TABLE t (id INT)",
+            "ALTER TABLE t ADD COLUMN c INT",
+            "SET FOREIGN_KEY_CHECKS=0",
+            "USE db",
+            "LOCK TABLES t WRITE",
+            "BEGIN",
+            "COMMIT",
+        ] {
+            assert!(
+                !is_transactional_restore_statement(barrier),
+                "{barrier} must stay a barrier"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_groups_keep_order_and_merge_consecutive_dml() {
+        let stmts = statements(&[
+            "DROP TABLE IF EXISTS t",
+            "CREATE TABLE t (id INT)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (2)",
+            "UPDATE t SET id = 3",
+            "SET FOREIGN_KEY_CHECKS=1",
+            "DELETE FROM t",
+        ]);
+        assert_eq!(
+            restore_groups(&stmts),
+            vec![
+                RestoreGroup::Single(0),
+                RestoreGroup::Single(1),
+                RestoreGroup::Batch { start: 2, end: 5 },
+                RestoreGroup::Single(5),
+                RestoreGroup::Batch { start: 6, end: 7 },
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_groups_split_runs_on_the_statement_cap() {
+        let mut stmts = Vec::new();
+        for _ in 0..(RESTORE_BATCH_STATEMENTS + 2) {
+            stmts.push("INSERT INTO t VALUES (1)".to_string());
+        }
+        let groups = restore_groups(&stmts);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(
+            groups[0],
+            RestoreGroup::Batch {
+                start: 0,
+                end: RESTORE_BATCH_STATEMENTS
+            }
+        );
+        assert_eq!(
+            groups[1],
+            RestoreGroup::Batch {
+                start: RESTORE_BATCH_STATEMENTS,
+                end: RESTORE_BATCH_STATEMENTS + 2
+            }
+        );
+    }
+
+    #[test]
+    fn restore_groups_split_runs_on_the_byte_budget() {
+        // Two statements of a bit more than half the budget each: the second
+        // one must start a new batch instead of pushing the first past the cap.
+        let half_plus = "x".repeat(RESTORE_BATCH_BYTES / 2 + 1);
+        let big = vec![
+            format!("INSERT INTO t VALUES ('{half_plus}')"),
+            format!("INSERT INTO t VALUES ('{half_plus}')"),
+        ];
+        assert_eq!(
+            restore_groups(&big),
+            vec![
+                RestoreGroup::Batch { start: 0, end: 1 },
+                RestoreGroup::Batch { start: 1, end: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_batches_start_with_autocommit_off_because_prepared_begin_is_rejected() {
+        let mysql = restore_tx_for("mysql");
+        assert_eq!(mysql.begin, "SET autocommit = 0");
+        assert_eq!(mysql.commit, "COMMIT");
+        assert_eq!(mysql.rollback, "ROLLBACK");
+        assert_eq!(
+            mysql.reset,
+            Some("SET autocommit = 1"),
+            "barrier statements after a batch must run in the old autocommit mode"
+        );
+        let postgres = restore_tx_for("postgres");
+        assert_eq!(postgres.begin, "BEGIN");
+        assert_eq!(postgres.reset, None);
+        let sqlite = restore_tx_for("sqlite");
+        assert_eq!(sqlite.begin, "BEGIN");
+    }
+}
+

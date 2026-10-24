@@ -120,6 +120,19 @@ pub trait SqlSession: Send + Sync {
         Err(AppError::Internal("该会话不支持事务试插".to_string()))
     }
 
+    /// 在一个事务里依次执行多条语句，返回每条语句的结果。
+    ///
+    /// 全部成功才提交；任一条失败则整批回滚并返回错误（错误里带失败序号）。
+    /// 用来实现行批量保存（`api::explorer::apply_row_changes`）这类
+    /// "多行必须一起成功" 的写入。默认实现报告不支持，池化会话按驱动实现。
+    ///
+    /// 注意：事务控制由驱动用 sqlx 的 transaction API 发出，不要在这个方法里
+    /// 执行 `BEGIN`：MySQL 的 prepared-statement 协议拒绝 `BEGIN`（错误 1295），
+    /// 而 `sqlx::query("BEGIN")` 恰好走 prepared 路径。
+    async fn execute_transaction(&self, _statements: Vec<String>) -> AppResult<Vec<ResultSet>> {
+        Err(AppError::Internal("该会话不支持事务批量执行".to_string()))
+    }
+
     /// 这条会话背后的 SSH 隧道（无隧道为 None）。
     ///
     /// TOFU 固定主机密钥（N-01）需要连接后读指纹；api 通过句柄拿，不碰门面字段。
@@ -239,6 +252,14 @@ impl ConnectionHandle {
     /// 事务内试插一行并回滚（导入向导）。
     pub async fn probe_insert(&self, insert: &str, select: &str) -> AppResult<serde_json::Value> {
         self.inner.probe_insert(insert, select).await
+    }
+
+    /// 一个事务内执行多条语句（全部成功才提交，否则整批回滚）。
+    pub async fn execute_transaction(
+        &self,
+        statements: Vec<String>,
+    ) -> AppResult<Vec<ResultSet>> {
+        self.inner.execute_transaction(statements).await
     }
 
     /// 流式扫描（导出/备份）：逐行回调、不整表载入内存。

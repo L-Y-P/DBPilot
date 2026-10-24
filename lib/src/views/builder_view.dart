@@ -865,17 +865,21 @@ class _BuilderViewState extends State<BuilderView> {
         ),
     ];
     final rawRows = result['rows'];
-    final rows = rawRows is List
-        ? rawRows
-            .map((row) => row is List ? List<Object?>.from(row) : <Object?>[])
-            .toList()
-        : <List<Object?>>[];
-    if (rows.length > _previewCap) {
-      _previewRows = rows.sublist(0, _previewCap);
-      _previewTruncated = true;
-    } else {
-      _previewRows = rows;
+    final sourceRows = rawRows is List ? rawRows : const <dynamic>[];
+    // Convert only the rows the preview can ever show. The previous version
+    // copied every row of the result into a List<Object?> (a 50k-row query paid
+    // ~50k list copies plus a sublist), then dropped everything past the cap.
+    // The full result stays in [_results] for export, which re-runs the SQL and
+    // streams from the server.
+    final rowCount = sourceRows.length;
+    final limit = rowCount > _previewCap ? _previewCap : rowCount;
+    final previewRows = <List<Object?>>[];
+    for (var index = 0; index < limit; index++) {
+      final row = sourceRows[index];
+      previewRows.add(row is List ? List<Object?>.from(row) : const <Object?>[]);
     }
+    _previewRows = previewRows;
+    if (rowCount > _previewCap) _previewTruncated = true;
     if (result['truncated'] == true) _previewTruncated = true;
   }
 
@@ -1080,7 +1084,7 @@ class _BuilderViewState extends State<BuilderView> {
         // configuration card and the result preview at once, so the page
         // scrolls instead.
         final compact = constraints.maxHeight < 640;
-        final padding = constraints.maxWidth < 1000 ? 10.0 : 12.0;
+        const padding = AppMetrics.mainPadding;
         return Padding(
           padding: EdgeInsets.all(padding),
           child: compact
@@ -1088,7 +1092,7 @@ class _BuilderViewState extends State<BuilderView> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      _toolbar(constraints.maxWidth),
+                      _toolbar(),
                       NoticeBanner(widget.notice),
                       const SizedBox(height: 8),
                       SizedBox(height: 240, child: _dataSourcePanelCached()),
@@ -1102,7 +1106,7 @@ class _BuilderViewState extends State<BuilderView> {
               : Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    _toolbar(constraints.maxWidth),
+                    _toolbar(),
                     NoticeBanner(widget.notice),
                     const SizedBox(height: 8),
                     Expanded(
@@ -1143,17 +1147,11 @@ class _BuilderViewState extends State<BuilderView> {
   double _dataSourceWidth(double pageWidth) =>
       pageWidth < 1100 ? 272 : 300;
 
-  Widget _toolbar(double pageWidth) {
-    // Every action in this row is 30px tall. Mixing small text buttons (23px)
-    // with icon buttons (26px) and full-size buttons (36px) made the toolbar
-    // look ragged, so the height is pinned for all of them here.
-    const actionHeight = 30.0;
+  Widget _toolbar() {
     final actions = <Widget>[
       Btn(
         _advanced ? '编辑数据源' : '高级查询',
         key: const ValueKey('builder-advanced'),
-        small: true,
-        height: actionHeight,
         icon: Icons.hub_outlined,
         tooltip: _advanced
             ? '增加 / 移除跨库查询的数据源（不会重置当前配置）'
@@ -1165,21 +1163,16 @@ class _BuilderViewState extends State<BuilderView> {
           Icons.close,
           key: const ValueKey('builder-exit-advanced'),
           tooltip: '退出高级查询',
-          dimension: actionHeight,
-          glyphSize: 16,
           onPressed: _running ? null : _exitAdvanced,
         ),
       IconBtn(
         Icons.folder_open,
         tooltip: '打开查询模块',
-        dimension: actionHeight,
-        glyphSize: 16,
         onPressed: _openModule,
       ),
       Btn(
         '重置',
         key: const ValueKey('builder-reset'),
-        height: actionHeight,
         tooltip: '清空当前查询的全部配置',
         onPressed: _reset,
       ),
@@ -1188,107 +1181,66 @@ class _BuilderViewState extends State<BuilderView> {
         key: const ValueKey('builder-run'),
         primary: true,
         busy: _running,
-        height: actionHeight,
         icon: Icons.play_arrow,
         onPressed: _running ? null : _run,
       ),
     ];
-    final heading = <Widget>[
-      Text(
-        '查询构建器',
-        style: TextStyle(
-          fontSize: 15,
-          fontWeight: FontWeight.w600,
-          color: AppColors.header,
-        ),
-      ),
-      Text('数据源（库/模式）',
-          style: TextStyle(fontSize: 12, color: AppColors.muted)),
-      _advanced
-          ? BuilderTag(
-              pickText('跨库 · ', 'Cross-database · ') +
-                  _advancedDatabases.join(' / '),
-              tone: builderPurpleTone,
-              icon: Icons.hub_outlined,
-              maxWidth: 300,
-              tooltip: _advancedDatabases.join(', '),
-            )
-          : BuilderDrop<String>(
-              value: _database,
-              width: 190,
-              hint: '选择数据源',
-              tooltip: '当前连接下的数据库 / 模式',
-              items: [
-                for (final database in AppState.instance.databases)
-                  if (!AppState.instance
-                      .isDatabaseDenied((database['name'] ?? '').toString()))
-                    DropdownMenuItem<String>(
-                      value: (database['name'] ?? '').toString(),
-                      child: Text(
-                        // PostgreSQL's picker lists schemas ('public') while
-                        // MySQL's lists databases; showing `db.schema` makes
-                        // both engines read the same way (round 34, P3-07).
-                        dataSourceOptionLabel(
-                          (database['name'] ?? '').toString(),
-                          database: AppState.instance.activeDatabase,
-                          postgres: AppState.instance.isPostgres,
-                        ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 12),
+    final dataSource = _advanced
+        ? BuilderTag(
+            pickText('跨库 · ', 'Cross-database · ') +
+                _advancedDatabases.join(' / '),
+            tone: builderPurpleTone,
+            icon: Icons.hub_outlined,
+            maxWidth: 300,
+            tooltip: _advancedDatabases.join(', '),
+          )
+        : BuilderDrop<String>(
+            value: _database,
+            width: 190,
+            hint: '选择数据源',
+            tooltip: '当前连接下的数据库 / 模式',
+            items: [
+              for (final database in AppState.instance.databases)
+                if (!AppState.instance
+                    .isDatabaseDenied((database['name'] ?? '').toString()))
+                  DropdownMenuItem<String>(
+                    value: (database['name'] ?? '').toString(),
+                    child: Text(
+                      dataSourceOptionLabel(
+                        (database['name'] ?? '').toString(),
+                        database: AppState.instance.activeDatabase,
+                        postgres: AppState.instance.isPostgres,
                       ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12),
                     ),
-              ],
-              onChanged: (value) {
-                if (value == null || value == _database) return;
-                setState(() => _database = value);
-                _loadSchema();
-              },
-            ),
-      _statusChip(),
-    ];
-    final toolbar = Container(
-      key: const ValueKey('builder-toolbar'),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: AppColors.panel,
-        border: Border.all(color: AppColors.border),
-        borderRadius: BorderRadius.circular(AppMetrics.radiusCard),
-      ),
-      child: pageWidth < 900
-          ? Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Wrap(
-                  spacing: 10,
-                  runSpacing: 8,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: heading,
-                ),
-                const SizedBox(height: 8),
-                Wrap(spacing: 8, runSpacing: 8, children: actions),
-              ],
-            )
-          : Row(
-              children: [
-                Expanded(
-                  child: Wrap(
-                    spacing: 10,
-                    runSpacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: heading,
                   ),
-                ),
-                Wrap(spacing: 8, runSpacing: 8, children: actions),
-              ],
-            ),
-    );
+            ],
+            onChanged: (value) {
+              if (value == null || value == _database) return;
+              setState(() => _database = value);
+              _loadSchema();
+            },
+          );
     return CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.enter, control: true): _run,
         const SingleActivator(LogicalKeyboardKey.enter, meta: true): _run,
       },
-      child: toolbar,
+      child: PageHead(
+        key: const ValueKey('builder-toolbar'),
+        titleWidget: Text(
+          '查询构建器',
+          style: monoStyle(size: 20, weight: FontWeight.w600),
+        ),
+        meta: [
+          Text('数据源（库/模式）', style: kSmallMuted),
+          dataSource,
+          _statusChip(),
+        ],
+        actions: actions,
+      ),
     );
   }
 
@@ -2069,8 +2021,6 @@ class _BuilderViewState extends State<BuilderView> {
     }
     final pages = _pageCount();
     final page = _previewPage.clamp(0, pages - 1);
-    final start = page * _pageSize;
-    final pageRows = _previewRows.skip(start).take(_pageSize).toList();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -2082,7 +2032,7 @@ class _BuilderViewState extends State<BuilderView> {
               style: TextStyle(fontSize: 10, color: AppColors.warnText),
             ),
           ),
-        Expanded(child: _previewTableCached(pageRows, page)),
+        Expanded(child: _previewTableCached(page)),
       ],
     );
   }
@@ -2108,7 +2058,7 @@ class _BuilderViewState extends State<BuilderView> {
   /// state is translated, so a language switch has to rebuild it (P3-08a).
   AppLang? _previewCacheLang;
 
-  Widget _previewTableCached(List<List<Object?>> pageRows, int page) {
+  Widget _previewTableCached(int page) {
     if (!identical(_previewCacheColumns, _previewColumns) ||
         !identical(_previewCacheRows, _previewRows) ||
         _previewCacheLang != I18n.current) {
@@ -2117,7 +2067,17 @@ class _BuilderViewState extends State<BuilderView> {
       _previewCacheLang = I18n.current;
       _previewPageCache.clear();
     }
-    return _previewPageCache[page] ??= BuilderPreviewTable(
+    final cached = _previewPageCache[page];
+    if (cached != null) return cached;
+    // Slice the page only when it is actually built; on a cache hit (unrelated
+    // edit, paging back to a visited page) no row list is allocated at all.
+    final start = page * _pageSize;
+    final end = start + _pageSize;
+    final pageRows = _previewRows.sublist(
+      start,
+      end > _previewRows.length ? _previewRows.length : end,
+    );
+    return _previewPageCache[page] = BuilderPreviewTable(
       columns: _previewColumns,
       rows: pageRows,
     );

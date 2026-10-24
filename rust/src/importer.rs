@@ -15,6 +15,7 @@
 //! module owns parsing, conversion and batched INSERT generation.
 
 use std::fs::File;
+use std::fmt::Write as _;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -327,6 +328,13 @@ enum ScanItem {
     Problem(ReadProblem),
 }
 
+/// Result of the unquoted-record fast path in [RecordScanner::next_line].
+enum FastRecord {
+    Bytes(Vec<u8>),
+    Eof,
+    Fallback,
+}
+
 // ---------------------------------------------------------------- byte stream
 
 /// Buffered byte stream with absolute offset + line tracking.
@@ -459,6 +467,45 @@ impl ByteStream {
     fn position(&self) -> (u64, u64) {
         (self.abs, self.line)
     }
+
+    /// Read one more chunk into the buffer, compacting consumed bytes first.
+    /// Returns false at EOF. Same 64 KiB bound as [ByteStream::ensure].
+    fn fill_more(&mut self) -> AppResult<bool> {
+        if self.eof {
+            return Ok(false);
+        }
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        let mut chunk = [0u8; 64 * 1024];
+        let read = self
+            .file
+            .read(&mut chunk)
+            .map_err(|e| AppError::bad(format!("读取文件失败: {e}")))?;
+        if read == 0 {
+            self.eof = true;
+            return Ok(false);
+        }
+        self.buf.extend_from_slice(&chunk[..read]);
+        Ok(true)
+    }
+
+    /// Consume buffered bytes up to buffer index `end` (exclusive), keeping the
+    /// absolute offset and 1-based line in sync. Unlike [ByteStream::advance]
+    /// this is used by the fast record scanner, which can skip whole records.
+    fn consume_through(&mut self, end: usize) {
+        let end = end.min(self.buf.len());
+        let consumed = end.saturating_sub(self.pos);
+        if consumed > 0 {
+            self.line += self.buf[self.pos..end]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count() as u64;
+            self.abs += consumed as u64;
+            self.pos = end;
+        }
+    }
 }
 
 /// Byte-order mark detection. Returns (bytes to skip, encoding label).
@@ -550,79 +597,89 @@ impl RecordScanner {
                 return Ok(None);
             }
             let (start_offset, start_line) = self.stream.position();
-            let mut text: Vec<u8> = Vec::new();
-            let mut in_quote = false;
-            let mut at_field_start = true;
-            loop {
-                if self.stream.at_eof()? {
-                    if in_quote {
+            let mut text: Vec<u8> = match self.read_fast_record(&sep, quote_on, quote)? {
+                FastRecord::Bytes(bytes) => bytes,
+                FastRecord::Eof => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                FastRecord::Fallback => {
+                    let mut text: Vec<u8> = Vec::new();
+                    let mut in_quote = false;
+                    let mut at_field_start = true;
+                    loop {
+                    if self.stream.at_eof()? {
+                        if in_quote {
+                            self.done = true;
+                            return Ok(Some(ScanItem::Problem(ReadProblem {
+                                message: "引号未闭合：记录一直读到文件结尾".to_string(),
+                                offset: start_offset,
+                                line: start_line,
+                                fatal: true,
+                            })));
+                        }
+                        break;
+                    }
+                    if !in_quote && self.stream.starts_with(&sep)? {
+                        self.stream.advance(sep.len());
+                        break;
+                    }
+                    if quote_on
+                        && !in_quote
+                        && !field_sep.is_empty()
+                        && self.stream.starts_with(&field_sep)?
+                    {
+                        self.stream.advance(field_sep.len());
+                        text.extend_from_slice(&field_sep);
+                        at_field_start = true;
+                        continue;
+                    }
+                    let byte = match self.stream.next_byte()? {
+                        Some(b) => b,
+                        None => break,
+                    };
+                    if quote_on {
+                        if in_quote {
+                            if Some(byte) == quote {
+                                // Doubled quote escapes itself inside a quoted field.
+                                if Some(byte) == self.stream.peek()? {
+                                    self.stream.advance(1);
+                                    text.push(byte);
+                                    text.push(byte);
+                                } else {
+                                    in_quote = false;
+                                    text.push(byte);
+                                }
+                            } else {
+                                text.push(byte);
+                            }
+                            continue;
+                        }
+                        if Some(byte) == quote && at_field_start {
+                            in_quote = true;
+                            at_field_start = false;
+                            text.push(byte);
+                            continue;
+                        }
+                    }
+                    at_field_start = false;
+                    text.push(byte);
+                    if text.len() > self.read.max_record_bytes {
                         self.done = true;
                         return Ok(Some(ScanItem::Problem(ReadProblem {
-                            message: "引号未闭合：记录一直读到文件结尾".to_string(),
+                            message: format!(
+                                "单条记录超过上限 {} 字节，可能记录分隔符配置不正确",
+                                self.read.max_record_bytes
+                            ),
                             offset: start_offset,
                             line: start_line,
                             fatal: true,
                         })));
                     }
-                    break;
-                }
-                if !in_quote && self.stream.starts_with(&sep)? {
-                    self.stream.advance(sep.len());
-                    break;
-                }
-                if quote_on
-                    && !in_quote
-                    && !field_sep.is_empty()
-                    && self.stream.starts_with(&field_sep)?
-                {
-                    self.stream.advance(field_sep.len());
-                    text.extend_from_slice(&field_sep);
-                    at_field_start = true;
-                    continue;
-                }
-                let byte = match self.stream.next_byte()? {
-                    Some(b) => b,
-                    None => break,
-                };
-                if quote_on {
-                    if in_quote {
-                        if Some(byte) == quote {
-                            // Doubled quote escapes itself inside a quoted field.
-                            if Some(byte) == self.stream.peek()? {
-                                self.stream.advance(1);
-                                text.push(byte);
-                                text.push(byte);
-                            } else {
-                                in_quote = false;
-                                text.push(byte);
-                            }
-                        } else {
-                            text.push(byte);
-                        }
-                        continue;
                     }
-                    if Some(byte) == quote && at_field_start {
-                        in_quote = true;
-                        at_field_start = false;
-                        text.push(byte);
-                        continue;
-                    }
+                    text
                 }
-                at_field_start = false;
-                text.push(byte);
-                if text.len() > self.read.max_record_bytes {
-                    self.done = true;
-                    return Ok(Some(ScanItem::Problem(ReadProblem {
-                        message: format!(
-                            "单条记录超过上限 {} 字节，可能记录分隔符配置不正确",
-                            self.read.max_record_bytes
-                        ),
-                        offset: start_offset,
-                        line: start_line,
-                        fatal: true,
-                    })));
-                }
-            }
+            };
             // A record terminated by CRLF keeps a trailing CR when the separator
             // is a bare newline; strip it like a text editor would.
             if sep.ends_with(b"\n") && text.last() == Some(&b'\r') {
@@ -666,6 +723,70 @@ impl RecordScanner {
                 line: start_line,
                 text,
             })));
+        }
+    }
+
+    /// Fast path for the common exported-CSV shape: a single-byte record
+    /// separator, a single-byte quote character and rows whose cells are not
+    /// quoted. Scans the 64 KiB buffer for the separator instead of walking it
+    /// byte by byte through `at_eof`/`starts_with`/`next_byte` (the old inner
+    /// loop cost several function calls per input byte).
+    ///
+    /// Any record that contains the quote character falls back to the general
+    /// state machine, so quoted cells, doubled quotes and embedded newlines keep
+    /// the exact previous semantics.
+    fn read_fast_record(
+        &mut self,
+        sep: &[u8],
+        quote_on: bool,
+        quote: Option<u8>,
+    ) -> AppResult<FastRecord> {
+        if sep.len() != 1 {
+            return Ok(FastRecord::Fallback);
+        }
+        let sep_byte = sep[0];
+        let quote_byte = if quote_on {
+            match quote {
+                Some(byte) if byte != b'\n' && byte != sep_byte => Some(byte),
+                _ => return Ok(FastRecord::Fallback),
+            }
+        } else {
+            None
+        };
+        loop {
+            if self.stream.remaining() == 0 {
+                if !self.stream.fill_more()? {
+                    return Ok(FastRecord::Eof);
+                }
+            }
+            let start = self.stream.pos;
+            let buf = &self.stream.buf;
+            match buf[start..].iter().position(|&byte| byte == sep_byte) {
+                Some(relative) => {
+                    let end = start + relative;
+                    if end - start > self.read.max_record_bytes {
+                        // Let the byte-wise path report the configured size limit.
+                        return Ok(FastRecord::Fallback);
+                    }
+                    if let Some(quote_byte) = quote_byte {
+                        if buf[start..end].contains(&quote_byte) {
+                            return Ok(FastRecord::Fallback);
+                        }
+                    }
+                    let bytes = buf[start..end].to_vec();
+                    self.stream.consume_through(end + sep.len());
+                    return Ok(FastRecord::Bytes(bytes));
+                }
+                None => {
+                    if self.stream.eof || self.stream.remaining() > self.read.max_record_bytes {
+                        // Final record without a trailing separator, or a record
+                        // that exceeds the configured limit: the byte-wise path
+                        // produces the exact same bytes / diagnostics.
+                        return Ok(FastRecord::Fallback);
+                    }
+                    self.stream.fill_more()?;
+                }
+            }
         }
     }
 
@@ -904,6 +1025,22 @@ pub fn split_fields(
     }
     let quote_char = quote.chars().next();
     let escape_char = escape.chars().next();
+    // Fast path: when the quoting character does not occur in the record, the
+    // general state machine degenerates to "split on the separator, then trim".
+    // Exported CSV data takes this path; quoted/doubled-quote cells stay on the
+    // byte-at-a-time implementation below.
+    if quote_char.is_none_or(|quote| !text.contains(quote)) {
+        return Ok(text
+            .split(sep)
+            .map(|part| {
+                if trim {
+                    part.trim().to_string()
+                } else {
+                    part.to_string()
+                }
+            })
+            .collect());
+    }
     let mut fields: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
@@ -964,7 +1101,12 @@ pub fn split_fields(
 
 fn finish_field(mut field: String, trim: bool) -> String {
     if trim {
-        field = field.trim().to_string();
+        let trimmed = field.trim();
+        if trimmed.len() != field.len() {
+            // Only pay for a second allocation when whitespace is actually
+            // present (the old code always reallocated the field).
+            field = trimmed.to_string();
+        }
     }
     field
 }
@@ -1525,125 +1667,129 @@ fn mark_null_tokens(values: Vec<Value>) -> Vec<Value> {
     values.into_iter().map(mark_null_token).collect()
 }
 
-fn convert_value(raw: &Value, column: &TableColumn, mapping: &MappingSpec) -> Result<Value, String> {
+fn convert_value(raw: Value, column: &TableColumn, mapping: &MappingSpec) -> Result<Value, String> {
     if raw.is_null() {
         return Ok(Value::Null);
     }
     let kind = column.kind();
-    let mut text: Option<String> = None;
-    if let Value::String(s) = raw {
-        let mut s = s.clone();
+    if let Value::String(mut text) = raw {
         if mapping.trim_values {
-            s = s.trim().to_string();
+            let trimmed = text.trim();
+            if trimmed.len() != text.len() {
+                // Only allocate when the field actually carries whitespace.
+                text = trimmed.to_string();
+            }
         }
-        if mapping.null_tokens.iter().any(|t| t == &s) {
+        if mapping.null_tokens.iter().any(|token| token == &text) {
             return Ok(Value::Null);
         }
-        if s.is_empty() {
+        if text.is_empty() {
             // Empty is NULL for every non-text column. JSON goes here too: an
             // empty string is not a valid JSON document, so keeping it would
             // only fail later at INSERT time.
-            if mapping.empty_as_null || !matches!(kind, ColumnKind::Text) {
-                return Ok(Value::Null);
-            }
-            return Ok(Value::String(String::new()));
+            return if mapping.empty_as_null || !matches!(kind, ColumnKind::Text) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::String(String::new()))
+            };
         }
-        text = Some(s);
-    }
-    match kind {
-        ColumnKind::Int => {
-            let s = text.as_deref().unwrap_or("");
-            if !s.is_empty() {
-                let cleaned = s.replace([',', '_'], "");
-                if let Ok(v) = cleaned.parse::<i64>() {
-                    return Ok(json!(v));
+        return match kind {
+            // The common CSV case: move the parsed String into the INSERT values
+            // instead of cloning it (the old code cloned it twice: trim + match).
+            ColumnKind::Text => Ok(Value::String(text)),
+            ColumnKind::Int => {
+                let cleaned = text.replace([',', '_'], "");
+                if let Ok(value) = cleaned.parse::<i64>() {
+                    Ok(json!(value))
+                } else if let Ok(value) = cleaned.parse::<u64>() {
+                    Ok(json!(value))
+                } else {
+                    Err(format!(
+                        "列 '{}' 需要整数，但值是 '{}'",
+                        column.name,
+                        snippet(&text, 40)
+                    ))
                 }
-                if let Ok(v) = cleaned.parse::<u64>() {
-                    return Ok(json!(v));
-                }
-                return Err(format!(
-                    "列 '{}' 需要整数，但值是 '{}'",
-                    column.name,
-                    snippet(s, 40)
-                ));
             }
-            match raw {
-                Value::Number(n) if n.is_i64() || n.is_u64() => Ok(raw.clone()),
-                Value::Number(_) => Err(format!("列 '{}' 需要整数，但值是小数", column.name)),
-                Value::Bool(b) => Ok(if *b { json!(1) } else { json!(0) }),
-                _ => Err(format!("列 '{}' 需要整数", column.name)),
-            }
-        }
-        ColumnKind::Float => {
-            let s = text.as_deref().unwrap_or("");
-            if !s.is_empty() {
-                let cleaned = s.replace([',', '_'], "");
+            ColumnKind::Float => {
+                let cleaned = text.replace([',', '_'], "");
                 if cleaned.parse::<f64>().is_err() {
                     return Err(format!(
                         "列 '{}' 需要数字，但值是 '{}'",
                         column.name,
-                        snippet(s, 40)
+                        snippet(&text, 40)
                     ));
                 }
                 // Keep the original text: the database parses decimals without
                 // the precision loss of an f64 round-trip.
-                return Ok(Value::String(cleaned));
+                Ok(Value::String(cleaned))
             }
-            match raw {
-                Value::Number(_) => Ok(raw.clone()),
-                Value::Bool(b) => Ok(if *b { json!(1) } else { json!(0) }),
-                _ => Err(format!("列 '{}' 需要数字", column.name)),
+            ColumnKind::Bool => {
+                let lowered = text.to_ascii_lowercase();
+                let value = match lowered.as_str() {
+                    "1" | "t" | "true" | "y" | "yes" | "on" => Some(true),
+                    "0" | "f" | "false" | "n" | "no" | "off" => Some(false),
+                    _ => None,
+                };
+                match value {
+                    Some(value) => Ok(Value::Bool(value)),
+                    None => Err(format!(
+                        "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
+                        column.name,
+                        snippet(&lowered, 40)
+                    )),
+                }
             }
-        }
-        ColumnKind::Bool => {
-            if let Value::Bool(b) = raw {
-                return Ok(Value::Bool(*b));
-            }
-            let s = text.as_deref().unwrap_or("").to_ascii_lowercase();
-            let value = match s.as_str() {
-                "1" | "t" | "true" | "y" | "yes" | "on" => Some(true),
-                "0" | "f" | "false" | "n" | "no" | "off" => Some(false),
-                _ => None,
-            };
-            match value {
-                Some(b) => Ok(Value::Bool(b)),
-                None => Err(format!(
-                    "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
-                    column.name,
-                    snippet(s.as_str(), 40)
-                )),
-            }
-        }
-        ColumnKind::Date => match raw {
-            Value::String(s) => Ok(Value::String(s.clone())),
-            _ => Err(format!(
-                "列 '{}' 是日期时间类型，请使用文本格式（如 2024-01-02 03:04:05）",
-                column.name
-            )),
-        },
-        ColumnKind::Json => match raw {
-            Value::String(s) => {
-                if serde_json::from_str::<Value>(s).is_err() {
+            ColumnKind::Date => Ok(Value::String(text)),
+            ColumnKind::Json => {
+                if serde_json::from_str::<Value>(&text).is_err() {
                     return Err(format!(
                         "列 '{}' 是 JSON 类型，但值是 '{}'，不是合法的 JSON 文本",
                         column.name,
-                        snippet(s, 40)
+                        snippet(&text, 40)
                     ));
                 }
-                Ok(Value::String(s.clone()))
+                Ok(Value::String(text))
             }
-            Value::Object(_) | Value::Array(_) => Ok(raw.clone()),
+            ColumnKind::Binary => Err(format!(
+                "列 '{}' 是二进制/BLOB 类型，暂不支持从文本文件导入",
+                column.name
+            )),
+        };
+    }
+    // Non-string raw values only arrive from structured formats (JSON arrays /
+    // JSON lines / spreadsheets).
+    match kind {
+        ColumnKind::Int => match raw {
+            Value::Number(number) if number.is_i64() || number.is_u64() => {
+                Ok(Value::Number(number))
+            }
+            Value::Number(_) => Err(format!("列 '{}' 需要整数，但值是小数", column.name)),
+            Value::Bool(value) => Ok(if value { json!(1) } else { json!(0) }),
+            _ => Err(format!("列 '{}' 需要整数", column.name)),
+        },
+        ColumnKind::Float => match raw {
+            Value::Number(number) => Ok(Value::Number(number)),
+            Value::Bool(value) => Ok(if value { json!(1) } else { json!(0) }),
+            _ => Err(format!("列 '{}' 需要数字", column.name)),
+        },
+        ColumnKind::Bool => Err(format!(
+            "列 '{}' 需要布尔值（true/false/1/0），但值是 ''",
+            column.name
+        )),
+        ColumnKind::Date => Err(format!(
+            "列 '{}' 是日期时间类型，请使用文本格式（如 2024-01-02 03:04:05）",
+            column.name
+        )),
+        ColumnKind::Json => match raw {
+            Value::Object(_) | Value::Array(_) => Ok(raw),
             other => Ok(Value::String(other.to_string())),
         },
         ColumnKind::Binary => Err(format!(
             "列 '{}' 是二进制/BLOB 类型，暂不支持从文本文件导入",
             column.name
         )),
-        ColumnKind::Text => match raw {
-            Value::String(s) => Ok(Value::String(s.clone())),
-            Value::Null => Ok(Value::Null),
-            other => Ok(Value::String(other.to_string())),
-        },
+        ColumnKind::Text => Ok(Value::String(raw.to_string())),
     }
 }
 
@@ -1665,7 +1811,7 @@ fn map_record(
                 };
                 let column = &resolved.columns[i];
                 match map.get(key) {
-                    Some(raw) => values.push(convert_value(raw, column, mapping)?),
+                    Some(raw) => values.push(convert_value(raw.clone(), column, mapping)?),
                     None if column.nullable || column.auto_increment => {
                         values.push(Value::Null)
                     }
@@ -1710,11 +1856,202 @@ fn map_record(
                 let index = index as usize;
                 // Positions past the end of a short record are NULL (see above).
                 let raw = fields.get(index).cloned().unwrap_or(Value::Null);
-                values.push(convert_value(&raw, &resolved.columns[i], mapping)?);
+                values.push(convert_value(raw, &resolved.columns[i], mapping)?);
             }
             Ok(values)
         }
     }
+}
+
+/// Mapping sources repeated for two target columns cannot take ownership of a
+/// cell (the second column would read an empty slot), so the execute path only
+/// uses the moving conversion when every source appears once.
+fn sources_are_unique(resolved: &ResolvedMapping) -> bool {
+    for i in 0..resolved.sources.len() {
+        for j in (i + 1)..resolved.sources.len() {
+            if resolved.sources[i] == resolved.sources[j] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// [`map_record`] that consumes the parsed row.
+///
+/// The INSERT path only needs the values once, so moving the parsed strings into
+/// the converted values avoids the clone-per-cell the borrowed version needs.
+fn map_record_owned(
+    row: ParsedRow,
+    resolved: &ResolvedMapping,
+    mapping: &MappingSpec,
+) -> Result<Vec<Value>, String> {
+    match row {
+        ParsedRow::Keyed(mut map) => {
+            if !resolved.keyed {
+                return Err("文件记录是字典格式（带列名），但列映射使用的是位置序号".to_string());
+            }
+            let mut values = Vec::with_capacity(resolved.sources.len());
+            for (i, source) in resolved.sources.iter().enumerate() {
+                let Some(key) = source.as_str() else {
+                    return Err("列映射来源类型错误".to_string());
+                };
+                let column = &resolved.columns[i];
+                match map.remove(key) {
+                    Some(raw) => values.push(convert_value(raw, column, mapping)?),
+                    None if column.nullable || column.auto_increment => {
+                        values.push(Value::Null)
+                    }
+                    None => {
+                        return Err(format!(
+                            "缺少字段 '{}'（目标列 '{}' 不允许 NULL）",
+                            key, column.name
+                        ))
+                    }
+                }
+            }
+            if !mapping.ignore_unknown {
+                for key in map.keys() {
+                    if !resolved.sources.iter().any(|s| s.as_str() == Some(key)) {
+                        return Err(format!("记录多出未映射的字段 '{}'", key));
+                    }
+                }
+            }
+            Ok(values)
+        }
+        ParsedRow::Positional(mut fields) => {
+            if resolved.keyed {
+                return Err("文件记录没有列名（数组/分隔文本），但列映射使用的是列名".to_string());
+            }
+            if fields.len() > resolved.sources.len() {
+                return Err(format!(
+                    "记录有 {} 个字段，但列映射只有 {} 列（字段数多于列映射）",
+                    fields.len(),
+                    resolved.sources.len()
+                ));
+            }
+            let mut values = Vec::with_capacity(resolved.sources.len());
+            for (i, source) in resolved.sources.iter().enumerate() {
+                let Some(index) = source.as_u64() else {
+                    return Err("列映射来源类型错误".to_string());
+                };
+                let index = index as usize;
+                let raw = if index < fields.len() {
+                    std::mem::take(&mut fields[index])
+                } else {
+                    Value::Null
+                };
+                values.push(convert_value(raw, &resolved.columns[i], mapping)?);
+            }
+            Ok(values)
+        }
+    }
+}
+
+/// Move-or-clone dispatch used by the execute loop.
+fn map_parsed_owned(
+    row: ParsedRow,
+    resolved: &ResolvedMapping,
+    mapping: &MappingSpec,
+    sources_unique: bool,
+) -> Result<Vec<Value>, String> {
+    if sources_unique {
+        map_record_owned(row, resolved, mapping)
+    } else {
+        map_record(&row, resolved, mapping)
+    }
+}
+
+/// Header→position translation computed once per import.
+///
+/// A delimited file with a header and a name-based mapping used to rebuild a
+/// `Map<String, Value>` (with cloned header keys and cloned cell values) for
+/// every row, then look the mapped names up by hash. The header is constant, so
+/// the positions are computed once and the row path stays positional.
+struct HeaderPlan {
+    /// For every mapped target column: index into the positional record fields,
+    /// or `None` when the mapped source name does not occur in the header.
+    positions: Vec<Option<usize>>,
+    /// First header column that is not mapped, when `ignore_unknown = false`.
+    extra_field: Option<String>,
+    header_len: usize,
+}
+
+impl HeaderPlan {
+    fn new(header: &[String], resolved: &ResolvedMapping, mapping: &MappingSpec) -> Self {
+        let positions = resolved
+            .sources
+            .iter()
+            .map(|source| {
+                source
+                    .as_str()
+                    .and_then(|name| header.iter().position(|column| column == name))
+            })
+            .collect();
+        let extra_field = if mapping.ignore_unknown {
+            None
+        } else {
+            header
+                .iter()
+                .find(|name| {
+                    !resolved
+                        .sources
+                        .iter()
+                        .any(|source| source.as_str() == Some(name.as_str()))
+                })
+                .cloned()
+        };
+        Self {
+            positions,
+            extra_field,
+            header_len: header.len(),
+        }
+    }
+}
+
+/// Convert one positional record using the pre-computed header plan.
+fn map_header_record(
+    mut fields: Vec<Value>,
+    plan: &HeaderPlan,
+    resolved: &ResolvedMapping,
+    mapping: &MappingSpec,
+) -> Result<Vec<Value>, String> {
+    if fields.len() > plan.header_len {
+        return Err(format!(
+            "记录有 {} 个字段，表头只有 {} 列",
+            fields.len(),
+            plan.header_len
+        ));
+    }
+    let mut values = Vec::with_capacity(resolved.sources.len());
+    for (i, position) in plan.positions.iter().enumerate() {
+        let column = &resolved.columns[i];
+        match position {
+            Some(index) => {
+                let raw = if *index < fields.len() {
+                    std::mem::take(&mut fields[*index])
+                } else {
+                    Value::Null
+                };
+                values.push(convert_value(raw, column, mapping)?);
+            }
+            None => {
+                let key = resolved.sources[i].as_str().unwrap_or("");
+                if column.nullable || column.auto_increment {
+                    values.push(Value::Null);
+                } else {
+                    return Err(format!(
+                        "缺少字段 '{}'（目标列 '{}' 不允许 NULL）",
+                        key, column.name
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(name) = &plan.extra_field {
+        return Err(format!("记录多出未映射的字段 '{}'", name));
+    }
+    Ok(values)
 }
 
 /// Build the column list for INSERT from a resolved mapping.
@@ -1730,27 +2067,10 @@ pub fn build_insert_sql(
     columns: &[String],
     rows: &[Vec<Value>],
 ) -> String {
-    let target = qualify(driver, database, table);
-    let cols = columns
-        .iter()
-        .map(|c| qi(driver, c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut values = String::new();
-    for (i, row) in rows.iter().enumerate() {
-        if i > 0 {
-            values.push(',');
-        }
-        values.push('(');
-        for (j, value) in row.iter().enumerate() {
-            if j > 0 {
-                values.push(',');
-            }
-            values.push_str(&literal(driver, value));
-        }
-        values.push(')');
-    }
-    format!("INSERT INTO {target} ({cols}) VALUES {values}")
+    let mut sql = String::with_capacity(rows.len() * 48 + columns.len() * 8 + 32);
+    push_insert_header(&mut sql, driver, database, table, columns);
+    push_insert_rows(&mut sql, driver, rows.iter().map(|row| row.as_slice()));
+    sql
 }
 
 /// Full INSERT of one row, used by the probe ("试插入") dialog.
@@ -1761,8 +2081,137 @@ pub fn build_single_insert_sql(
     columns: &[String],
     values: &[Value],
 ) -> String {
-    let rows = vec![values.to_vec()];
-    build_insert_sql(driver, database, table, columns, &rows)
+    let mut sql = String::with_capacity(columns.len() * 8 + 64);
+    push_insert_header(&mut sql, driver, database, table, columns);
+    push_insert_rows(&mut sql, driver, std::iter::once(values));
+    sql
+}
+
+/// Write the shared `INSERT INTO <target> (<columns>) VALUES ` head.
+///
+/// The importer renders this once and appends every batch to it; the old code
+/// rebuilt the target/column list for every statement.
+fn push_insert_header(
+    out: &mut String,
+    driver: DriverKind,
+    database: &str,
+    table: &str,
+    columns: &[String],
+) {
+    out.push_str("INSERT INTO ");
+    out.push_str(&qualify(driver, database, table));
+    out.push_str(" (");
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&qi(driver, column));
+    }
+    out.push_str(") VALUES ");
+}
+
+/// Append `(v1,v2),(v3,v4),...` for already-converted rows.
+fn push_insert_rows<'a>(
+    out: &mut String,
+    driver: DriverKind,
+    rows: impl IntoIterator<Item = &'a [Value]>,
+) {
+    let mut first = true;
+    for row in rows {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push('(');
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_literal(out, driver, value);
+        }
+        out.push(')');
+    }
+}
+
+/// Upper bound of the SQL text [`literal`] renders for `value`.
+///
+/// Used only for the `MAX_BATCH_SQL_BYTES` cap. The old implementation called
+/// `literal()` for every cell just to measure its length — ~10 M extra String
+/// allocations for a 100 MB import. A type-based bound is enough here.
+fn estimate_literal_len(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(_) => 32,
+        // MySQL doubles backslashes as well as quotes, so `* 2 + 2` is a safe
+        // upper bound for every dialect.
+        Value::String(text) => text.len().saturating_mul(2) + 2,
+        // Binary markers / JSON objects are rare on this path.
+        other => other.to_string().len() + 2,
+    }
+}
+
+/// [`literal`] without the per-cell `String` allocation.
+///
+/// The importer renders millions of cells; `literal()` returning a fresh String
+/// per cell was a measurable part of the insert phase. Byte-for-byte identical
+/// to `dbpilot_core::sql::literal` for the shapes the importer can produce
+/// (a unit test pins the equivalence).
+fn push_literal(out: &mut String, driver: DriverKind, value: &Value) {
+    match value {
+        Value::Null => out.push_str("NULL"),
+        Value::Bool(true) => out.push_str(if matches!(driver, DriverKind::Postgres) {
+            "TRUE"
+        } else {
+            "1"
+        }),
+        Value::Bool(false) => out.push_str(if matches!(driver, DriverKind::Postgres) {
+            "FALSE"
+        } else {
+            "0"
+        }),
+        Value::Number(number) => {
+            // `write!` renders exactly like `Number::to_string()` but reuses the
+            // caller's buffer instead of allocating per cell.
+            let _ = write!(out, "{number}");
+        }
+        Value::String(text) => push_quoted(out, driver, text),
+        other => {
+            // Objects (binary markers / JSON payloads) are rare here and need
+            // the shared implementation; everything else stringifies first.
+            out.push_str(&literal(driver, other));
+        }
+    }
+}
+
+/// Quote a string literal, mirroring `dbpilot_core::sql::quote_str_for`.
+fn push_quoted(out: &mut String, driver: DriverKind, text: &str) {
+    let mysql = driver.is_mysql();
+    let needs_escape = text
+        .as_bytes()
+        .iter()
+        .any(|&byte| byte == b'\'' || (mysql && byte == b'\\'));
+    out.push('\'');
+    if !needs_escape {
+        // Nothing to double: UTF-8 can be copied verbatim.
+        out.push_str(text);
+    } else if mysql {
+        for ch in text.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("''"),
+                other => out.push(other),
+            }
+        }
+    } else {
+        for ch in text.chars() {
+            if ch == '\'' {
+                out.push('\'');
+            }
+            out.push(ch);
+        }
+    }
+    out.push('\'');
 }
 
 // ---------------------------------------------------------------- inspection
@@ -2426,6 +2875,9 @@ pub async fn execute(
     let batch_size = options.batch_size.clamp(1, MAX_BATCH_SIZE);
     let max_issues = options.max_issues.clamp(1, 1_000);
     let skip_errors = options.on_error == "skip";
+    // Two target columns may read the same source; the moving conversion cannot
+    // hand the same cell to both, so those rare mappings keep the cloning path.
+    let sources_unique = sources_are_unique(&resolved);
 
     let mut scanner = RecordScanner::open(&spec.validate.parse)?;
     let mut progress_state = Progress {
@@ -2441,15 +2893,24 @@ pub async fn execute(
     let mut batches = 0u64;
     let mut issues: Vec<Value> = Vec::new();
     let mut header: Option<Vec<String>> = None;
+    let mut header_plan: Option<HeaderPlan> = None;
     let mut header_pending =
         spec.validate.parse.fields.header && spec.validate.parse.fields.mode == "delimited";
     let mut cancelled = false;
     let mut stopped = false;
     let mut stop_message = String::new();
+    // Progress is throttled: the callback clones `Progress` and takes the job
+    // mutex, which dominated small-row imports when done per record.
+    let mut last_progress = Instant::now();
+    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
     type Row = (u64, u64, u64, Vec<Value>);
-    let mut batch: Vec<Row> = Vec::new();
+    let mut batch: Vec<Row> = Vec::with_capacity(batch_size.min(4_096));
     let mut batch_bytes: usize = 0;
+    // The target table and column list are identical for every batch, so render
+    // the INSERT head once instead of rebuilding it per statement.
+    let mut insert_prefix = String::new();
+    push_insert_header(&mut insert_prefix, driver.kind(), database, table, &columns);
 
     macro_rules! report_issue {
         ($index:expr, $line:expr, $offset:expr, $message:expr, $text:expr) => {{
@@ -2465,22 +2926,24 @@ pub async fn execute(
     macro_rules! flush_batch {
         () => {{
             if !batch.is_empty() {
-                let rows: Vec<Vec<Value>> = batch.iter().map(|r| r.3.clone()).collect();
-                let sql = build_insert_sql(driver.kind(), database, table, &columns, &rows);
-                let result = conn.run_one(sql).await;
+                // Borrow the queued rows: the old code cloned the whole batch
+                // (`batch.iter().map(|r| r.3.clone())`) just to hand a
+                // `&[Vec<Value>]` to the SQL builder.
+                let mut sql = String::with_capacity(insert_prefix.len() + batch_bytes + 16);
+                sql.push_str(&insert_prefix);
+                push_insert_rows(&mut sql, driver.kind(), batch.iter().map(|row| row.3.as_slice()));
+                // Text protocol: the SQL text is unique per batch, so a prepared
+                // statement would be a prepare+execute+close round trip each time.
+                let result = conn.run_raw(&sql).await;
                 batches += 1;
                 if let Some(error) = result.error {
                     if skip_errors {
                         // Retry one row at a time to find the exact offenders.
                         for (index, line, offset, values) in batch.iter() {
-                            let sql = build_single_insert_sql(
-                                driver.kind(),
-                                database,
-                                table,
-                                &columns,
-                                values,
-                            );
-                            let result = conn.run_one(sql).await;
+                            let mut single = String::with_capacity(insert_prefix.len() + 128);
+                            single.push_str(&insert_prefix);
+                            push_insert_rows(&mut single, driver.kind(), std::iter::once(values.as_slice()));
+                            let result = conn.run_raw(&single).await;
                             match result.error {
                                 Some(error) => {
                                     report_issue!(
@@ -2557,6 +3020,9 @@ pub async fn execute(
                     header_pending = false;
                     match header_of(&record.text, &spec.validate.parse.fields) {
                         Ok(names) => {
+                            if resolved.keyed && sources_unique {
+                                header_plan = Some(HeaderPlan::new(&names, &resolved, mapping));
+                            }
                             header = Some(names);
                             progress_state.records = records;
                             progress_state.bytes = bytes_read;
@@ -2569,11 +3035,21 @@ pub async fn execute(
                 } else {
                     parse_row(&record.text, &spec.validate.parse.fields)
                 };
-                let row: Result<Vec<Value>, String> = match parsed {
+                let converted: Result<Vec<Value>, String> = match parsed {
                     Err(message) => Err(message),
-                    Ok(row) => {
+                    Ok(ParsedRow::Positional(fields)) if header_plan.is_some() => {
+                        // Fast path: constant header + name-based mapping. Avoids
+                        // rebuilding a Map (cloned keys + cloned cells) per row.
+                        map_header_record(
+                            fields,
+                            header_plan.as_ref().expect("checked by pattern"),
+                            &resolved,
+                            mapping,
+                        )
+                    }
+                    Ok(parsed) => {
                         let row = if let Some(header) = &header {
-                            match row {
+                            match parsed {
                                 ParsedRow::Positional(values) => {
                                     if values.len() > header.len() {
                                         Err(format!(
@@ -2595,15 +3071,15 @@ pub async fn execute(
                                 keyed => Ok(keyed),
                             }
                         } else {
-                            Ok(row)
+                            Ok(parsed)
                         };
                         match row {
-                            Ok(row) => map_record(&row, &resolved, mapping),
+                            Ok(row) => map_parsed_owned(row, &resolved, mapping, sources_unique),
                             Err(message) => Err(message),
                         }
                     }
                 };
-                match row {
+                match converted {
                     Err(message) => {
                         report_issue!(
                             record.index,
@@ -2620,10 +3096,7 @@ pub async fn execute(
                     }
                     Ok(values) => {
                         data_records += 1;
-                        batch_bytes += values
-                            .iter()
-                            .map(|v| literal(driver.kind(), v).len() + 2)
-                            .sum::<usize>();
+                        batch_bytes += values.iter().map(estimate_literal_len).sum::<usize>();
                         batch.push((record.index, record.line, record.offset, values));
                         if batch.len() >= batch_size || batch_bytes >= MAX_BATCH_SQL_BYTES {
                             flush_batch!();
@@ -2635,12 +3108,15 @@ pub async fn execute(
                 }
             }
         }
-        progress_state.bytes = bytes_read;
-        progress_state.records = records;
-        progress_state.rows = rows_inserted;
-        progress_state.failed = rows_failed;
-        progress_state.refresh(started);
-        progress(&progress_state);
+        if last_progress.elapsed() >= PROGRESS_INTERVAL {
+            last_progress = Instant::now();
+            progress_state.bytes = bytes_read;
+            progress_state.records = records;
+            progress_state.rows = rows_inserted;
+            progress_state.failed = rows_failed;
+            progress_state.refresh(started);
+            progress(&progress_state);
+        }
         if stopped {
             break;
         }
@@ -3269,9 +3745,165 @@ mod tests {
     fn type_conversion_rejects_text_in_number_column() {
         let column = int_column("id");
         let mapping = MappingSpec::default();
-        assert!(convert_value(&json!("12"), &column, &mapping).is_ok());
-        assert!(convert_value(&json!("12.5"), &column, &mapping).is_err());
-        assert!(convert_value(&json!("abc"), &column, &mapping).is_err());
+        assert!(convert_value(json!("12"), &column, &mapping).is_ok());
+        assert!(convert_value(json!("12.5"), &column, &mapping).is_err());
+        assert!(convert_value(json!("abc"), &column, &mapping).is_err());
+    }
+
+    #[test]
+    fn push_literal_matches_the_shared_literal_implementation() {
+        let values = vec![
+            Value::Null,
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(-42),
+            json!(i64::MAX),
+            json!(1.5),
+            json!(""),
+            json!("plain"),
+            json!("it's"),
+            json!("back\\slash"),
+            json!("line\nbreak"),
+            json!("a, b"),
+            json!("日本語"),
+            json!({ "__binary__": "AAEC/w==", "len": 4 }),
+            json!([1, 2]),
+            json!({ "a": 1 }),
+        ];
+        for driver in [DriverKind::Mysql, DriverKind::Postgres, DriverKind::Sqlite] {
+            for value in &values {
+                let mut out = String::new();
+                push_literal(&mut out, driver, value);
+                assert_eq!(out, literal(driver, value), "{driver:?} {value}");
+                assert!(
+                    estimate_literal_len(value) >= literal(driver, value).len(),
+                    "{driver:?} {value}: estimate must be an upper bound"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_sql_builders_render_identical_statements() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let row = vec![json!(1), json!("it's")];
+        let single = build_single_insert_sql(DriverKind::Mysql, "db", "t", &columns, &row);
+        let multi = build_insert_sql(
+            DriverKind::Mysql,
+            "db",
+            "t",
+            &columns,
+            std::slice::from_ref(&row),
+        );
+        assert_eq!(single, multi);
+        let expected = format!(
+            "INSERT INTO {} ({}, {}) VALUES (1,'it''s')",
+            qualify(DriverKind::Mysql, "db", "t"),
+            qi(DriverKind::Mysql, "id"),
+            qi(DriverKind::Mysql, "name"),
+        );
+        assert_eq!(single, expected);
+        let two = build_insert_sql(
+            DriverKind::Mysql,
+            "db",
+            "t",
+            &columns,
+            &[row, vec![json!(2), Value::Null]],
+        );
+        let expected = format!(
+            "INSERT INTO {} ({}, {}) VALUES (1,'it''s'),(2,NULL)",
+            qualify(DriverKind::Mysql, "db", "t"),
+            qi(DriverKind::Mysql, "id"),
+            qi(DriverKind::Mysql, "name"),
+        );
+        assert_eq!(two, expected);
+    }
+
+    #[test]
+    fn header_plan_matches_the_map_based_conversion() {
+        let resolved = ResolvedMapping {
+            columns: vec![int_column("id"), text_column("name"), text_column("note")],
+            sources: vec![json!("id"), json!("name"), json!("note")],
+            keyed: true,
+        };
+        let mapping = MappingSpec::default();
+        let header: Vec<String> = ["id", "name", "note"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let plan = HeaderPlan::new(&header, &resolved, &mapping);
+
+        // What the old execute path did: positional row -> Map -> keyed map_record.
+        let legacy = |fields: Vec<Value>| -> Result<Vec<Value>, String> {
+            let mut map = Map::new();
+            for (index, name) in header.iter().enumerate() {
+                map.insert(
+                    name.clone(),
+                    fields.get(index).cloned().unwrap_or(Value::Null),
+                );
+            }
+            map_record(&ParsedRow::Keyed(map), &resolved, &mapping)
+        };
+        for fields in [
+            vec![json!("1"), json!("Ada"), json!("x")],
+            vec![json!("2"), json!(" Bob "), json!("")],
+            vec![json!("3")],
+        ] {
+            let expected = legacy(fields.clone());
+            let actual = map_header_record(fields.clone(), &plan, &resolved, &mapping);
+            match (&actual, &expected) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "fields {fields:?}"),
+                (Err(a), Err(b)) => assert_eq!(a, b, "fields {fields:?}"),
+                _ => panic!("fast path differs: {actual:?} vs {expected:?}"),
+            }
+        }
+
+        // An unmapped header column has to fail exactly like the map path did.
+        let mut strict = MappingSpec::default();
+        strict.ignore_unknown = false;
+        let mut wide_header = header.clone();
+        wide_header.push("extra".to_string());
+        let plan = HeaderPlan::new(&wide_header, &resolved, &strict);
+        let fields = vec![json!("1"), json!("Ada"), json!("x")];
+        let mut map = Map::new();
+        for (index, name) in wide_header.iter().enumerate() {
+            map.insert(
+                name.clone(),
+                fields.get(index).cloned().unwrap_or(Value::Null),
+            );
+        }
+        let expected = map_record(&ParsedRow::Keyed(map), &resolved, &strict).unwrap_err();
+        let actual = map_header_record(fields, &plan, &resolved, &strict).unwrap_err();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn owned_and_borrowed_mapping_produce_the_same_values() {
+        let mapping = MappingSpec::default();
+        let keyed = ResolvedMapping {
+            columns: vec![int_column("id"), text_column("name")],
+            sources: vec![json!("id"), json!("name")],
+            keyed: true,
+        };
+        let mut row = Map::new();
+        row.insert("id".to_string(), json!("7"));
+        row.insert("name".to_string(), json!("Ada"));
+        let borrowed = map_record(&ParsedRow::Keyed(row.clone()), &keyed, &mapping).unwrap();
+        let owned = map_record_owned(ParsedRow::Keyed(row), &keyed, &mapping).unwrap();
+        assert_eq!(borrowed, owned);
+
+        let positional = ResolvedMapping {
+            columns: vec![int_column("id"), text_column("name")],
+            sources: vec![json!(0), json!(1)],
+            keyed: false,
+        };
+        let fields = vec![json!("9"), json!("Bob")];
+        let borrowed =
+            map_record(&ParsedRow::Positional(fields.clone()), &positional, &mapping).unwrap();
+        let owned =
+            map_record_owned(ParsedRow::Positional(fields), &positional, &mapping).unwrap();
+        assert_eq!(borrowed, owned);
     }
 
     #[test]

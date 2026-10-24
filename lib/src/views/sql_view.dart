@@ -2,6 +2,7 @@ import 'package:flutter/material.dart' hide Text, Tooltip;
 import '../text.dart';
 
 import '../api.dart';
+import '../query_metrics.dart';
 import '../app_state.dart';
 import '../i18n.dart';
 import '../i18n_literals.dart';
@@ -35,6 +36,9 @@ class _SqlViewState extends State<SqlView> {
   /// S-08: set when the backend cut the result off at its row limit.
   bool _truncated = false;
   int? _rowLimit;
+
+  /// Query-metrics run id of the last console run (for paging telemetry).
+  int? _metricRunId;
 
   /// SQL-file execution: the Rust core streams the file and executes it
   /// statement by statement; this state polls progress and shows the summary.
@@ -97,30 +101,165 @@ class _SqlViewState extends State<SqlView> {
   Future<void> _run() async {
     if (_running || _editor.text.trim().isEmpty) return;
     final sql = _editor.text;
+    final wall = Stopwatch()..start();
+    final runId = QueryMetrics.instance.beginRun(sql: sql, source: 'console');
+    _metricRunId = runId;
+    // The console consumes the streaming API (optimisation layer 3): every
+    // event paints into the result list, so the first page shows up while the
+    // server is still reading rows instead of after the whole result set has
+    // crossed the bridge and been materialised.
     setState(() {
       _running = true;
       _error = null;
       // Drop a previous run's truncation banner immediately; the new response
       // decides whether it applies again.
       _truncated = false;
+      _results = <Json>[];
     });
     try {
-      final res = await Api.instance.query(sql, _queryDatabase);
-      if (!mounted) return;
-      setState(() {
-        _results = _asResults(res['results']);
-        _elapsed = (res['elapsed_ms'] as num?)?.toInt();
-        _statements = (res['statement_count'] as num?)?.toInt();
-        _truncated = res['truncated'] == true;
-        _rowLimit = (res['row_limit'] as num?)?.toInt() ?? _rowLimit;
-      });
-      _applySearchPath(res);
-      await _refreshAfterDdl(res);
+      await for (final event in Api.instance.queryStream(sql, _queryDatabase)) {
+        if (!mounted) return;
+        switch (event.kind) {
+          case queryEventStarted:
+            _streamStarted(event);
+          case queryEventBatch:
+            _streamBatch(event);
+          case queryEventStatementDone:
+            _streamStatementDone(event);
+          case queryEventDone:
+            await _streamDone(event);
+          case queryEventFailed:
+            setState(() => _error = event.message);
+          default:
+            break;
+        }
+      }
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
     } finally {
+      wall.stop();
+      QueryMetrics.instance.finishRun(
+        runId: runId,
+        resultRows: _rowsInResults(),
+        truncated: _truncated,
+        rustElapsedMs: _elapsed ?? 0,
+        wallMs: wall.elapsedMilliseconds,
+        statementCount: _statements ?? _results.length,
+        failed: _error != null,
+      );
       if (mounted) setState(() => _running = false);
     }
+  }
+
+  /// Rows currently rendered by the console (sum over result sets).
+  int _rowsInResults() {
+    var total = 0;
+    for (final result in _results) {
+      final rows = result['rows'];
+      if (rows is List) total += rows.length;
+    }
+    return total;
+  }
+
+  /// Empty result map for one statement; the stream events fill it in.
+  Json _emptyResult() => <String, dynamic>{
+        'statement': '',
+        'columns': <dynamic>[],
+        'rows': <dynamic>[],
+        'kind': '',
+        'row_count': 0,
+        'last_insert_id': 0,
+        'error': null,
+        'truncated': false,
+      };
+
+  /// Grow [_results] so `index` is addressable. Statement indexes are
+  /// sequential; the loop keeps a skipped index from being fatal.
+  void _ensureResultSlot(int index) {
+    while (_results.length <= index) {
+      _results.add(_emptyResult());
+    }
+  }
+
+  /// `started` event: put the statement's card on screen immediately.
+  void _streamStarted(QueryEvent event) {
+    final index = event.statementIndex.toInt();
+    setState(() {
+      _ensureResultSlot(index);
+      _results[index] = _emptyResult()
+        ..['statement'] = event.statement ?? '';
+    });
+  }
+
+  /// `batch` event: append the rows read so far (the grid only builds the
+  /// first page, so one setState per batch stays cheap even for 50k rows).
+  void _streamBatch(QueryEvent event) {
+    final index = event.statementIndex.toInt();
+    if (index >= _results.length) return;
+    setState(() {
+      final result = _results[index];
+      final rows = result['rows'] as List<dynamic>;
+      for (final row in event.rows) {
+        rows.add(<dynamic>[
+          for (final cell in row) cellValueToJson(cell),
+        ]);
+      }
+      // Column metadata only rides on the first batch of the statement.
+      if (event.columns.isNotEmpty) {
+        result['columns'] = columnsToJson(event.columns);
+      }
+      // A batch means this statement returns rows: mark the kind now so the
+      // grid paints its first page while later batches are still arriving
+      // (waiting for statement_done would defeat the progressive rendering).
+      if (event.columns.isNotEmpty || event.rows.isNotEmpty) {
+        result['kind'] = 'rows';
+      }
+      if (event.truncated) result['truncated'] = true;
+    });
+  }
+
+  /// `statement_done` event: merge the per-statement metadata. The event's
+  /// rows are empty by contract — the batches already delivered them.
+  void _streamStatementDone(QueryEvent event) {
+    final meta = event.result;
+    final index = event.statementIndex.toInt();
+    if (meta == null || index >= _results.length) return;
+    setState(() {
+      final result = _results[index];
+      result['statement'] = meta.statement;
+      result['kind'] = meta.kind;
+      result['row_count'] = meta.rowCount;
+      result['last_insert_id'] = meta.lastInsertId;
+      result['error'] = meta.error;
+      result['truncated'] = meta.truncated;
+      // A rows statement that returns zero rows emits no batch at all, so its
+      // columns only arrive here. Filling an empty header does not overwrite
+      // the columns accumulated by the batches.
+      final columns = result['columns'];
+      if (columns is List && columns.isEmpty && meta.columns.isNotEmpty) {
+        result['columns'] = columnsToJson(meta.columns);
+      }
+    });
+  }
+
+  /// `done` event: run summary, search_path, then the post-DDL tree refresh.
+  Future<void> _streamDone(QueryEvent event) async {
+    final summary = event.summary;
+    if (summary != null) {
+      setState(() {
+        _elapsed = summary.elapsedMs.toInt();
+        _statements = summary.statementCount.toInt();
+        _truncated = summary.truncated;
+        _rowLimit = summary.rowLimit.toInt();
+      });
+      // null / empty search_path is skipped by [_applySearchPath] itself.
+      _applySearchPath(<String, dynamic>{'search_path': summary.searchPath});
+    }
+    // Refresh the tree using the same result maps the grid is showing, so a
+    // successful DDL makes the new table/schema appear without a manual
+    // refresh (errors inside are ignored).
+    await _refreshAfterDdl(<String, dynamic>{'results': _results});
+    if (mounted) setState(() {});
   }
 
   /// Ask the backend to cancel the running PostgreSQL query.
@@ -674,6 +813,10 @@ class _SqlViewState extends State<SqlView> {
             notice: widget.notice,
             rowLimit: _rowLimit,
             onRefresh: _rerun,
+            onPaged: () {
+              final id = _metricRunId;
+              if (id != null) QueryMetrics.instance.markPaged(runId: id);
+            },
           ),
         ],
       ),

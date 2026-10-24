@@ -9,7 +9,7 @@ import 'dart:convert';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `has_compound_body`, `parse_sorts`, `protected_schema`
+// These functions are ignored because they are not marked as `pub`: `has_compound_body`, `parse_row_changes`, `parse_sorts`, `protected_schema`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AlterRequest`, `CreateDatabaseRequest`, `DataQuery`, `ObjectRequest`, `RowChange`
 
 /// Namespaces visible inside the active database.
@@ -147,6 +147,32 @@ Future<Object?> changeRow({
   database: database,
   table: table,
   body: body,
+);
+
+/// Apply several row changes (INSERT / UPDATE / DELETE) in **one transaction**.
+///
+/// The semantic of every item is exactly [change_row]'s: the same key/value
+/// quoting, the same `limit_one` narrowing (ctid / rowid / LIMIT 1) and the
+/// same validation — the SQL is produced by the shared
+/// `DatabaseDriver::change_row_sql`, only execution differs.
+///
+/// Every statement is validated and built **before** the transaction starts, so
+/// a bad item (unknown action, update without keys, ...) cannot leave a
+/// half-applied write behind. The batch then runs through
+/// `ConnectionHandle::execute_transaction` (one sqlx transaction, driver-issued
+/// `BEGIN`/`COMMIT`); the first server error rolls the whole batch back and
+/// the error names the failing item.
+///
+/// Returns per-item results plus the total affected rows, so the table page can
+/// show "已保存 N 行" and flag the item that contained a zero-row match.
+Future<Object?> applyRowChanges({
+  required String database,
+  required String table,
+  required Object? changes,
+}) => RustLib.instance.api.crateApiExplorerApplyRowChanges(
+  database: database,
+  table: table,
+  changes: changes,
 );
 
 /// Table metadata for the graphical query builder.

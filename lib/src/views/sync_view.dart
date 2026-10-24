@@ -7,6 +7,7 @@ import '../i18n.dart';
 import '../i18n_literals.dart';
 import '../nav.dart';
 import '../notice.dart';
+import '../paging.dart';
 import '../theme.dart';
 import '../widgets.dart';
 
@@ -395,11 +396,27 @@ class _SyncViewState extends State<SyncView> {
   int _changedCount(Json? result) =>
       (result?['changed'] as num?)?.toInt() ?? 0;
 
+  /// Cached page source for the comparison table.
+  ///
+  /// The grid only needs the 50 rows of the current page, so the 5000-map copy
+  /// must not be rebuilt on every frame: a stable list identity also lets
+  /// [SyncResultTable] keep its page across unrelated rebuilds. The cache is
+  /// invalidated only when a new comparison replaces [_result].
+  Json? _resultTablesSource;
+  List<Json> _resultTablesCache = <Json>[];
+
   List<Json> get _resultTables {
-    final tables = _result?['tables'];
-    if (tables is! List) return <Json>[];
-    return tables.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    final result = _result;
+    if (!identical(result, _resultTablesSource)) {
+      _resultTablesSource = result;
+      final tables = result?['tables'];
+      _resultTablesCache = tables is List
+          ? tables.map((e) => Map<String, dynamic>.from(e as Map)).toList()
+          : <Json>[];
+    }
+    return _resultTablesCache;
   }
+
 
   bool get _hasDatabases => AppState.instance.isSqlite
       ? _sqliteCandidates.length >= 2
@@ -506,58 +523,6 @@ class _SyncViewState extends State<SyncView> {
       _allowDrop = false;
     });
     widget.notice.clear();
-  }
-
-  String _statusLabel(Object? status) {
-    switch ((status ?? '').toString()) {
-      case 'same':
-        return t('sync_same');
-      case 'missing':
-        return t('sync_missing');
-      case 'target_only':
-        return '仅目标有';
-      default:
-        return t('sync_differs');
-    }
-  }
-
-  Widget _statementsCell(Json table) {
-    final value = table['statements'];
-    final statements =
-        value is List ? value.map((e) => e.toString()).toList() : <String>[];
-    final added = t('sync_added', {'n': table['columns_added'] ?? 0});
-    final changed = t('sync_changed', {'n': table['columns_changed'] ?? 0});
-    final dropped = t('sync_dropped', {'n': table['columns_dropped'] ?? 0});
-    final summary =
-        '$added, $changed, $dropped, +${table['indexes_added'] ?? 0} / '
-        '-${table['indexes_dropped'] ?? 0} index';
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (statements.isEmpty)
-            Text('—', style: kSmallMuted)
-          else
-            SelectableText(statements.join('\n'), style: monoStyle(size: 12)),
-          const SizedBox(height: 2),
-          Text(summary, style: kSmallMuted),
-        ],
-      ),
-    );
-  }
-
-  Widget _warningsCell(Json table) {
-    final value = table['warnings'];
-    final warnings =
-        value is List ? value.map((e) => e.toString()).toList() : <String>[];
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-      child: warnings.isEmpty
-          ? Text('—', style: kSmallMuted)
-          : Text(warnings.join('\n'), style: kSmallMuted),
-    );
   }
 
   Widget _emptyState() {
@@ -854,62 +819,221 @@ class _SyncViewState extends State<SyncView> {
               child: _resultTables.isEmpty
                   ? Padding(
                       padding: EdgeInsets.symmetric(vertical: 8),
-                      child: Text(
-                        '源库没有可比对的表（或所选表不存在）。',
-                        style: kSmallMuted,
-                      ),
+                      child: Text('源库没有可比对的表（或所选表不存在）。', style: kSmallMuted),
                     )
-                  : GridTable(
-                      emptyText: '（无）',
-                      headers: [
-                        Text(t('table_name')),
-                        Text(t('sync_status')),
-                        Text(t('sync_statements')),
-                        Text(t('sync_warnings')),
-                      ],
-                      rows: [
-                        for (final table in _resultTables)
-                          TableRow(
-                            children: [
-                              gridCell(table['name'], mono: true),
-                              Padding(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 8, vertical: 5),
-                                child: Pill(
-                                  _statusLabel(table['status']),
-                                  tone:
-                                      (table['status'] ?? '').toString() == 'same'
-                                          ? PillTone.ok
-                                          : PillTone.warn,
-                                ),
-                              ),
-                              _statementsCell(table),
-                              _warningsCell(table),
-                            ],
-                          ),
-                      ],
-                    ),
+                  : SyncResultTable(tables: _resultTables),
             ),
           if (_syncResults.isNotEmpty)
             CardBox(
               title: t('sync_run'),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  for (final row in _syncResults)
-                    AlertBox(
-                      row['error'] != null
-                          ? '${row['statement'] ?? ''} — ${row['error']}'
-                          : (row['statement'] ?? '').toString(),
-                      tone: row['error'] != null
-                          ? AlertTone.error
-                          : AlertTone.ok,
-                    ),
-                ],
-              ),
+              child: SyncRunResults(results: _syncResults),
             ),
         ],
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------- result paging
+
+/// Human label for one comparison row's status pill.
+String _syncStatusLabel(Object? status) {
+  switch ((status ?? '').toString()) {
+    case 'same':
+      return t('sync_same');
+    case 'missing':
+      return t('sync_missing');
+    case 'target_only':
+      return '仅目标有';
+    default:
+      return t('sync_differs');
+  }
+}
+
+/// Statements summary cell for one comparison row.
+Widget _syncStatementsCell(Json table) {
+  final value = table['statements'];
+  final statements = value is List
+      ? value.map((e) => e.toString()).toList()
+      : <String>[];
+  final added = t('sync_added', {'n': table['columns_added'] ?? 0});
+  final changed = t('sync_changed', {'n': table['columns_changed'] ?? 0});
+  final dropped = t('sync_dropped', {'n': table['columns_dropped'] ?? 0});
+  final summary =
+      '$added, $changed, $dropped, +${table['indexes_added'] ?? 0} / '
+      '-${table['indexes_dropped'] ?? 0} index';
+  return Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (statements.isEmpty)
+          Text('—', style: kSmallMuted)
+        else
+          SelectableText(statements.join('\n'), style: monoStyle(size: 12)),
+        const SizedBox(height: 2),
+        Text(summary, style: kSmallMuted),
+      ],
+    ),
+  );
+}
+
+/// Warnings cell for one comparison row.
+Widget _syncWarningsCell(Json table) {
+  final value = table['warnings'];
+  final warnings = value is List
+      ? value.map((e) => e.toString()).toList()
+      : <String>[];
+  return Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+    child: warnings.isEmpty
+        ? Text('—', style: kSmallMuted)
+        : Text(warnings.join('\n'), style: kSmallMuted),
+  );
+}
+
+/// Paginated structure-comparison table (one page of 50 rows at a time).
+///
+/// 5000 tables used to mean 5000 eagerly-built [TableRow]s (plus the hidden
+/// measuring pass) on every rebuild. Only the current page is handed to
+/// [GridTable] now, and [TablePager] pages through the rest with the same
+/// widget and page size (50) as the data browser and the result table.
+class SyncResultTable extends StatefulWidget {
+  const SyncResultTable({super.key, required this.tables});
+
+  /// Comparison rows: name / status / statements / warnings.
+  final List<Json> tables;
+
+  /// Same page size as [ResultTable] and the data browser.
+  static const int pageSize = 50;
+
+  @override
+  State<SyncResultTable> createState() => _SyncResultTableState();
+}
+
+class _SyncResultTableState extends State<SyncResultTable> {
+  int _page = 1;
+
+  @override
+  void didUpdateWidget(covariant SyncResultTable oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A fresh comparison replaces the list instance; keep the old page when
+    // this is just an unrelated rebuild of the same result.
+    if (!identical(oldWidget.tables, widget.tables)) {
+      _page = 1;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final total = widget.tables.length;
+    final page = clampPage(_page, total, SyncResultTable.pageSize);
+    final rows = pageSlice(widget.tables, page, SyncResultTable.pageSize);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        GridTable(
+          emptyText: '（无）',
+          headers: [
+            Text(t('table_name')),
+            Text(t('sync_status')),
+            Text(t('sync_statements')),
+            Text(t('sync_warnings')),
+          ],
+          rows: [
+            for (final table in rows)
+              TableRow(
+                children: [
+                  gridCell(table['name'], mono: true),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 5,
+                    ),
+                    child: Pill(
+                      _syncStatusLabel(table['status']),
+                      tone: (table['status'] ?? '').toString() == 'same'
+                          ? PillTone.ok
+                          : PillTone.warn,
+                    ),
+                  ),
+                  _syncStatementsCell(table),
+                  _syncWarningsCell(table),
+                ],
+              ),
+          ],
+        ),
+        if (total > 0)
+          TablePager(
+            page: page,
+            pages: pageCountFor(total, SyncResultTable.pageSize),
+            total: total,
+            visible: rows.length,
+            keyPrefix: 'sync-tables-pager',
+            unit: '张表',
+            onPage: (next) => setState(() => _page = next),
+          ),
+      ],
+    );
+  }
+}
+
+/// Paginated execution log of a structure sync.
+///
+/// A sync of a large schema can execute thousands of DDL statements; one
+/// [AlertBox] per statement blocked the frame after "执行同步". The log now
+/// shows 50 results per page with the same [TablePager].
+class SyncRunResults extends StatefulWidget {
+  const SyncRunResults({super.key, required this.results});
+
+  /// One entry per executed statement: statement + optional error.
+  final List<Json> results;
+
+  /// Same page size as the comparison table.
+  static const int pageSize = 50;
+
+  @override
+  State<SyncRunResults> createState() => _SyncRunResultsState();
+}
+
+class _SyncRunResultsState extends State<SyncRunResults> {
+  int _page = 1;
+
+  @override
+  void didUpdateWidget(covariant SyncRunResults oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.results, widget.results)) {
+      _page = 1;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final total = widget.results.length;
+    final page = clampPage(_page, total, SyncRunResults.pageSize);
+    final rows = pageSlice(widget.results, page, SyncRunResults.pageSize);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final row in rows)
+          AlertBox(
+            row['error'] != null
+                ? '${row['statement'] ?? ''} — ${row['error']}'
+                : (row['statement'] ?? '').toString(),
+            tone: row['error'] != null ? AlertTone.error : AlertTone.ok,
+          ),
+        if (total > 0)
+          TablePager(
+            page: page,
+            pages: pageCountFor(total, SyncRunResults.pageSize),
+            total: total,
+            visible: rows.length,
+            keyPrefix: 'sync-run-pager',
+            unit: '条',
+            onPage: (next) => setState(() => _page = next),
+          ),
+      ],
     );
   }
 }

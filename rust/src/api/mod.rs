@@ -19,6 +19,8 @@ pub mod explorer;
 pub mod export;
 pub mod files;
 pub mod query;
+pub mod query_types;
+pub mod raw_buffer;
 pub mod server;
 pub mod sqlite;
 pub mod sync;
@@ -29,7 +31,6 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{json, Value};
 
 use crate::config::DesktopConfig;
-use crate::db::{ColumnMeta, ResultSet};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -146,38 +147,6 @@ pub(crate) async fn switch_database_for_use(state: &AppState, name: &str) -> App
     driver.ping(&handle).await?;
     state.set_active_database(Some(name.to_string())).await;
     Ok(())
-}
-
-/// Result entry for a handled session directive (USE), shown in the console.
-pub(crate) fn session_result(statement: &str, message: &str) -> ResultSet {
-    ResultSet {
-        columns: vec![ColumnMeta {
-            name: "结果".to_string(),
-            type_name: "TEXT".to_string(),
-        }],
-        rows: vec![vec![serde_json::json!(message)]],
-        row_count: 1,
-        last_insert_id: 0,
-        statement: statement.to_string(),
-        kind: "rows".to_string(),
-        error: None,
-        truncated: false,
-    }
-}
-
-/// Result entry for a failed USE directive, so a whole batch is not thrown away
-/// just because the switching statement was invalid.
-pub(crate) fn session_error_result(statement: &str, message: &str) -> ResultSet {
-    ResultSet {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        row_count: 0,
-        last_insert_id: 0,
-        statement: statement.to_string(),
-        kind: "error".to_string(),
-        error: Some(message.to_string()),
-        truncated: false,
-    }
 }
 
 /// Initialize the Rust core. `data_dir` comes from Dart's `path_provider`

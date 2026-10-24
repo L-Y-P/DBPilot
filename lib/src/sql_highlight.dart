@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'theme.dart';
@@ -46,6 +48,36 @@ class SqlHighlightingController extends TextEditingController {
   /// Text longer than this is rendered in a single plain span.
   static const int maxHighlightChars = 120 * 1024;
 
+  /// Short SQL is tokenised synchronously (tests, small snippets); larger text
+  /// is highlighted after a pause so a keystroke never pays the full 20–60 ms
+  /// tokenizer cost on the frame.
+  static const int syncHighlightChars = 8 * 1024;
+  static const Duration debounce = Duration(milliseconds: 120);
+
+  String? _cachedText;
+  List<SqlToken>? _cachedTokens;
+  Timer? _timer;
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  /// Test hook: tokenise the current text now instead of waiting for the
+  /// debounce timer.
+  void flushHighlight() {
+    _timer?.cancel();
+    final text = value.text;
+    if (text.length > maxHighlightChars) {
+      _cachedText = text;
+      _cachedTokens = null;
+    } else {
+      _cachedText = text;
+      _cachedTokens = sqlTokenize(text);
+    }
+  }
+
   @override
   TextSpan buildTextSpan({
     required BuildContext context,
@@ -64,11 +96,38 @@ class SqlHighlightingController extends TextEditingController {
     final base = style ?? kBody;
     final text = value.text;
     if (text.length > maxHighlightChars) {
+      _timer?.cancel();
+      _cachedText = text;
+      _cachedTokens = null;
       return TextSpan(text: text, style: base);
     }
-    final tokens = sqlTokenize(text);
+    if (text == _cachedText && _cachedTokens != null) {
+      return _span(base, _cachedTokens!);
+    }
+    if (text.length <= syncHighlightChars) {
+      _timer?.cancel();
+      final tokens = sqlTokenize(text);
+      _cachedText = text;
+      _cachedTokens = tokens;
+      return _span(base, tokens);
+    }
+    _schedule(text);
+    return TextSpan(text: text, style: base);
+  }
+
+  void _schedule(String text) {
+    _timer?.cancel();
+    _timer = Timer(debounce, () {
+      if (value.text != text) return;
+      _cachedText = text;
+      _cachedTokens = sqlTokenize(text);
+      notifyListeners();
+    });
+  }
+
+  TextSpan _span(TextStyle base, List<SqlToken> tokens) {
     if (tokens.length == 1 && tokens.first.kind == SqlTokenKind.plain) {
-      return TextSpan(text: text, style: base);
+      return TextSpan(text: tokens.first.text, style: base);
     }
     return TextSpan(style: base, children: [
       for (final token in tokens)

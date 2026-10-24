@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart';
 
+import 'query_metrics.dart';
 import 'rust/api.dart' as rapi;
 import 'rust/api/backup.dart' as rbackup;
 import 'rust/api/connections.dart' as rconn;
@@ -11,9 +12,12 @@ import 'rust/api/explorer.dart' as rexplorer;
 import 'rust/api/export.dart' as rexport;
 import 'rust/api/files.dart' as rfiles;
 import 'rust/api/query.dart' as rquery;
+import 'rust/api/query_types.dart';
 import 'rust/api/server.dart' as rserver;
 import 'rust/api/sqlite.dart' as rsqlite;
 import 'rust/api/sync.dart' as rsync;
+
+export 'rust/api/query_types.dart' show QueryEvent;
 
 /// Thrown for every failed bridge call. The message is the user-facing text the
 /// Rust side produced, which is exactly what the web API used to put in the
@@ -300,6 +304,16 @@ class Api {
       _asMap(await _guard(
           () => rexplorer.changeRow(database: db, table: table, body: body)));
 
+  /// Apply several row changes in **one transaction** ("保存全部改动").
+  ///
+  /// [changes] is the array built by `buildRowChanges` (one UPDATE per touched
+  /// row). The Rust side validates every statement before it opens the
+  /// transaction, and any server error rolls the whole batch back.
+  Future<Json> applyRowChanges(
+          String db, String table, List<Map<String, dynamic>> changes) async =>
+      _asMap(await _guard(() => rexplorer.applyRowChanges(
+          database: db, table: table, changes: changes)));
+
   Future<Json> builderSchema(String db) async =>
       _asMap(await _guard(() => rexplorer.builderSchema(database: db)));
 
@@ -333,10 +347,63 @@ class Api {
 
   // -------------------------------------------------------------------- query
 
-  Future<Json> query(String sql, [String? database]) async =>
-      _asMap(await _guard(() => rquery.runQuery(
-            body: {'sql': sql, 'database': database},
-          )));
+  /// Run a SQL script (one or many statements) and return the legacy payload.
+  ///
+  /// Consumes [queryStream] and folds the events back into the flat Map shape
+  /// every view consumes ([aggregateQueryEvents] wraps the same aggregator):
+  /// rows are converted batch by batch while the driver is still reading them,
+  /// so the whole result set never exists as one `QueryResponseDto` on the
+  /// bridge. On the live-MySQL benchmark this measured 1.4–1.9× faster than
+  /// the typed round trip (LIMIT 50000: 169 ms → 116 ms).
+  Future<Json> query(String sql, [String? database]) async {
+    final wall = Stopwatch()..start();
+    final runId = QueryMetrics.instance.beginRun(sql: sql, source: 'api');
+    try {
+      final payload = _asMap(
+        await _guard(() async {
+          final aggregator = _QueryEventAggregator();
+          final stream =
+              rquery.runQueryStream(body: {'sql': sql, 'database': database});
+          await for (final event in stream) {
+            aggregator.add(event);
+          }
+          return aggregator.finish();
+        }),
+      );
+      wall.stop();
+      QueryMetrics.instance.finishRun(
+        runId: runId,
+        resultRows: resultRowsOf(payload),
+        truncated: payload['truncated'] == true,
+        rustElapsedMs: (payload['elapsed_ms'] as num?)?.toInt() ?? 0,
+        wallMs: wall.elapsedMilliseconds,
+        statementCount: (payload['statement_count'] as num?)?.toInt() ?? 0,
+      );
+      return payload;
+    } catch (error) {
+      wall.stop();
+      QueryMetrics.instance.finishRun(
+        runId: runId,
+        resultRows: 0,
+        truncated: false,
+        rustElapsedMs: 0,
+        wallMs: wall.elapsedMilliseconds,
+        statementCount: 0,
+        failed: true,
+      );
+      rethrow;
+    }
+  }
+
+  /// Streaming variant of [query] for the SQL console (optimisation layer 3).
+  ///
+  /// Emits a `started` event per statement, zero or more `batch` events while
+  /// the driver is still reading rows, one `statement_done` per statement and
+  /// a final `done` with the run summary. A top-level failure arrives as a
+  /// `failed` event (not a thrown exception), so the console can keep whatever
+  /// it already painted.
+  Stream<QueryEvent> queryStream(String sql, [String? database]) =>
+      rquery.runQueryStream(body: {'sql': sql, 'database': database});
 
   Future<Json> explain(String sql, [String? database]) async =>
       _asMap(await _guard(() => rquery.explain(
@@ -561,4 +628,232 @@ String formatBytes(num? bytes) {
 /// Debug helper used by the startup self-check.
 void logApiError(Object error) {
   debugPrint('[rust-myadmin] $error');
+}
+
+// ------------------------------------------------------- query result adapter
+
+// The generated Dart bindings do not emit the Rust `CELL_KIND_*` /
+// `EVENT_KIND_*` constants, so the numeric tags are pinned here.
+//
+// `CellValue.kind`: 0=null, 1=bool, 2=int, 3=float, 4=text, 5=bytes.
+const int cellKindNull = 0;
+const int cellKindBool = 1;
+const int cellKindInt = 2;
+const int cellKindFloat = 3;
+const int cellKindText = 4;
+const int cellKindBytes = 5;
+
+// `QueryEvent.kind`: 0=started, 1=batch, 2=statement_done, 3=done, 4=failed.
+const int queryEventStarted = 0;
+const int queryEventBatch = 1;
+const int queryEventStatementDone = 2;
+const int queryEventDone = 3;
+const int queryEventFailed = 4;
+
+/// Type-safe dispatch over [CellValue.kind].
+///
+/// The kind codes are a hand-written convention (FRB does not generate the
+/// Rust `CELL_KIND_*` constants), so a missed case must fail loudly instead of
+/// silently falling through. `tools/check_api_surface.py` keeps the Rust/Dart
+/// constant tables in sync; this extension keeps every switch exhaustive.
+extension CellValueX on CellValue {
+  T when<T>({
+    required T Function() null_,
+    required T Function(bool value) bool_,
+    required T Function(int value) int_,
+    required T Function(double value) float_,
+    required T Function(String value) text_,
+    required T Function(Uint8List value) bytes_,
+  }) {
+    switch (kind) {
+      case cellKindNull:
+        return null_();
+      case cellKindBool:
+        return bool_(boolValue!);
+      case cellKindInt:
+        return int_(intValue!);
+      case cellKindFloat:
+        return float_(floatValue!);
+      case cellKindText:
+        return text_(textValue!);
+      case cellKindBytes:
+        return bytes_(bytesValue!);
+      default:
+        throw StateError(
+            'unknown CellValue.kind $kind (Rust/Dart kind tables out of sync?)');
+    }
+  }
+}
+
+/// Convert one typed cell back to the legacy JSON cell shape.
+///
+/// Shared by [aggregateQueryEvents] (which rebuilds the legacy Map payload the
+/// non-console views consume) and the SQL console's streaming renderer, so both
+/// paths decode a cell exactly the same way. Binary cells keep the old
+/// `{"__binary__": base64, "len": n}` marker object [displayCell] and
+/// [isBinaryCell] understand.
+Object? cellValueToJson(CellValue cell) => cell.when<Object?>(
+      null_: () => null,
+      bool_: (value) => value,
+      int_: (value) => value,
+      float_: (value) => value,
+      text_: (value) => value,
+      bytes_: (value) => <String, dynamic>{
+        '__binary__': base64Encode(value),
+        'len': value.length,
+      },
+    );
+/// The legacy `columns` list shape ([{name, type_name}, ...]).
+List<Json> columnsToJson(List<ColumnDto> columns) => List<Json>.generate(
+      columns.length,
+      (index) => <String, dynamic>{
+        'name': columns[index].name,
+        'type_name': columns[index].typeName,
+      },
+      growable: false,
+    );
+
+/// Folds streaming console events back into the legacy flat JSON payload that
+/// `run_query` returns.
+///
+/// Optimisation layer 3 moved the console to [Api.queryStream]; [Api.query]
+/// feeds the same events through this aggregator instead of asking Rust for a
+/// whole `QueryResponseDto` at once. Streaming keeps the peak at one batch of
+/// `CellValue` objects on both sides of the bridge, while the Map contract
+/// every non-console view consumes stays field-for-field identical:
+/// `results[].{columns,rows,row_count,last_insert_id,statement,kind,error,
+/// truncated}` plus the flattened summary (`statement_count`, `failed`,
+/// `elapsed_ms`, `driver`, `search_path`, `database`, `use_database`,
+/// `truncated`, `row_limit`).
+class _QueryEventAggregator {
+  final List<Json> _results = <Json>[];
+  QuerySummaryDto? _summary;
+
+  /// Empty result map for one statement; the stream events fill it in.
+  static Json _emptyResult() => <String, dynamic>{
+        'statement': '',
+        'columns': <dynamic>[],
+        'rows': <dynamic>[],
+        'kind': '',
+        'row_count': 0,
+        'last_insert_id': 0,
+        'error': null,
+        'truncated': false,
+      };
+
+  /// Grow [_results] so `index` is addressable. Statement indexes are
+  /// sequential; the loop keeps a skipped index from being fatal.
+  void _ensureResultSlot(int index) {
+    while (_results.length <= index) {
+      _results.add(_emptyResult());
+    }
+  }
+
+  void add(QueryEvent event) {
+    switch (event.kind) {
+      case queryEventStarted:
+        {
+          final index = event.statementIndex.toInt();
+          _ensureResultSlot(index);
+          _results[index] = _emptyResult()
+            ..['statement'] = event.statement ?? '';
+        }
+      case queryEventBatch:
+        {
+          final index = event.statementIndex.toInt();
+          _ensureResultSlot(index);
+          final result = _results[index];
+          final rows = result['rows'] as List<dynamic>;
+          for (final row in event.rows) {
+            rows.add(<dynamic>[
+              for (final cell in row) cellValueToJson(cell),
+            ]);
+          }
+          // Column metadata only rides on the first batch of the statement.
+          if (event.columns.isNotEmpty) {
+            result['columns'] = columnsToJson(event.columns);
+          }
+          // A batch means this statement returns rows: mark the kind now so a
+          // console rendering the payload can paint before statement_done.
+          if (event.columns.isNotEmpty || event.rows.isNotEmpty) {
+            result['kind'] = 'rows';
+          }
+          if (event.truncated) result['truncated'] = true;
+        }
+      case queryEventStatementDone:
+        {
+          final meta = event.result;
+          if (meta == null) return;
+          final index = event.statementIndex.toInt();
+          _ensureResultSlot(index);
+          final result = _results[index];
+          result['statement'] = meta.statement;
+          result['kind'] = meta.kind;
+          result['row_count'] = meta.rowCount;
+          result['last_insert_id'] = meta.lastInsertId;
+          result['error'] = meta.error;
+          result['truncated'] = meta.truncated;
+          // A rows statement that returned zero rows emits no batch at all, so
+          // its columns only arrive here.
+          final columns = result['columns'];
+          if (columns is List && columns.isEmpty && meta.columns.isNotEmpty) {
+            result['columns'] = columnsToJson(meta.columns);
+          }
+        }
+      case queryEventDone:
+        _summary = event.summary;
+      case queryEventFailed:
+        // Same contract as the old `run_query`: a top-level failure threw
+        // (an [ApiException] via [_guard]) rather than returning a payload.
+        throw ApiException(_cleanMessage(event.message ?? ''));
+      default:
+        break;
+    }
+  }
+
+  Json finish() {
+    final summary = _summary;
+    final results = List<Json>.of(_results, growable: false);
+    return <String, dynamic>{
+      'results': results,
+      'statement_count': summary?.statementCount ?? results.length,
+      'failed': summary?.failed ?? 0,
+      'elapsed_ms': summary?.elapsedMs ?? 0,
+      'driver': summary?.driver ?? '',
+      'search_path': summary?.searchPath,
+      'database': summary?.database,
+      'use_database': summary?.useDatabase,
+      'truncated': summary?.truncated ?? false,
+      'row_limit': summary?.rowLimit ?? 0,
+    };
+  }
+}
+
+/// Fold a completed [Api.queryStream] event sequence into the legacy flat JSON
+/// payload.
+///
+/// Pure (no FFI, no database), which is what lets the adapter be unit tested;
+/// [Api.query] drives the same aggregator incrementally while the stream is
+/// still arriving, so events are never all retained at once.
+@visibleForTesting
+Json aggregateQueryEvents(Iterable<QueryEvent> events) {
+  final aggregator = _QueryEventAggregator();
+  for (final event in events) {
+    aggregator.add(event);
+  }
+  return aggregator.finish();
+}
+/// Rows actually materialised into the payload (the UI's paging source).
+@visibleForTesting
+int resultRowsOf(Json payload) {
+  final results = payload['results'];
+  if (results is! List) return 0;
+  var total = 0;
+  for (final result in results) {
+    if (result is Map) {
+      final rows = result['rows'];
+      if (rows is List) total += rows.length;
+    }
+  }
+  return total;
 }

@@ -170,4 +170,21 @@ void main() {
       expect(tester.takeException(), isNull);
     });
   });
+
+  testWidgets('table SQL tab exposes the cancel button', (tester) async {
+    await tester.pumpWidget(host(TableView(
+      db: 'main',
+      table: 'count_rows',
+      notice: Notice(),
+    )));
+    await settle(tester);
+    await tester.tap(find.text('SQL').first);
+    await settle(tester);
+    final cancel = find.byKey(const ValueKey('table-sql-cancel'));
+    expect(cancel, findsOneWidget);
+    // Idle: the button is disabled (no in-flight query), so tapping is a no-op
+    // rather than an error.
+    await tester.tap(cancel);
+    await settle(tester);
+  });
 }

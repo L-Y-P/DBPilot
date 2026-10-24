@@ -70,6 +70,24 @@ fn safe_file_component(raw: &str) -> String {
     trimmed
 }
 
+/// Stable identity of one new backup: its id and its on-disk file name.
+///
+/// The name becomes a real file on disk, so it has to be legal on every
+/// platform: `/`, `\\` and spaces are already replaced by `safe_file_component`,
+/// and the rest of the Windows-invalid set (`:` `*` `?` `"` `<` `>` `|`,
+/// control characters) plus the reserved device names (CON, PRN, AUX, NUL,
+/// COM1-9, LPT1-9) would otherwise make the backup write fail there.
+fn backup_identity(driver: &str, database: &str, table: Option<&str>) -> (String, String) {
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let id = format!("bk-{}", Uuid::new_v4().simple());
+    let safe_db = safe_file_component(database);
+    let file_name = match table {
+        Some(t) => format!("{}-{}-{}-{}.sql", stamp, driver, safe_db, safe_file_component(t)),
+        None => format!("{}-{}-{}.sql", stamp, driver, safe_db),
+    };
+    (id, file_name)
+}
+
 /// Read and parse one `index.json`; anything unreadable means "no backups".
 fn read_index(dir: &std::path::Path) -> Vec<BackupMeta> {
     std::fs::read_to_string(dir.join("index.json"))
@@ -138,18 +156,7 @@ impl BackupStore {
         server_database: Option<&str>,
     ) -> AppResult<BackupMeta> {
         let dir = self.dir.read().await.clone();
-        let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-        let id = format!("bk-{}", Uuid::new_v4().simple());
-        // The name becomes a real file on disk, so it has to be legal on every
-        // platform: `/`, `\` and spaces were already replaced, and the rest of
-        // the Windows-invalid set (`:` `*` `?` `"` `<` `>` `|`, control
-        // characters) plus the reserved device names (CON, PRN, AUX, NUL,
-        // COM1-9, LPT1-9) would otherwise make the backup write fail there.
-        let safe_db = safe_file_component(database);
-        let file_name = match table {
-            Some(t) => format!("{}-{}-{}-{}.sql", stamp, driver, safe_db, safe_file_component(t)),
-            None => format!("{}-{}-{}.sql", stamp, driver, safe_db),
-        };
+        let (id, file_name) = backup_identity(driver, database, table);
         let path = dir.join(&file_name);
         crate::secure::write_private(&path, &content)
             .map_err(|e| AppError::Internal(format!("无法写入备份文件: {e}")))?;
@@ -164,6 +171,71 @@ impl BackupStore {
             created_by: "local".to_string(),
             size: content.len() as u64,
         };
+        self.register(&dir, meta).await
+    }
+
+    /// Reserve a private file in the backup directory for a **streamed** dump.
+    ///
+    /// A large dump is written table by table straight into this file (the
+    /// caller streams through `BufWriter`), so the process never holds the whole
+    /// dump as a `String`. The file lives in the backup directory on purpose:
+    /// [BackupStore::create_from_path] then commits it with one atomic rename.
+    /// Mode 0600 is applied before the first byte is written.
+    pub async fn temp_dump_path(&self) -> AppResult<PathBuf> {
+        let dir = self.dir.read().await.clone();
+        crate::secure::ensure_private_dir(&dir)
+            .map_err(|e| AppError::Internal(format!("无法创建备份目录: {e}")))?;
+        let path = dir.join(format!(".dump-{}.tmp", Uuid::new_v4().simple()));
+        // Create first, then tighten: the directory is already 0700, but a
+        // crash between the two calls must not leave a world-readable dump.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| AppError::Internal(format!("无法创建备份临时文件: {e}")))?;
+        crate::secure::set_file_mode(&path, 0o600);
+        Ok(path)
+    }
+
+    /// Commit a streamed dump file (see [BackupStore::temp_dump_path]).
+    ///
+    /// The caller has already written the complete dump into `source`. This
+    /// renames it to the recorded backup name (same directory, so the rename is
+    /// atomic) and registers the metadata with the real file size.
+    pub async fn create_from_path(
+        &self,
+        driver: &str,
+        database: &str,
+        table: Option<&str>,
+        source: &std::path::Path,
+        server_database: Option<&str>,
+    ) -> AppResult<BackupMeta> {
+        let dir = self.dir.read().await.clone();
+        let (id, file_name) = backup_identity(driver, database, table);
+        let path = dir.join(&file_name);
+        let size = std::fs::metadata(source)
+            .map_err(|e| AppError::Internal(format!("无法读取备份临时文件: {e}")))?
+            .len();
+        crate::secure::set_file_mode(source, 0o600);
+        std::fs::rename(source, &path)
+            .map_err(|e| AppError::Internal(format!("无法保存备份文件: {e}")))?;
+        crate::secure::set_file_mode(&path, 0o600);
+        let meta = BackupMeta {
+            id,
+            file: file_name,
+            driver: driver.to_string(),
+            database: database.to_string(),
+            server_database: server_database.map(str::to_string),
+            table: table.map(|t| t.to_string()),
+            created_at: Utc::now().to_rfc3339(),
+            created_by: "local".to_string(),
+            size,
+        };
+        self.register(&dir, meta).await
+    }
+
+    /// Append one backup to the index, enforce the 200-entry cap and persist.
+    async fn register(&self, dir: &std::path::Path, meta: BackupMeta) -> AppResult<BackupMeta> {
         let mut guard = self.inner.write().await;
         guard.push(meta.clone());
         guard.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -317,6 +389,62 @@ mod tests {
         assert!(store.list().await.is_empty());
         assert!(dir.join("index.json").exists());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    #[tokio::test]
+    async fn streamed_dumps_are_renamed_registered_and_sized() {
+        let root = temp_dir("streamed");
+        let store = BackupStore::load(root.join("dumps"));
+        let temp = store.temp_dump_path().await.expect("reserve a dump file");
+        assert_eq!(
+            temp.parent(),
+            Some(store.dir().await.as_path()),
+            "the temp file must sit in the backup directory so the commit is one atomic rename"
+        );
+        let dump = "-- DBPilot backup\nDROP TABLE IF EXISTS t;\n".to_string();
+        std::fs::write(&temp, &dump).unwrap();
+
+        let meta = store
+            .create_from_path("mysql", "db", Some("t"), &temp, None)
+            .await
+            .expect("commit the streamed dump");
+        assert!(!temp.exists(), "the temp file must be moved, not copied");
+        assert_eq!(meta.size as usize, dump.len());
+        assert_eq!(meta.table.as_deref(), Some("t"));
+        assert_eq!(meta.database, "db");
+        let path = store.dir().await.join(&meta.file);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), dump);
+        // The index was persisted with the committed name.
+        let listed = store.list().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, meta.id);
+        assert_eq!(listed[0].size, meta.size);
+        let index: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(store.dir().await.join("index.json")).unwrap())
+                .unwrap();
+        assert_eq!(index.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn streamed_dump_names_keep_the_existing_file_contract() {
+        let root = temp_dir("naming");
+        let store = BackupStore::load(root.join("dumps"));
+        let temp = store.temp_dump_path().await.unwrap();
+        std::fs::write(&temp, "SELECT 1;").unwrap();
+        let meta = store
+            .create_from_path("sqlite", "a/b", None, &temp, None)
+            .await
+            .unwrap();
+        // Same name shape as BackupStore::create: starts with the timestamp,
+        // contains the driver and the sanitised database, ends with .sql.
+        assert!(meta.file.ends_with(".sql"), "{}", meta.file);
+        assert!(meta.file.contains("-sqlite-"), "{}", meta.file);
+        assert!(meta.file.contains("a_b"), "{}", meta.file);
+        assert!(!meta.file.contains('/'), "{}", meta.file);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -10,7 +10,7 @@ pub mod driver;
 
 use crate::core::connection::ConnectionHandle;
 use crate::core::dialect::DatabaseDialect;
-use crate::db::{ColumnMeta, ResultSet, ScanStats};
+use crate::db::{ColumnMeta, ResultBatch, ResultSet, ScanStats};
 use crate::drivers::{
     bytes_json, column_json, qi, qualify, quote_str_for, safe_ident, CreateTableSpec, DriverKind,
 };
@@ -218,17 +218,9 @@ pub async fn run_one_owned(
     if wants_rows {
         let result = match sqlx::query(stmt.as_str()).fetch_all(&mut *conn).await {
             Ok(rows) => {
-                let columns: Vec<ColumnMeta> = rows
+                let columns = rows
                     .first()
-                    .map(|r| {
-                        r.columns()
-                            .iter()
-                            .map(|c| ColumnMeta {
-                                name: c.name().to_string(),
-                                type_name: c.type_info().name().to_string(),
-                            })
-                            .collect()
-                    })
+                    .map(|row| crate::drivers::columns_meta(row))
                     .unwrap_or_default();
                 let values: Vec<Vec<Value>> = rows
                     .iter()
@@ -311,17 +303,9 @@ pub async fn run_one_limited_owned(
     if let Some(e) = failure {
         return (error_set(stmt, e), false, conn);
     }
-    let columns: Vec<ColumnMeta> = rows
+    let columns = rows
         .first()
-        .map(|r| {
-            r.columns()
-                .iter()
-                .map(|c| ColumnMeta {
-                    name: c.name().to_string(),
-                    type_name: c.type_info().name().to_string(),
-                })
-                .collect()
-        })
+        .map(|row| crate::drivers::columns_meta(row))
         .unwrap_or_default();
     let values: Vec<Vec<Value>> = rows
         .iter()
@@ -338,6 +322,170 @@ pub async fn run_one_limited_owned(
         truncated,
     };
     (result, truncated, conn)
+}
+
+/// Streaming variant of [run_one_limited_owned] (optimisation layer 3).
+///
+/// Same contract as the MySQL implementation in
+/// `drivers/mysql/exec.rs::run_one_limited_batched_owned`, which is the
+/// reference for the docs below:
+///
+/// * rows are decoded with [value_to_json] and handed to `on_batch` as soon as
+///   `batch_size` of them have been read, so a large SQL-console result never
+///   materialises as a whole;
+/// * a statement that does not return rows reuses [run_one_limited_owned]
+///   verbatim (one `affected` batch);
+/// * reading stops at `max_rows`, `truncated` is set and the caller closes the
+///   connection (never drain/decode the rest);
+/// * `on_batch` returning `false` stops the scan immediately; the caller closes
+///   the connection, which also cancels the server-side query.
+///
+/// The returned [ResultSet] carries metadata only (`rows` is empty — the rows
+/// travelled through the callback). The connection is moved in and returned for
+/// the same rustc/`Send` reason documented on [run_one_limited_owned].
+pub async fn run_one_limited_batched_owned(
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    stmt: String,
+    max_rows: usize,
+    batch_size: usize,
+    on_batch: &mut (dyn FnMut(ResultBatch) -> bool + Send),
+) -> (
+    ResultSet,
+    bool,
+    bool,
+    sqlx::pool::PoolConnection<sqlx::Postgres>,
+) {
+    if !crate::db::returns_rows(&stmt) {
+        let (result, truncated, conn) = run_one_limited_owned(conn, stmt, max_rows).await;
+        return (result, truncated, false, conn);
+    }
+    let mut conn = conn;
+    let batch_size = batch_size.max(1);
+    let mut columns: Vec<ColumnMeta> = Vec::new();
+    let mut buffered: Vec<Vec<Value>> = Vec::with_capacity(batch_size.min(max_rows.max(1)));
+    let mut row_count: usize = 0;
+    let mut truncated = false;
+    let mut stopped = false;
+    let mut failure: Option<sqlx::Error> = None;
+    {
+        let mut stream = sqlx::query(stmt.as_str()).fetch(&mut *conn);
+        loop {
+            match stream.next().await {
+                Some(Ok(row)) => {
+                    if row_count >= max_rows {
+                        truncated = true;
+                        break;
+                    }
+                    if columns.is_empty() {
+                        columns = crate::drivers::columns_meta(&row);
+                    }
+                    buffered.push((0..row.len()).map(|i| value_to_json(&row, i)).collect());
+                    row_count += 1;
+                    if buffered.len() >= batch_size {
+                        let batch = ResultBatch {
+                            columns: columns.clone(),
+                            rows: std::mem::take(&mut buffered),
+                            truncated: false,
+                        };
+                        if !on_batch(batch) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    failure = Some(e);
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+    if let Some(e) = failure {
+        return (error_set(stmt, e), false, false, conn);
+    }
+    if !stopped {
+        if !buffered.is_empty() {
+            let batch = ResultBatch {
+                columns: columns.clone(),
+                rows: std::mem::take(&mut buffered),
+                truncated,
+            };
+            if !on_batch(batch) {
+                stopped = true;
+            }
+        } else if truncated {
+            // The cap was reached exactly on a batch boundary: emit a trailing
+            // empty batch so the consumer still observes `truncated`.
+            let batch = ResultBatch {
+                columns: columns.clone(),
+                rows: Vec::new(),
+                truncated: true,
+            };
+            if !on_batch(batch) {
+                stopped = true;
+            }
+        }
+    }
+    let result = ResultSet {
+        columns,
+        rows: Vec::new(),
+        row_count: row_count as u64,
+        last_insert_id: 0,
+        statement: stmt,
+        kind: "rows".to_string(),
+        error: None,
+        truncated,
+    };
+    (result, truncated, stopped, conn)
+}
+
+/// Execute `statements` inside **one transaction**, one affected result each.
+///
+/// Transaction control goes through sqlx's transaction manager; the first
+/// failing statement rolls the whole batch back. PostgreSQL supports `BEGIN`
+/// over the extended protocol too, but going through the same helper as MySQL /
+/// SQLite keeps the batched row-edit path driver-agnostic.
+///
+/// The failing statement's 1-based index is part of the error message.
+pub async fn run_transaction(
+    pool: &PgPool,
+    statements: Vec<String>,
+) -> AppResult<Vec<ResultSet>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::bad(crate::error::database_message(&e)))?;
+    let mut results = Vec::with_capacity(statements.len());
+    for (index, stmt) in statements.into_iter().enumerate() {
+        match sqlx::query(stmt.as_str()).execute(&mut *tx).await {
+            Ok(result) => results.push(ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: result.rows_affected(),
+                last_insert_id: 0,
+                statement: stmt,
+                kind: "affected".to_string(),
+                error: None,
+                truncated: false,
+            }),
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(AppError::bad(format!(
+                    "第 {} 条改动失败，整批已回滚：{}",
+                    index + 1,
+                    crate::error::database_message(&e)
+                )));
+            }
+        }
+    }
+    tx.commit().await.map_err(|e| {
+        AppError::bad(format!(
+            "提交事务失败：{}",
+            crate::error::database_message(&e)
+        ))
+    })?;
+    Ok(results)
 }
 
 fn error_set(stmt: String, e: sqlx::Error) -> ResultSet {
@@ -378,14 +526,7 @@ pub async fn scan_rows<'a>(
             match item {
                 Ok(row) => {
                     if stats.columns.is_empty() {
-                        stats.columns = row
-                            .columns()
-                            .iter()
-                            .map(|c| ColumnMeta {
-                                name: c.name().to_string(),
-                                type_name: c.type_info().name().to_string(),
-                            })
-                            .collect();
+                        stats.columns = crate::drivers::columns_meta(&row);
                     }
                     let values: Vec<Value> =
                         (0..row.len()).map(|i| value_to_json(&row, i)).collect();

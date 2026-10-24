@@ -601,6 +601,11 @@ class _SidebarState extends State<_Sidebar> {
     final nav = Navigation.instance;
     final route = nav.route;
 
+    // 惰性节点列表：每个元素只描述"怎么建这一行"，不会创建 Widget。
+    final nodes = state.connected
+        ? _databaseNodes(state, nav, route)
+        : <Widget Function()>[];
+
     // A route can mark a namespace expanded without the tree having fetched its
     // tables (for example the connect flow lands on DatabaseView.public). Load
     // any such missing list, once.
@@ -691,9 +696,14 @@ class _SidebarState extends State<_Sidebar> {
           Expanded(
             child: !state.connected
                 ? _emptyState()
-                : ListView(
+                // 节点按需构建：5000 张表的库有 5000 个表行，一次性建成 Widget
+                // 会让展开卡住数秒（每个 EllipsisText 还要在 post-frame 里测量
+                // 是否溢出）。这里只收集"怎么建这一行"的构建器（闭包很便宜），
+                // ListView.builder 只对可见的行调用它们。
+                : ListView.builder(
                     padding: const EdgeInsets.only(bottom: 8),
-                    children: _databaseNodes(state, nav, route),
+                    itemCount: nodes.length,
+                    itemBuilder: (context, index) => nodes[index](),
                   ),
           ),
         ],
@@ -718,7 +728,13 @@ class _SidebarState extends State<_Sidebar> {
     );
   }
 
-  List<Widget> _databaseNodes(AppState state, Navigation nav, AppRoute route) {
+  /// 侧边栏每一行的构建器。
+  ///
+  /// 返回的是 [Widget Function()] 而不是 Widget：数据库可能有 5000 张表，
+  /// 一次性把它们都建成 Widget 会在展开时卡住数秒。ListView.builder 只会对
+  /// 可见的行调用构建器，其余行连 Widget 都不会创建。
+  List<Widget Function()> _databaseNodes(
+      AppState state, Navigation nav, AppRoute route) {
     if (state.isSqlite) return _sqliteNodes(state, nav, route);
     if (state.isPostgres) return _postgresNodes(state, nav, route);
     return _flatDatabaseNodes(state, nav, route);
@@ -744,7 +760,7 @@ class _SidebarState extends State<_Sidebar> {
       );
 
   /// MySQL / MariaDB: a flat database list, each database with its tables.
-  List<Widget> _flatDatabaseNodes(
+  List<Widget Function()> _flatDatabaseNodes(
       AppState state, Navigation nav, AppRoute route) {
     final databases = (state.instanceDatabases.isNotEmpty
             ? state.instanceDatabases
@@ -754,25 +770,26 @@ class _SidebarState extends State<_Sidebar> {
         .toList();
     if (databases.isEmpty) {
       return [
-        _treeMessage(state.instanceDatabasesLoading || state.databasesLoading
+        () => _treeMessage(state.instanceDatabasesLoading ||
+                state.databasesLoading
             ? '连接中…'
             : '（无数据库）'),
       ];
     }
-    final nodes = <Widget>[];
+    final nodes = <Widget Function()>[];
     for (final db in databases) {
       final name = (db['name'] ?? '').toString();
       if (name.isEmpty) continue;
       final active = state.activeDatabase == name || route.db == name;
       final expanded = nav.expanded.contains(name);
-      nodes.add(_dbRow(
-        name,
-        name,
-        active,
-        expanded,
-        onOpen: () => _openMySQLDatabase(name),
-        onToggle: () => _toggleMySQLDatabase(name),
-      ));
+      nodes.add(() => _dbRow(
+            name,
+            name,
+            active,
+            expanded,
+            onOpen: () => _openMySQLDatabase(name),
+            onToggle: () => _toggleMySQLDatabase(name),
+          ));
       if (expanded) {
         nodes.addAll(_tableRows(name, nav, route));
       }
@@ -815,13 +832,15 @@ class _SidebarState extends State<_Sidebar> {
   /// database. Expanding a database lazily opens one pool and loads its
   /// schemas; clicking a schema switches the active database (if needed) and
   /// loads the tables for that schema.
-  List<Widget> _postgresNodes(AppState state, Navigation nav, AppRoute route) {
+  List<Widget Function()> _postgresNodes(
+      AppState state, Navigation nav, AppRoute route) {
     if (state.instanceDatabases.isEmpty) {
       return [
-        _treeMessage(state.instanceDatabasesLoading ? '连接中…' : '（无数据库）'),
+        () => _treeMessage(
+            state.instanceDatabasesLoading ? '连接中…' : '（无数据库）'),
       ];
     }
-    final nodes = <Widget>[];
+    final nodes = <Widget Function()>[];
     for (final db in state.instanceDatabases) {
       final name = (db['name'] ?? '').toString();
       if (name.isEmpty || state.isDatabaseDenied(name)) continue;
@@ -833,23 +852,23 @@ class _SidebarState extends State<_Sidebar> {
       // older build, or a privilege revoked mid-session, must grey the row and
       // explain rather than expand into a failing query.
       final canConnect = db['can_connect'] != false;
-      nodes.add(_instanceRow(name, active, expanded,
+      nodes.add(() => _instanceRow(name, active, expanded,
           canConnect: canConnect,
           onToggle: () => _togglePostgresDatabase(name, canConnect)));
       if (!expanded) continue;
 
       if (nav.loadingSchemas.contains(name)) {
-        nodes.add(_treeMessage('加载模式…', indent: 22));
+        nodes.add(() => _treeMessage('加载模式…', indent: 22));
         continue;
       }
       final error = nav.schemaErrors[name];
       if (error != null) {
-        nodes.add(_treeError(error));
+        nodes.add(() => _treeError(error));
         continue;
       }
       final schemas = nav.schemasByDb[name];
       if (schemas == null) {
-        nodes.add(_treeMessage('...', indent: 22));
+        nodes.add(() => _treeMessage('...', indent: 22));
         continue;
       }
       final path = state.searchPathSchemas;
@@ -869,7 +888,7 @@ class _SidebarState extends State<_Sidebar> {
           return byPath != 0 ? byPath : an.compareTo(bn);
         });
       if (visible.isEmpty) {
-        nodes.add(_noSchemaRow(name));
+        nodes.add(() => _noSchemaRow(name));
         continue;
       }
       final defaultSchema = state.searchPathDefaultSchema;
@@ -878,15 +897,15 @@ class _SidebarState extends State<_Sidebar> {
         if (schemaName.isEmpty) continue;
         final activeSchema = active && route.db == schemaName;
         final schemaExpanded = active && nav.expanded.contains(schemaName);
-        nodes.add(_schemaRow(
-          name,
-          schemaName,
-          activeSchema,
-          schemaExpanded,
-          isDefault: active && schemaName == defaultSchema,
-          onOpen: () => _openSchema(name, schemaName),
-          onToggle: () => _toggleSchema(name, schemaName),
-        ));
+        nodes.add(() => _schemaRow(
+              name,
+              schemaName,
+              activeSchema,
+              schemaExpanded,
+              isDefault: active && schemaName == defaultSchema,
+              onOpen: () => _openSchema(name, schemaName),
+              onToggle: () => _toggleSchema(name, schemaName),
+            ));
         if (schemaExpanded) {
           nodes.addAll(
               _tableRows(schemaName, nav, route, indent: 38));
@@ -1186,14 +1205,15 @@ class _SidebarState extends State<_Sidebar> {
   /// point of the grouping is to show the files without extra clicks.
   final Set<String> _collapsedDirs = <String>{};
 
-  List<Widget> _sqliteNodes(AppState state, Navigation nav, AppRoute route) {
-    final nodes = <Widget>[];
+  List<Widget Function()> _sqliteNodes(
+      AppState state, Navigation nav, AppRoute route) {
+    final nodes = <Widget Function()>[];
     final groups = state.databaseGroups;
     if (groups.isEmpty) {
       // The list can be empty while the pool reports nothing (broken primary,
       // unreadable folder); say so instead of rendering a blank sidebar.
       nodes.add(
-        Padding(
+        () => Padding(
           padding: const EdgeInsets.all(12),
           child: Text(
             state.databasesLoading ? '...' : '（该目录下没有可用的数据库）',
@@ -1214,7 +1234,7 @@ class _SidebarState extends State<_Sidebar> {
               .map((e) => Map<String, dynamic>.from(e as Map))
               .toList()
           : <Json>[];
-      nodes.add(_dirRow(dir, label, expanded, databases.length));
+      nodes.add(() => _dirRow(dir, label, expanded, databases.length));
       if (!expanded) continue;
       for (final db in databases) {
         final name = (db['name'] ?? '').toString();
@@ -1225,7 +1245,8 @@ class _SidebarState extends State<_Sidebar> {
             : db['title'].toString();
         final isActive = route.db == name;
         final open = nav.expanded.contains(name);
-        nodes.add(_dbRow(name, title, isActive, open, indent: 22, tooltip: path));
+        nodes.add(
+            () => _dbRow(name, title, isActive, open, indent: 22, tooltip: path));
         if (open) {
           nodes.addAll(_tableRows(name, nav, route));
         }
@@ -1235,7 +1256,7 @@ class _SidebarState extends State<_Sidebar> {
     // instead of silently showing a shorter list than the folder contains.
     if (state.sqliteOverflow.isNotEmpty) {
       nodes.add(
-        Padding(
+        () => Padding(
           padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
           child: Tooltip(
             message: state.sqliteOverflow
@@ -1368,51 +1389,59 @@ class _SidebarState extends State<_Sidebar> {
     );
   }
 
-  List<Widget> _tableRows(String db, Navigation nav, AppRoute route,
+  /// One row per table, as builders (see [_databaseNodes]).
+  ///
+  /// This is the hot path for a 5000-table database: the old version built every
+  /// row up front, and each [EllipsisText] scheduled its own post-frame overflow
+  /// measurement, so expanding the database blocked the UI for seconds. Now the
+  /// list holds one cheap closure per table and the ListView only materialises
+  /// the rows that are actually on screen.
+  List<Widget Function()> _tableRows(String db, Navigation nav, AppRoute route,
       {double indent = 26}) {
     final tables = nav.tablesByDb[db];
     if (tables == null) {
       return [
-        Padding(
-          padding: EdgeInsets.fromLTRB(indent, 2, 0, 6),
-          child: Text('...',
-              style: TextStyle(fontSize: 12, color: AppColors.muted)),
-        ),
+        () => Padding(
+              padding: EdgeInsets.fromLTRB(indent, 2, 0, 6),
+              child: Text('...',
+                  style: TextStyle(fontSize: 12, color: AppColors.muted)),
+            ),
       ];
     }
     if (tables.isEmpty) {
       return [
-        Padding(
-          padding: EdgeInsets.fromLTRB(indent, 2, 0, 6),
-          child: Text('（无）',
-              style: TextStyle(fontSize: 12, color: AppColors.muted)),
-        ),
+        () => Padding(
+              padding: EdgeInsets.fromLTRB(indent, 2, 0, 6),
+              child: Text('（无）',
+                  style: TextStyle(fontSize: 12, color: AppColors.muted)),
+            ),
       ];
     }
     return [
       for (final table in tables)
-        InkWell(
-          onTap: () => Navigation.instance.go(AppRoute.tableRoute(db, table)),
-          child: Container(
-            color: route.db == db && route.table == table
-                ? AppColors.dbItemActive
-                : Colors.transparent,
-            padding: EdgeInsets.fromLTRB(indent, 2, 6, 2),
-            child: EllipsisText(
-              table,
-              tooltip: '$db.$table',
-              style: monoStyle(
-                size: 12,
+        () => InkWell(
+              onTap: () =>
+                  Navigation.instance.go(AppRoute.tableRoute(db, table)),
+              child: Container(
                 color: route.db == db && route.table == table
-                    ? AppColors.bodyText
-                    : AppColors.tableLink,
-                weight: route.db == db && route.table == table
-                    ? FontWeight.w600
-                    : FontWeight.normal,
+                    ? AppColors.dbItemActive
+                    : Colors.transparent,
+                padding: EdgeInsets.fromLTRB(indent, 2, 6, 2),
+                child: EllipsisText(
+                  table,
+                  tooltip: '$db.$table',
+                  style: monoStyle(
+                    size: 12,
+                    color: route.db == db && route.table == table
+                        ? AppColors.bodyText
+                        : AppColors.tableLink,
+                    weight: route.db == db && route.table == table
+                        ? FontWeight.w600
+                        : FontWeight.normal,
+                  ),
+                ),
               ),
             ),
-          ),
-        ),
     ];
   }
 

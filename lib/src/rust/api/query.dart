@@ -9,18 +9,32 @@ import 'dart:convert';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `clean_database`, `database_ddl_target`, `is_cancel_transport_error`, `is_session_prelude`, `open_console_session`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `DatabaseDdl`, `QueryRequest`
+import 'query_types.dart';
 
 /// Run a SQL script (one or many statements) and record it in history.
 ///
-/// A `USE <database>` statement is handled as a validated database switch
-/// instead of being forwarded to the server: the console's only_db / hide_db
-/// boundary is checked exactly like the database picker, then following
-/// statements run against the new database. That makes the natural
-/// "USE db;" prelude work without letting raw SQL escape the visibility rules.
+/// Compatibility shim: keeps the pre-typed `serde_json::Value` contract so the
+/// Dart UI and the Rust integration tests that treat the response as JSON keep
+/// working. The payload is produced by [QueryResponseDto::to_json_value], which
+/// is field-for-field identical to the old `json!(...)` response.
 Future<Object?> runQuery({required Object? body}) =>
     RustLib.instance.api.crateApiQueryRunQuery(body: body);
+
+/// Typed variant of [run_query] (optimisation layer 1).
+///
+/// Returns the result sets as structs instead of a JSON tree: no `to_value`
+/// deep copy, no `to_string`, no Dart `jsonDecode`.
+Future<QueryResponseDto> runQueryTyped({required Object? body}) =>
+    RustLib.instance.api.crateApiQueryRunQueryTyped(body: body);
+
+/// Streaming variant of [run_query] (optimisation layer 3).
+///
+/// Emits one `Started` per statement, zero or more `Batch` events, one
+/// `StatementDone` per statement and a final `Done`; a top-level failure is
+/// reported as `Failed`. Rows are handed to `sink` while the driver is still
+/// reading them, so the console never materialises the whole result set.
+Stream<QueryEvent> runQueryStream({required Object? body}) =>
+    RustLib.instance.api.crateApiQueryRunQueryStream(body: body);
 
 /// Cancel the query currently running from the SQL console.
 ///

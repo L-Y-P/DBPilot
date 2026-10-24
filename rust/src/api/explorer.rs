@@ -497,6 +497,106 @@ pub async fn change_row(database: String, table: String, body: Value) -> anyhow:
         .map_err(anyhow::Error::from)
 }
 
+/// Parse the batch-change payload: a JSON array of row changes, or an object
+/// `{"changes": [...]}` (the shape the Dart page sends).
+fn parse_row_changes(changes: Value) -> anyhow::Result<Vec<RowChange>> {
+    let items = match changes {
+        Value::Array(items) => items,
+        Value::Object(mut object) => match object.remove("changes") {
+            Some(Value::Array(items)) => items,
+            _ => {
+                return Err(AppError::bad("changes 必须是数组，或包含 changes 数组的对象").into());
+            }
+        },
+        _ => return Err(AppError::bad("changes 必须是数组，或包含 changes 数组的对象").into()),
+    };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            serde_json::from_value::<RowChange>(item).map_err(|error| {
+                AppError::bad(format!("第 {} 条改动格式无效：{error}", index + 1)).into()
+            })
+        })
+        .collect()
+}
+
+/// Apply several row changes (INSERT / UPDATE / DELETE) in **one transaction**.
+///
+/// The semantic of every item is exactly [change_row]'s: the same key/value
+/// quoting, the same `limit_one` narrowing (ctid / rowid / LIMIT 1) and the
+/// same validation — the SQL is produced by the shared
+/// `DatabaseDriver::change_row_sql`, only execution differs.
+///
+/// Every statement is validated and built **before** the transaction starts, so
+/// a bad item (unknown action, update without keys, ...) cannot leave a
+/// half-applied write behind. The batch then runs through
+/// `ConnectionHandle::execute_transaction` (one sqlx transaction, driver-issued
+/// `BEGIN`/`COMMIT`); the first server error rolls the whole batch back and
+/// the error names the failing item.
+///
+/// Returns per-item results plus the total affected rows, so the table page can
+/// show "已保存 N 行" and flag the item that contained a zero-row match.
+pub async fn apply_row_changes(
+    database: String,
+    table: String,
+    changes: Value,
+) -> anyhow::Result<Value> {
+    let state = state()?;
+    let driver = state.driver_for_active().await?;
+    let parsed = parse_row_changes(changes)?;
+    // Build first: validation errors must fail before BEGIN (no rollback needed).
+    let mut statements: Vec<(usize, String, String)> = Vec::with_capacity(parsed.len());
+    for (index, change) in parsed.iter().enumerate() {
+        let keys = change.keys.clone().unwrap_or_default();
+        let values = change.values.clone().unwrap_or_default();
+        let sql = driver
+            .change_row_sql(&database, &table, &change.action, &keys, &values, change.limit_one)
+            .map_err(anyhow::Error::from)?;
+        statements.push((index, change.action.clone(), sql));
+    }
+    if statements.is_empty() {
+        return Ok(json!({
+            "ok": true,
+            "database": database,
+            "table": table,
+            "results": [],
+            "rows_affected": 0,
+        }));
+    }
+    // One transaction on one pooled connection. The driver issues BEGIN/COMMIT
+    // through sqlx's transaction manager (a prepared `BEGIN` is rejected by
+    // MySQL, error 1295) and rolls the whole batch back when a statement fails.
+    let conn = state.connection_for(Some(&database)).await?;
+    let sqls: Vec<String> = statements
+        .iter()
+        .map(|(_, _, sql)| sql.clone())
+        .collect();
+    let executed = conn
+        .execute_transaction(sqls)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let mut results: Vec<Value> = Vec::with_capacity(executed.len());
+    let mut rows_affected = 0u64;
+    for ((index, action, _sql), result) in statements.into_iter().zip(executed) {
+        rows_affected += result.row_count;
+        results.push(json!({
+            "ok": true,
+            "index": index,
+            "action": action,
+            "rows_affected": result.row_count,
+            "last_insert_id": result.last_insert_id,
+        }));
+    }
+    Ok(json!({
+        "ok": true,
+        "database": database,
+        "table": table,
+        "results": results,
+        "rows_affected": rows_affected,
+    }))
+}
+
 /// Table metadata for the graphical query builder.
 pub async fn builder_schema(database: String) -> anyhow::Result<Value> {
     let state = state()?;

@@ -624,5 +624,23 @@ pub trait DatabaseDriver: Send + Sync + fmt::Debug {
         )
         .await
     }
+
+    /// 生成（不执行）一行 INSERT / UPDATE / DELETE 的 SQL。
+    ///
+    /// [Self::change_row] 与批量提交（`api::explorer::apply_row_changes`）共用，
+    /// 保证两边的标识符引用、字面量与 keys/values 校验完全一致；批量路径可以在
+    /// 开启事务之前先把所有语句校验/生成完，坏输入不会留下半个事务。
+    #[allow(clippy::too_many_arguments)]
+    fn change_row_sql(
+        &self,
+        namespace: &str,
+        table: &str,
+        action: &str,
+        keys: &serde_json::Map<String, Value>,
+        values: &serde_json::Map<String, Value>,
+        limit_one: bool,
+    ) -> AppResult<String> {
+        crate::ops::change_row_sql(self, namespace, table, action, keys, values, limit_one)
+    }
 }
 

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sqlx::mysql::{MySqlRow, MySqlValueRef};
 use sqlx::{Column, Decode, Row, TypeInfo, ValueRef};
 
-use crate::db::{quote_str, ColumnMeta};
+use crate::db::{quote_str, ColumnMeta, RawCell};
 
 pub fn columns_meta(row: &MySqlRow) -> Vec<ColumnMeta> {
     row.columns()
@@ -144,6 +144,127 @@ pub fn row_values(row: &MySqlRow) -> Vec<Value> {
     (0..row.len()).map(|i| value_to_json(row, i)).collect()
 }
 
+/// Convert raw bytes to a [RawCell], or NULL when the payload cannot be read.
+fn bytes_cell(raw: MySqlValueRef<'_>) -> RawCell {
+    match decode::<Vec<u8>>(raw) {
+        Some(bytes) => RawCell::Bytes(bytes),
+        None => RawCell::Null,
+    }
+}
+
+/// Decode one MySQL cell straight into a [RawCell] — no `serde_json::Value`.
+///
+/// This is deliberately the **same type dispatch** as [value_to_json]; it only
+/// changes the output representation. The SQL-console typed/streaming path
+/// (optimisation layer 4) uses it to skip the JSON tree that dominated the cost
+/// of a large result set, while the legacy `run_query` contract is still built
+/// from the typed cells.
+///
+/// Keep the two functions in lockstep: a new MySQL type branch added here must
+/// also be added to [value_to_json] (and vice versa), and the live
+/// `raw_cells_match_the_legacy_json_decoder` test in `exec.rs` compares their
+/// output cell by cell against a real server.
+pub fn raw_cell(row: &MySqlRow, idx: usize) -> RawCell {
+    let raw = match row.try_get_raw(idx) {
+        Ok(raw) => raw,
+        Err(_) => return RawCell::Null,
+    };
+    if raw.is_null() {
+        return RawCell::Null;
+    }
+    let tname = row.column(idx).type_info().name().to_uppercase();
+
+    if tname.contains("INT") || matches!(tname.as_str(), "YEAR" | "BIT" | "BOOLEAN" | "SERIAL") {
+        if tname == "BOOLEAN" {
+            if let Some(v) = decode::<bool>(raw.clone()) {
+                return RawCell::Bool(v);
+            }
+        }
+        if tname.contains("UNSIGNED") || tname == "BIT" {
+            if let Some(v) = decode::<u64>(raw.clone()) {
+                return RawCell::UInt(v);
+            }
+        }
+        if let Some(v) = decode::<i64>(raw.clone()) {
+            return RawCell::Int(v);
+        }
+        if let Some(v) = decode::<u64>(raw.clone()) {
+            return RawCell::UInt(v);
+        }
+        return bytes_cell(raw);
+    }
+
+    if tname == "FLOAT" || tname == "DOUBLE" {
+        if let Some(v) = decode::<f64>(raw.clone()) {
+            return RawCell::Float(v);
+        }
+        return bytes_cell(raw);
+    }
+
+    if tname == "DECIMAL" || tname == "NEWDECIMAL" {
+        if let Some(v) = decode::<String>(raw.clone()) {
+            return RawCell::Text(v);
+        }
+        return bytes_cell(raw);
+    }
+
+    if tname == "DATE" {
+        if let Some(v) = decode::<chrono::NaiveDate>(raw.clone()) {
+            return RawCell::Text(v.to_string());
+        }
+        return bytes_cell(raw);
+    }
+
+    if tname == "DATETIME" || tname == "TIMESTAMP" {
+        if let Some(v) = decode::<chrono::NaiveDateTime>(raw.clone()) {
+            return RawCell::Text(v.format("%Y-%m-%d %H:%M:%S%.f").to_string());
+        }
+        return bytes_cell(raw);
+    }
+
+    if tname == "TIME" {
+        if let Some(v) = decode::<chrono::NaiveTime>(raw.clone()) {
+            return RawCell::Text(v.to_string());
+        }
+        if let Some(v) = decode::<chrono::TimeDelta>(raw.clone()) {
+            let total = v.num_seconds();
+            let sign = if total < 0 { "-" } else { "" };
+            let abs = total.abs();
+            return RawCell::Text(format!(
+                "{}{:02}:{:02}:{:02}",
+                sign,
+                abs / 3600,
+                (abs % 3600) / 60,
+                abs % 60
+            ));
+        }
+        return bytes_cell(raw);
+    }
+
+    if tname == "JSON" {
+        if let Some(v) = decode::<String>(raw.clone()) {
+            return RawCell::Text(v);
+        }
+        return bytes_cell(raw);
+    }
+
+    // Everything else (VARCHAR, CHAR, TEXT, ENUM, SET, BLOB, BINARY, ...):
+    // prefer readable UTF-8, otherwise keep the bytes (the typed path stores
+    // them directly instead of a base64 marker).
+    if let Some(v) = decode::<String>(raw.clone()) {
+        if !looks_binary(&v) {
+            return RawCell::Text(v);
+        }
+    }
+    bytes_cell(raw)
+}
+
+/// Decode one whole MySQL row straight into [RawCell]s.
+pub fn raw_row_values(row: &MySqlRow) -> Vec<RawCell> {
+    (0..row.len()).map(|i| raw_cell(row, i)).collect()
+}
+
+
 /// Serialize rows as objects keyed by column name (for metadata queries).
 pub fn rows_to_named(rows: &[MySqlRow]) -> Vec<Value> {
     rows.iter()
@@ -195,3 +316,22 @@ pub fn sql_literal(row: &MySqlRow, idx: usize) -> String {
         other => quote_str(&other.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::looks_binary;
+
+    #[test]
+    fn looks_binary_only_flags_control_characters() {
+        assert!(!looks_binary("plain text"));
+        assert!(!looks_binary("tabs\tand\nnewlines\r"));
+        assert!(!looks_binary("中文文本"));
+        assert!(!looks_binary(""));
+        // NUL and other control bytes mean the server sent real binary data,
+        // which both decoders must keep as bytes.
+        assert!(looks_binary("\u{0}"));
+        assert!(looks_binary("ab\u{1}"));
+        assert!(looks_binary("\u{1f}"));
+    }
+}
+

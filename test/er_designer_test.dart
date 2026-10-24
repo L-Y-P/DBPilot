@@ -8,6 +8,7 @@
 //  * 中文动作文案不出现 SQL 关键字，英文界面才出现。
 
 import 'dart:io';
+import 'dart:ui' show PointerDeviceKind;
 
 import 'package:flutter/material.dart' hide Text, Tooltip;
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
@@ -19,6 +20,7 @@ import 'package:rust_myadmin_desktop/src/i18n_literals.dart' as lit;
 import 'package:rust_myadmin_desktop/src/rust/frb_generated.dart';
 import 'package:rust_myadmin_desktop/src/text.dart' as app_text;
 import 'package:rust_myadmin_desktop/src/theme.dart';
+import 'package:rust_myadmin_desktop/src/tooltip.dart' as app_tooltip;
 import 'package:rust_myadmin_desktop/src/views/er_model.dart';
 import 'package:rust_myadmin_desktop/src/views/relation_designer.dart';
 import 'package:rust_myadmin_desktop/src/widgets.dart';
@@ -99,6 +101,14 @@ void main() {
       // 没有外键、但列名暗示关系的表（建议关系）。
       'CREATE TABLE shops (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
       'CREATE TABLE members (id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER, name TEXT)',
+      // 长类型名：验证类型列单行省略、不换行。
+      'CREATE TABLE variants (id INTEGER PRIMARY KEY AUTOINCREMENT, code VARCHAR(255), note TEXT)',
+      // 建议关系专用（无外键）：对应 golden B 的「仅建议关系」场景。
+      'CREATE TABLE su_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+      'CREATE TABLE su_categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+      'CREATE TABLE su_products (id INTEGER PRIMARY KEY AUTOINCREMENT, su_categories_id INTEGER, name TEXT)',
+      'CREATE TABLE su_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, su_users_id INTEGER)',
+      'CREATE TABLE su_items (id INTEGER PRIMARY KEY AUTOINCREMENT, su_orders_id INTEGER, su_products_id INTEGER)',
     ];
     for (final sql in fixtures) {
       await Api.instance.query(sql);
@@ -295,7 +305,18 @@ void main() {
     );
     await settle(tester);
     expect(find.byKey(const ValueKey('er-node-members')), findsOneWidget);
-    expect(find.text('建议：'), findsOneWidget);
+    // 标签降噪：默认只显示小号「建议」胶囊，完整文案在 tooltip。
+    expect(find.text('建议'), findsOneWidget);
+    expect(find.textContaining('members.shop_id → shops.id'), findsNothing);
+    final suggestionTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .ancestor(
+            of: find.text('建议'),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(suggestionTooltip.message, contains('members.shop_id → shops.id'));
     expect(
       find.byKey(const ValueKey('er-suggestion-members.shop_id>shops.id')),
       findsOneWidget,
@@ -367,12 +388,173 @@ void main() {
     );
     await settle(tester);
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
-    final dot = tester.widget<GestureDetector>(
+    // 字段行左右两端都有连接点，SQLite 下都禁用（ALTER 不能加外键）。
+    final rightDot = tester.widget<GestureDetector>(
       find.byKey(const ValueKey('er-connect-books-author_id')),
     );
-    expect(dot.onPanStart, isNull, reason: '连接点在 SQLite 下必须禁用');
+    expect(rightDot.onPanStart, isNull, reason: '右连接点在 SQLite 下必须禁用');
+    final leftDot = tester.widget<GestureDetector>(
+      find.byKey(const ValueKey('er-connect-left-books-author_id')),
+    );
+    expect(leftDot.onPanStart, isNull, reason: '左连接点在 SQLite 下必须禁用');
     // 只读：已有外键仍然显示。
     expect(find.text('books.author_id → authors.id'), findsOneWidget);
+  });
+
+  testWidgets('关系标签默认隐藏，hover / 选中才显示', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    const booksLabel = 'books.author_id → authors.id';
+    Opacity labelOpacity() => tester.widget<Opacity>(
+      find
+          .ancestor(of: find.text(booksLabel), matching: find.byType(Opacity))
+          .first,
+    );
+
+    // 默认不绘制（仍在树里，方便命中/可访问性）。
+    expect(find.text(booksLabel), findsOneWidget);
+    expect(labelOpacity().opacity, 0);
+
+    // hover 到曲线中点（标签锚点）→ 显示。
+    final center = tester.getCenter(find.text(booksLabel));
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: center);
+    addTearDown(mouse.removePointer);
+    await tester.pump();
+    await mouse.moveTo(center);
+    await settle(tester, rounds: 3);
+    expect(labelOpacity().opacity, 1);
+
+    // 移开 → 再次隐藏。
+    await mouse.moveTo(const Offset(2, 2));
+    await settle(tester, rounds: 3);
+    expect(labelOpacity().opacity, 0);
+
+    // 点击边（标签位置落在曲线上）→ 打开详情，关闭后保持选中高亮。
+    await tester.tapAt(tester.getCenter(find.text(booksLabel)));
+    await settle(tester, rounds: 6);
+    expect(find.text('外键关系'), findsWidgets);
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 12);
+    expect(labelOpacity().opacity, 1, reason: '选中后关系标签保持显示');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('类型列单行省略，不换行', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['variants'],
+          height: 420,
+        ),
+      ),
+    );
+    await settle(tester);
+    final typeTexts = tester
+        .widgetList<app_text.Text>(find.byType(app_text.Text))
+        .where((widget) => widget.data == 'VARCHAR(255)')
+        .toList();
+    expect(typeTexts.length, 1);
+    expect(typeTexts.single.maxLines, 1);
+    expect(typeTexts.single.softWrap, isFalse);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('边层先画、卡片后画（卡片遮挡穿过的线）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    final stack = tester.widget<Stack>(
+      find.byKey(const ValueKey('er-canvas-stack')),
+    );
+    expect(
+      stack.children.first.key,
+      const ValueKey('er-edge-layer'),
+      reason: '边层必须是 Stack 的第一个孩子（画在卡片下面）',
+    );
+    expect(
+      stack.children.indexWhere(
+        (child) => child.key == const ValueKey('er-node-layer-books'),
+      ),
+      greaterThan(0),
+      reason: '卡片必须画在边层之后',
+    );
+    expect(
+      stack.children.indexWhere(
+        (child) => child.key == const ValueKey('er-node-layer-authors'),
+      ),
+      greaterThan(0),
+    );
+  });
+
+  testWidgets('分层布局：子表在左、被引用父表在右', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['c1'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    double xOf(String name) =>
+        tester.getTopLeft(find.byKey(ValueKey('er-node-$name'))).dx;
+    // c2 → c1、c3 → c2：被引用的父表逐层往右。
+    expect(xOf('c1'), greaterThan(xOf('c2')));
+    expect(xOf('c2'), greaterThan(xOf('c3')));
+    expect(xOf('c3'), greaterThan(xOf('c4')));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('建议关系场景：同源两条边上下不交叉', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>[
+            'su_users',
+            'su_categories',
+            'su_products',
+            'su_orders',
+            'su_items',
+          ],
+          height: 820,
+        ),
+      ),
+    );
+    await settle(tester);
+    double yOf(String name) =>
+        tester.getTopLeft(find.byKey(ValueKey('er-node-$name'))).dy;
+    // su_items 的 su_orders_id 在 su_products_id 上面 → su_orders 必须排在
+    // su_products 上面，否则两条建议边会交叉成 X。
+    expect(yOf('su_orders'), lessThan(yOf('su_products')));
+    expect(yOf('su_users'), lessThan(yOf('su_categories')));
+    // 4 条建议虚线，各带一个小「建议」胶囊。
+    expect(find.text('建议'), findsNWidgets(4));
+    expect(find.text('建立建议外键 (4)'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('SQLite：中间表通过 createTable 一次建表成功', (tester) async {
@@ -466,7 +648,10 @@ void main() {
       ),
     );
     await settle(tester);
-    await tester.tap(find.text('books.author_id → authors.id'));
+    // 标签默认隐藏，直接点线（标签锚点在曲线上）。
+    await tester.tapAt(
+      tester.getCenter(find.text('books.author_id → authors.id')),
+    );
     await settle(tester, rounds: 5);
     expect(find.text('外键关系'), findsWidgets);
     expect(find.text('books.author_id'), findsOneWidget);
@@ -581,7 +766,7 @@ void main() {
       ),
     );
     await settle(tester);
-    expect(find.text('Suggested: '), findsOneWidget);
+    expect(find.text('Suggested'), findsOneWidget);
     expect(find.text('Create suggested FKs (1)'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
     expect(tester.takeException(), isNull);

@@ -29,6 +29,7 @@ const Map<String, String> enRelations = <String, String>{
   '中间表（多对多）': 'Junction table (many-to-many)',
   '折叠中间表': 'Collapse junction table',
   '展开中间表': 'Expand junction table',
+  '建议': 'Suggested',
   '建议：': 'Suggested: ',
   '撤销自动加入': 'Undo auto-add',
   '两表之间已有中间表': 'A junction table already links these tables',

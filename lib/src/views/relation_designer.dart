@@ -116,7 +116,13 @@ class _RelationDesignerState extends State<RelationDesigner> {
   String? _draggingNode;
   Offset? _nodeDragLast;
   int? _hoverRelation;
+
+  /// 当前 hover 的多对多连线 key（"m2m:中间表名"）；hover 时才显示它的标签。
+  String? _hoverM2MKey;
   String? _hoverDot;
+
+  /// 用户手动拖过位置的表：自动布局 / 自动带入时保留这些坐标。
+  final Set<String> _userMoved = <String>{};
 
   /// 每张表里「单列唯一」的字段（单列主键 / 单列唯一索引），用于判断被引用列
   /// 能不能独立作为外键目标；同时决定「双方都不唯一 → 默认建议中间表」。
@@ -280,7 +286,8 @@ class _RelationDesignerState extends State<RelationDesigner> {
         _uniqueColumns
           ..clear()
           ..addAll(unique);
-        _positions.clear(); // 首帧用真实画布宽度自动布局
+        _positions.clear(); // 首帧用分层布局
+        _userMoved.clear();
         _loading = false;
         _bumpGraph();
       });
@@ -345,21 +352,43 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   // ---------------------------------------------------------------- 表管理
 
-  /// 补齐新加入节点 / 清掉已移除节点的位置；画布每帧布局时调用。
-  void _fillMissingPositions(double width) {
-    final layout = autoErLayout(
-      _tables,
-      viewportWidth: width,
-      metrics: _metrics,
-    );
-    final names = <String>{};
+  /// 分层布局用的边：真实外键 + 建议关系 + 中间表多对多（父 → 子方向）。
+  List<ErRelation> _layoutRelations() => <ErRelation>[
+    ..._relations,
+    ..._suggestions,
+    for (final link in _m2mLinks) link.syntheticRelation,
+  ];
+
+  Map<String, Offset> _layeredPositions(double width) => layeredErLayout(
+    _tables,
+    _layoutRelations(),
+    viewportWidth: width,
+    metrics: _metrics,
+  );
+
+  /// 首次加载 / 自动带入后重新分层布局；用户拖动过的节点保留原坐标。
+  void _relayout({required bool force, required double width}) {
+    if (_tables.isEmpty) return;
+    final computed = _layeredPositions(width);
     for (final table in _tables) {
-      names.add(table.name);
-      _positions.putIfAbsent(
-        table.name,
-        () => layout[table.name] ?? const Offset(24, 24),
-      );
+      final existing = _positions[table.name];
+      final keep =
+          !force && existing != null && _userMoved.contains(table.name);
+      _positions[table.name] = keep
+          ? existing
+          : (computed[table.name] ?? existing ?? const Offset(24, 24));
     }
+    if (force) _userMoved.clear();
+  }
+
+  /// 补上新加入节点的位置并清掉已移除节点；画布每帧布局时调用。
+  void _ensurePositions(double width) {
+    if (_tables.isEmpty) return;
+    final missing = _tables.any((table) => !_positions.containsKey(table.name));
+    if (_positions.isEmpty || missing) {
+      _relayout(force: false, width: width);
+    }
+    final names = <String>{for (final table in _tables) table.name};
     _positions.removeWhere((key, _) => !names.contains(key));
   }
 
@@ -367,13 +396,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
     final width = _layoutWidth > 0
         ? _layoutWidth
         : (widget.compact ? 660.0 : 860.0);
-    setState(() {
-      _positions
-        ..clear()
-        ..addAll(
-          autoErLayout(_tables, viewportWidth: width, metrics: _metrics),
-        );
-    });
+    setState(() => _relayout(force: true, width: width));
   }
 
   ErTable? _tableNamed(String name) {
@@ -470,6 +493,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
       _autoAdded.remove(name);
       // 用户手动移除过的表不再自动加回；选中的关系也可能因此消失。
       _userRemoved.add(name);
+      _userMoved.remove(name);
       _selectedRelationKey = null;
       _bumpGraph();
     });
@@ -551,6 +575,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
         _uniqueColumns.remove(name);
         _positions.remove(name);
         _collapsedJunctions.remove(name);
+        _userMoved.remove(name);
       }
       _userRemoved.addAll(remove);
       _autoAdded = <String>[];
@@ -911,6 +936,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
     final delta = globalPosition - last;
     final position = _positions[table] ?? const Offset(24, 24);
     setState(() {
+      _userMoved.add(table);
       _nodeDragLast = globalPosition;
       _positions[table] = Offset(
         math.max(0, position.dx + delta.dx),
@@ -927,10 +953,18 @@ class _RelationDesignerState extends State<RelationDesigner> {
     });
   }
 
-  void _startConnect(ErTable table, int columnIndex, Offset globalPosition) {
+  void _startConnect(
+    ErTable table,
+    int columnIndex,
+    Offset globalPosition, {
+    required bool fromLeft,
+  }) {
     final local = _toCanvas(globalPosition);
     final columnName = table.columns[columnIndex].name;
-    final source = _layout.connectionPoint(table.name, columnName) ?? local;
+    final layout = _layout;
+    final source = fromLeft
+        ? (layout.leftConnectionPoint(table.name, columnName) ?? local)
+        : (layout.connectionPoint(table.name, columnName) ?? local);
     setState(() {
       _dotPressed = true;
       _drag = _ConnectDrag(
@@ -938,6 +972,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
         columnIndex: columnIndex,
         source: source,
         point: local,
+        fromLeft: fromLeft,
       );
     });
   }
@@ -982,10 +1017,23 @@ class _RelationDesignerState extends State<RelationDesigner> {
     );
   }
 
-  void _handleHover(Offset local, List<ErRelationCurve> curves) {
+  void _handleHover(
+    Offset local,
+    List<ErRelationCurve> curves,
+    List<ErRelationCurve> m2mCurves,
+    List<ErManyToManyLink> m2mLinks,
+  ) {
     final hit = hitTestRelationCurves(curves, local);
-    if (hit != _hoverRelation) {
-      setState(() => _hoverRelation = hit);
+    int? m2mHit;
+    if (hit == null && m2mCurves.isNotEmpty) {
+      m2mHit = hitTestRelationCurves(m2mCurves, local);
+    }
+    final m2mKey = m2mHit == null ? null : m2mLinks[m2mHit].key;
+    if (hit != _hoverRelation || m2mKey != _hoverM2MKey) {
+      setState(() {
+        _hoverRelation = hit;
+        _hoverM2MKey = m2mKey;
+      });
     }
   }
 
@@ -997,7 +1045,11 @@ class _RelationDesignerState extends State<RelationDesigner> {
       }
       return;
     }
-    final relation = curves[hit].relation;
+    _selectRelation(curves[hit].relation);
+  }
+
+  /// 选中一条边（画布高亮 + 标签显示）并打开详情。
+  void _selectRelation(ErRelation relation) {
     setState(() => _selectedRelationKey = relation.key);
     _openRelationDialog(relation);
   }
@@ -1214,7 +1266,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
       builder: (context, constraints) {
         final viewport = Size(constraints.maxWidth, constraints.maxHeight);
         _layoutWidth = viewport.width;
-        _fillMissingPositions(viewport.width);
+        _ensurePositions(viewport.width);
         final layout = _layout;
         final relations = _relations;
         final curves = relationCurves(layout, relations);
@@ -1234,10 +1286,14 @@ class _RelationDesignerState extends State<RelationDesigner> {
           width: content.width,
           height: content.height,
           child: MouseRegion(
-            onHover: (event) => _handleHover(event.localPosition, curves),
+            onHover: (event) =>
+                _handleHover(event.localPosition, curves, m2mCurves, m2mLinks),
             onExit: (_) {
-              if (_hoverRelation != null) {
-                setState(() => _hoverRelation = null);
+              if (_hoverRelation != null || _hoverM2MKey != null) {
+                setState(() {
+                  _hoverRelation = null;
+                  _hoverM2MKey = null;
+                });
               }
             },
             child: GestureDetector(
@@ -1245,11 +1301,13 @@ class _RelationDesignerState extends State<RelationDesigner> {
               onTapUp: (details) =>
                   _handleCanvasTap(details.localPosition, curves),
               child: Stack(
+                key: const ValueKey('er-canvas-stack'),
                 clipBehavior: Clip.none,
                 children: <Widget>[
-                  for (final table in _visibleTables) _node(table),
-                  // 边画在节点之上：箭头落在目标端边框上，不会被卡片盖住。
+                  // 先画边、后画卡片：卡片不透明，穿过卡片的线段被自然遮挡；
+                  // 箭头尖端落在卡片边界上，留在边界外的部分仍然可见。
                   Positioned.fill(
+                    key: const ValueKey('er-edge-layer'),
                     child: IgnorePointer(
                       child: CustomPaint(
                         painter: _ErCanvasPainter(
@@ -1260,12 +1318,14 @@ class _RelationDesignerState extends State<RelationDesigner> {
                           m2mCurves: m2mCurves,
                           drag: _drag,
                           hoveredRelation: _hoverRelation,
+                          hoveredM2MKey: _hoverM2MKey,
                           selectedRelationKey: _selectedRelationKey,
                           dropTarget: dropTarget,
                         ),
                       ),
                     ),
                   ),
+                  for (final table in _visibleTables) _node(table),
                   for (var i = 0; i < curves.length; i++)
                     _relationLabel(curves[i], i),
                   for (var i = 0; i < m2mCurves.length; i++)
@@ -1293,6 +1353,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
     final position = _positions[table.name] ?? const Offset(24, 24);
     final metrics = _metrics;
     return Positioned(
+      key: ValueKey('er-node-layer-${table.name}'),
       left: position.dx,
       top: position.dy,
       child: SizedBox(
@@ -1412,11 +1473,13 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   Widget _fieldRow(ErTable table, int index, ErNodeMetrics metrics) {
     final column = table.columns[index];
+    final typeLabel = column.typeLabel;
     return SizedBox(
       height: metrics.rowHeight,
       child: Row(
         children: <Widget>[
-          const SizedBox(width: 6),
+          // 左右两端都有连接点：从任一端拖拽都能建关系。
+          _connectionDot(table, index, column, metrics, fromLeft: true),
           SizedBox(
             width: 20,
             child: Text(
@@ -1432,6 +1495,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
             child: Text(
               column.name,
               maxLines: 1,
+              softWrap: false,
               overflow: TextOverflow.ellipsis,
               style: monoStyle(
                 size: widget.compact ? 10.5 : 11,
@@ -1439,17 +1503,19 @@ class _RelationDesignerState extends State<RelationDesigner> {
               ),
             ),
           ),
-          if (column.typeLabel.isNotEmpty)
-            ConstrainedBox(
-              constraints: BoxConstraints(maxWidth: metrics.cardWidth * 0.3),
+          if (typeLabel.isNotEmpty)
+            SizedBox(
+              width: metrics.cardWidth * 0.34,
               child: Text(
-                column.typeLabel,
+                typeLabel,
                 maxLines: 1,
+                softWrap: false,
+                textAlign: TextAlign.right,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(fontSize: 9, color: AppColors.muted),
               ),
             ),
-          _connectionDot(table, index, column, metrics),
+          _connectionDot(table, index, column, metrics, fromLeft: false),
         ],
       ),
     );
@@ -1459,13 +1525,18 @@ class _RelationDesignerState extends State<RelationDesigner> {
     ErTable table,
     int index,
     ErColumn column,
-    ErNodeMetrics metrics,
-  ) {
+    ErNodeMetrics metrics, {
+    required bool fromLeft,
+  }) {
     final enabled = !_isSqlite;
     final tableName = table.name;
     final columnName = column.name;
-    final hoverKey = '$tableName\u0000$columnName';
+    final side = fromLeft ? 'L' : 'R';
+    final hoverKey = '$tableName\u0000$columnName\u0000$side';
     final hovered = _hoverDot == hoverKey;
+    final keyName = fromLeft
+        ? 'er-connect-left-$tableName-$columnName'
+        : 'er-connect-$tableName-$columnName';
     final dot = Container(
       width: 9,
       height: 9,
@@ -1491,11 +1562,16 @@ class _RelationDesignerState extends State<RelationDesigner> {
           if (_hoverDot == hoverKey) setState(() => _hoverDot = null);
         },
         child: GestureDetector(
-          key: ValueKey('er-connect-$tableName-$columnName'),
+          key: ValueKey(keyName),
           behavior: HitTestBehavior.opaque,
           onPanDown: enabled ? (_) => setState(() => _dotPressed = true) : null,
           onPanStart: enabled
-              ? (details) => _startConnect(table, index, details.globalPosition)
+              ? (details) => _startConnect(
+                  table,
+                  index,
+                  details.globalPosition,
+                  fromLeft: fromLeft,
+                )
               : null,
           onPanUpdate: enabled
               ? (details) => _updateConnect(details.globalPosition)
@@ -1516,33 +1592,44 @@ class _RelationDesignerState extends State<RelationDesigner> {
     final relation = curve.relation;
     final relationKey = relation.key;
     final hovered = _hoverRelation == index;
+    // 标签降噪：完整关系标签默认不显示，hover 或选中该边才出现。
+    final visible = hovered || _selectedRelationKey == relationKey;
     return Positioned(
       left: curve.labelAnchor.dx,
       top: curve.labelAnchor.dy,
       child: FractionalTranslation(
         translation: const Offset(-0.5, -0.5),
-        child: GestureDetector(
-          key: ValueKey('er-relation-$relationKey'),
-          onTap: () => _openRelationDialog(relation),
-          child: MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: Container(
-              constraints: const BoxConstraints(maxWidth: 200),
-              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-              decoration: BoxDecoration(
-                color: hovered ? AppColors.focusRing : AppColors.panel,
-                border: Border.all(
-                  color: hovered ? AppColors.link : AppColors.border,
-                ),
-                borderRadius: BorderRadius.circular(3),
-              ),
-              child: Text(
-                relation.displayLabel,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 9.5,
-                  color: hovered ? AppColors.linkHover : AppColors.link,
+        child: IgnorePointer(
+          ignoring: !visible,
+          child: Opacity(
+            opacity: visible ? 1 : 0,
+            child: GestureDetector(
+              key: ValueKey('er-relation-$relationKey'),
+              onTap: () => _selectRelation(relation),
+              child: MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: Container(
+                  constraints: const BoxConstraints(maxWidth: 200),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: 1,
+                  ),
+                  decoration: BoxDecoration(
+                    color: hovered ? AppColors.focusRing : AppColors.panel,
+                    border: Border.all(
+                      color: hovered ? AppColors.link : AppColors.border,
+                    ),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Text(
+                    relation.displayLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 9.5,
+                      color: hovered ? AppColors.linkHover : AppColors.link,
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -1568,10 +1655,13 @@ class _RelationDesignerState extends State<RelationDesigner> {
     final collapsed = _collapsedJunctions.contains(junction);
     final hint = collapsed ? '展开中间表' : '折叠中间表';
     final label = pickText('多对多 · $junction', 'many-to-many · $junction');
+    // 标签降噪：多对多标签只在折叠状态或 hover 到这条线时显示。
+    final visible = collapsed || _hoverM2MKey == link.key;
     return _edgeLabel(
       left: _m2mLabelAnchor(link),
       tooltip: hint,
       keyValue: 'er-m2m-$junction',
+      visible: visible,
       background: AppColors.infoBg,
       borderColor: AppColors.infoBorder,
       child: Row(
@@ -1593,29 +1683,21 @@ class _RelationDesignerState extends State<RelationDesigner> {
     );
   }
 
-  /// 建议关系的虚线标签；点击即建立这一条建议外键（SQLite 只读）。
+  /// 建议关系的虚线标签：默认只显示小号「建议」胶囊，完整文案放 tooltip；
+  /// 点击即建立这一条建议外键（SQLite 只读）。
   Widget _suggestionLabel(ErRelationCurve curve) {
     final relation = curve.relation;
     final relationKey = relation.key;
+    final fullText = pickText('建议：', 'Suggested: ') + relation.displayLabel;
     return _edgeLabel(
       left: curve.labelAnchor,
-      tooltip: _isSqlite ? 'SQLite 不支持用 ALTER 新增外键' : '点击建立这条建议外键',
+      tooltip: fullText,
       keyValue: 'er-suggestion-$relationKey',
       background: AppColors.warnBg,
       borderColor: AppColors.warnBorder,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          Text('建议：', style: TextStyle(fontSize: 9, color: AppColors.warnText)),
-          Flexible(
-            child: Text(
-              relation.displayLabel,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 9, color: AppColors.warnText),
-            ),
-          ),
-        ],
+      child: Text(
+        '建议',
+        style: TextStyle(fontSize: 9, color: AppColors.warnText),
       ),
       onTap: _isSqlite ? null : () => _applySuggestions(only: relation),
     );
@@ -1630,31 +1712,41 @@ class _RelationDesignerState extends State<RelationDesigner> {
     required Color borderColor,
     required Widget child,
     VoidCallback? onTap,
+    bool visible = true,
   }) {
     return Positioned(
       left: left.dx,
       top: left.dy,
       child: FractionalTranslation(
         translation: const Offset(-0.5, -0.5),
-        child: Tooltip(
-          message: tooltip,
-          waitDuration: const Duration(milliseconds: 300),
-          child: MouseRegion(
-            cursor: onTap == null
-                ? SystemMouseCursors.basic
-                : SystemMouseCursors.click,
-            child: GestureDetector(
-              key: ValueKey(keyValue),
-              onTap: onTap,
-              child: Container(
-                constraints: const BoxConstraints(maxWidth: 210),
-                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                decoration: BoxDecoration(
-                  color: background,
-                  border: Border.all(color: borderColor),
-                  borderRadius: BorderRadius.circular(3),
+        child: IgnorePointer(
+          ignoring: !visible,
+          child: Opacity(
+            opacity: visible ? 1 : 0,
+            child: Tooltip(
+              message: tooltip,
+              waitDuration: const Duration(milliseconds: 300),
+              child: MouseRegion(
+                cursor: onTap == null
+                    ? SystemMouseCursors.basic
+                    : SystemMouseCursors.click,
+                child: GestureDetector(
+                  key: ValueKey(keyValue),
+                  onTap: onTap,
+                  child: Container(
+                    constraints: const BoxConstraints(maxWidth: 210),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: background,
+                      border: Border.all(color: borderColor),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: child,
+                  ),
                 ),
-                child: child,
               ),
             ),
           ),
@@ -1702,6 +1794,7 @@ class _ConnectDrag {
     required this.columnIndex,
     required this.source,
     required this.point,
+    required this.fromLeft,
   });
 
   final String table;
@@ -1709,11 +1802,15 @@ class _ConnectDrag {
   final Offset source;
   final Offset point;
 
+  /// 拖拽起点是字段行的左连接点（true）还是右连接点。
+  final bool fromLeft;
+
   _ConnectDrag copyWith({Offset? point}) => _ConnectDrag(
     table: table,
     columnIndex: columnIndex,
     source: source,
     point: point ?? this.point,
+    fromLeft: fromLeft,
   );
 }
 
@@ -1743,9 +1840,9 @@ class _TableChoice {
 
 /// 画布绘制：网格背景、三类关系曲线 + 目标端箭头、拖拽预览、放置目标高亮。
 ///
-/// 三类边：真实外键（实线 + 箭头）、中间表多对多（��线 + 箭头）、按列名推导的
-/// 建议关系（虚线 + 箭头）。边层绘制在节点之上，箭头落在目标卡片边框上，
-/// 不会被卡片遮住。
+/// 三类边：真实外键（实线 + 箭头）、中间表多对多（实线 + 箭头）、按列名推导的
+/// 建议关系（虚线 + 箭头）。边层先画、卡片后画：穿过卡片的线段被卡片自然遮挡，
+/// 箭头尖端落在卡片边界上，留在边界外的三角部分仍然可见。
 class _ErCanvasPainter extends CustomPainter {
   _ErCanvasPainter({
     required this.layout,
@@ -1755,6 +1852,7 @@ class _ErCanvasPainter extends CustomPainter {
     required this.m2mCurves,
     required this.drag,
     required this.hoveredRelation,
+    required this.hoveredM2MKey,
     required this.selectedRelationKey,
     required this.dropTarget,
   });
@@ -1766,6 +1864,7 @@ class _ErCanvasPainter extends CustomPainter {
   final List<ErRelationCurve> m2mCurves;
   final _ConnectDrag? drag;
   final int? hoveredRelation;
+  final String? hoveredM2MKey;
   final String? selectedRelationKey;
   final ErFieldRef? dropTarget;
 
@@ -1780,18 +1879,22 @@ class _ErCanvasPainter extends CustomPainter {
       _paintArrow(canvas, curve, AppColors.warnBorder, scale: _arrowScale);
     }
     for (var i = 0; i < m2mCurves.length; i++) {
+      final highlighted =
+          hoveredM2MKey != null &&
+          i < m2mLinks.length &&
+          m2mLinks[i].key == hoveredM2MKey;
       _paintSolidCurve(
         canvas,
         m2mCurves[i],
         AppColors.accent,
-        width: 2.0,
-        highlighted: false,
+        width: highlighted ? 3.0 : 2.0,
+        highlighted: highlighted,
       );
       _paintArrow(
         canvas,
         m2mCurves[i],
         AppColors.accent,
-        scale: _arrowScale * 1.1,
+        scale: _arrowScale * (highlighted ? 1.25 : 1.1),
       );
     }
     for (var i = 0; i < curves.length; i++) {

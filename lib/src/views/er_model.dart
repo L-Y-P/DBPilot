@@ -629,7 +629,8 @@ String erForeignKeyColumnType(ErDriver driver, String raw) {
 /// 表卡片的尺寸度量：画布排版与命中检测共用，保证画出来的行和点击的行一致。
 class ErNodeMetrics {
   const ErNodeMetrics({
-    this.cardWidth = 230,
+    // 非 compact 卡片略加宽（244），字段名 + 类型列更不容易互相挤压。
+    this.cardWidth = 244,
     this.headerHeight = 32,
     this.rowHeight = 24,
     this.bottomPadding = 6,
@@ -676,15 +677,29 @@ class ErNodeMetrics {
       columnIndex * rowHeight +
       rowHeight / 2;
 
-  /// 字段行右侧连接点的圆心（拖拽起点 / 箭头起点）。
+  /// 字段行右侧连接点的圆心（右端拖拽起点）。
   Offset connectionPoint(Offset node, int columnIndex) => Offset(
     node.dx + cardWidth - borderInset - circleInset,
     rowCenterY(node, columnIndex),
   );
 
-  /// 字段行左边缘（箭头终点）。
-  Offset leftAnchor(Offset node, int columnIndex) =>
+  /// 字段行左侧连接点的圆心（左端拖拽起点）。
+  Offset leftConnectionPoint(Offset node, int columnIndex) => Offset(
+    node.dx + borderInset + circleInset,
+    rowCenterY(node, columnIndex),
+  );
+
+  /// 字段行左边界（左进锚点；箭头尖端正好落在卡片边界上）。
+  Offset leftBoundary(Offset node, int columnIndex) =>
       Offset(node.dx, rowCenterY(node, columnIndex));
+
+  /// 字段行右边界（右出锚点 / 镜像关系的箭头尖端）。
+  Offset rightBoundary(Offset node, int columnIndex) =>
+      Offset(node.dx + cardWidth, rowCenterY(node, columnIndex));
+
+  /// 兼容旧名：左边界锚点。
+  Offset leftAnchor(Offset node, int columnIndex) =>
+      leftBoundary(node, columnIndex);
 }
 
 /// 画布布局：每张表的左上角坐标 + 尺寸度量。
@@ -752,6 +767,16 @@ class ErCanvasLayout {
     final index = node.indexOfColumn(column);
     if (index == null) return null;
     return metrics.connectionPoint(position, index);
+  }
+
+  /// 字段行左侧连接点；列不存在时返回 null。
+  Offset? leftConnectionPoint(String table, String column) {
+    final node = tableNamed(table);
+    final position = positions[table];
+    if (node == null || position == null) return null;
+    final index = node.indexOfColumn(column);
+    if (index == null) return null;
+    return metrics.leftConnectionPoint(position, index);
   }
 
   /// 字段行左边缘锚点；列不存在时返回 null。
@@ -833,6 +858,208 @@ Map<String, Offset> autoErLayout(
   return positions;
 }
 
+/// 分层自动布局：按「已有外键 / 建议关系 / 中间表多对多」的父 → 子方向
+/// 从左到右分层，层内按相邻层邻居的重心排序减少交叉。
+///
+/// 首载 / 自动带入 / 「自动布局」按钮都走这里；用户拖动过的节点由调用方保留
+/// 坐标（这个函数只负责给出建议坐标）。没有关系边时所有表都在第 0 层。
+Map<String, Offset> layeredErLayout(
+  List<ErTable> tables,
+  List<ErRelation> relations, {
+  required double viewportWidth,
+  ErNodeMetrics metrics = const ErNodeMetrics(),
+  double gapX = 72,
+  double gapY = 40,
+  double margin = 24,
+}) {
+  if (tables.isEmpty) return <String, Offset>{};
+  final names = <String>[for (final table in tables) table.name];
+  final nameSet = names.toSet();
+  final tableByName = <String, ErTable>{
+    for (final table in tables) table.name: table,
+  };
+  int columnIndex(ErTable? table, String column) {
+    if (table == null || column.isEmpty) return 0;
+    return table.indexOfColumn(column) ?? 0;
+  }
+
+  final edges = <_LayerEdge>[];
+  for (final relation in relations) {
+    if (relation.localTable == relation.refTable) continue;
+    if (!nameSet.contains(relation.localTable)) continue;
+    if (!nameSet.contains(relation.refTable)) continue;
+    edges.add(
+      _LayerEdge(
+        relation.localTable,
+        relation.refTable,
+        sourceColumnIndex: columnIndex(
+          tableByName[relation.localTable],
+          relation.localColumn,
+        ),
+        targetColumnIndex: columnIndex(
+          tableByName[relation.refTable],
+          relation.refColumn,
+        ),
+      ),
+    );
+  }
+  // 1) 最长路径分层（限制迭代次数，允许互相引用的环）。
+  final layer = <String, int>{for (final name in names) name: 0};
+  for (var pass = 0; pass < names.length; pass++) {
+    var changed = false;
+    for (final edge in edges) {
+      final next = (layer[edge.from] ?? 0) + 1;
+      if ((layer[edge.to] ?? 0) < next) {
+        layer[edge.to] = next;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  final minLayer = layer.values.reduce(math.min);
+  for (final name in names) {
+    layer[name] = (layer[name] ?? 0) - minLayer;
+  }
+  final maxLayer = layer.values.reduce(math.max);
+  final layers = <int, List<String>>{
+    for (var i = 0; i <= maxLayer; i++) i: <String>[],
+  };
+  for (final name in names) {
+    layers[layer[name]!]!.add(name);
+  }
+  // 2) 层内排序：重心为主 + 「来源列 / 目标列顺序」做 tie-break，双向扫描 2 轮。
+  //
+  // 只做单向左→右 barycenter 时，同一张源表（如 order_items）发出的两条边
+  // 在下一层会得到相同重心，退化成按表加入顺序排目标，导致 order_id→orders
+  // 与 product_id→products 上下颠倒交叉成 X。这里把「上一行位置 + 源列序号」
+  // 组成 port 键：order_id 在 product_id 上面，orders 就排在 products 上面。
+  final incoming = <String, List<_LayerEdge>>{};
+  final outgoing = <String, List<_LayerEdge>>{};
+  for (final edge in edges) {
+    incoming.putIfAbsent(edge.to, () => <_LayerEdge>[]).add(edge);
+    outgoing.putIfAbsent(edge.from, () => <_LayerEdge>[]).add(edge);
+  }
+  final orderIndex = <String, int>{};
+  void refreshOrderIndex(int layerIndex) {
+    final list = layers[layerIndex]!;
+    for (var i = 0; i < list.length; i++) {
+      orderIndex[list[i]] = i;
+    }
+  }
+
+  void sortLayer(int layerIndex, {required bool fromLeft}) {
+    final current = layers[layerIndex]!;
+    if (current.length > 1) {
+      final keys = <String, _LayerSortKey>{};
+      for (final name in current) {
+        final neighbourEdges =
+            (fromLeft ? incoming[name] : outgoing[name]) ??
+            const <_LayerEdge>[];
+        final neighbourPositions = <double>[];
+        final ports = <double>[];
+        for (final edge in neighbourEdges) {
+          final neighbour = fromLeft ? edge.from : edge.to;
+          final position = orderIndex[neighbour];
+          if (position == null) continue;
+          neighbourPositions.add(position.toDouble());
+          final columnIndex = fromLeft
+              ? edge.sourceColumnIndex
+              : edge.targetColumnIndex;
+          ports.add(position.toDouble() * 1000 + columnIndex);
+        }
+        keys[name] = _LayerSortKey(
+          barycenter: neighbourPositions.isEmpty
+              ? double.infinity
+              : neighbourPositions.reduce((a, b) => a + b) /
+                    neighbourPositions.length,
+          port: ports.isEmpty
+              ? double.infinity
+              : ports.reduce((a, b) => a + b) / ports.length,
+          tableOrder: names.indexOf(name),
+        );
+      }
+      current.sort((a, b) => keys[a]!.compareTo(keys[b]!));
+    }
+    refreshOrderIndex(layerIndex);
+  }
+
+  refreshOrderIndex(0);
+  for (var round = 0; round < 2; round++) {
+    for (var i = 1; i <= maxLayer; i++) {
+      sortLayer(i, fromLeft: true);
+    }
+    for (var i = maxLayer - 1; i >= 0; i--) {
+      sortLayer(i, fromLeft: false);
+    }
+  }
+  // 3) 坐标：每层垂直居中，水平从 margin（或居中）开始逐层递增。
+  final layerHeights = <int, double>{};
+  for (var i = 0; i <= maxLayer; i++) {
+    final list = layers[i]!;
+    var height = 0.0;
+    for (var j = 0; j < list.length; j++) {
+      if (j > 0) height += gapY;
+      height += metrics.heightOf(tableByName[list[j]]!);
+    }
+    layerHeights[i] = height;
+  }
+  final maxHeight = layerHeights.values.reduce(math.max);
+  final totalWidth = maxLayer * (metrics.cardWidth + gapX) + metrics.cardWidth;
+  final left = totalWidth + margin * 2 < viewportWidth
+      ? (viewportWidth - totalWidth) / 2
+      : margin;
+  final positions = <String, Offset>{};
+  for (var i = 0; i <= maxLayer; i++) {
+    final list = layers[i]!;
+    var y = margin + (maxHeight - (layerHeights[i] ?? 0)) / 2;
+    final x = left + i * (metrics.cardWidth + gapX);
+    for (final name in list) {
+      positions[name] = Offset(x, y);
+      y += metrics.heightOf(tableByName[name]!) + gapY;
+    }
+  }
+  return positions;
+}
+
+class _LayerEdge {
+  const _LayerEdge(
+    this.from,
+    this.to, {
+    required this.sourceColumnIndex,
+    required this.targetColumnIndex,
+  });
+
+  final String from;
+  final String to;
+
+  /// 源 / 目标字段在各自表里的行号：层内排序 tie-break 用（同一源表的
+  /// order_id 在 product_id 上面时，目标 orders 也应排在 products 上面）。
+  final int sourceColumnIndex;
+  final int targetColumnIndex;
+}
+
+/// 层内排序键：重心（相邻层邻居平均位置）→ port 键（邻居位置 + 列序号）
+/// → 表加入顺序，保证排序稳定且同源相邻列的边不交叉。
+class _LayerSortKey {
+  const _LayerSortKey({
+    required this.barycenter,
+    required this.port,
+    required this.tableOrder,
+  });
+
+  final double barycenter;
+  final double port;
+  final int tableOrder;
+
+  int compareTo(_LayerSortKey other) {
+    var result = barycenter.compareTo(other.barycenter);
+    if (result != 0) return result;
+    result = port.compareTo(other.port);
+    if (result != 0) return result;
+    return tableOrder.compareTo(other.tableOrder);
+  }
+}
+
 /// 两点到线段的距离（箭头命中检测的基础）。
 double distanceToSegment(Offset point, Offset start, Offset end) {
   final dx = end.dx - start.dx;
@@ -846,7 +1073,9 @@ double distanceToSegment(Offset point, Offset start, Offset end) {
   return (point - projection).distance;
 }
 
-/// 一条关系的三次贝塞尔曲线：起点在本表字段右侧，终点在引用表字段左侧。
+/// 一条关系的三次贝塞尔曲线：默认「左进右出」——源表在左时从源字段右边界
+/// 出发、进入目标字段左边界；源表在右时镜像。控制点用水平切线，端点始终落在
+/// 卡片边界上（箭头尖端在边界、不被卡片遮住）。
 ///
 /// 同表自引用（如 manager_id → employees.id）从右侧出、绕到右侧回，避免线
 /// 穿过卡片。
@@ -899,8 +1128,61 @@ class ErRelationCurve {
   }
 }
 
-/// 按当前布局计算一条关系的曲线；任一端不在画布上时返回 null。
-ErRelationCurve? relationCurve(ErCanvasLayout layout, ErRelation relation) {
+/// 一条关系两端使用的锚点侧（右出/左进，或镜像）。
+class ErAnchorSide {
+  const ErAnchorSide({required this.startOnRight, required this.endOnRight});
+
+  /// 起点是否用卡片右边界（true）还是左边界。
+  final bool startOnRight;
+
+  /// 终点是否用卡片右边界（true）还是左边界。
+  final bool endOnRight;
+
+  ErAnchorSide get mirrored =>
+      ErAnchorSide(startOnRight: !startOnRight, endOnRight: !endOnRight);
+
+  @override
+  bool operator ==(Object other) =>
+      other is ErAnchorSide &&
+      other.startOnRight == startOnRight &&
+      other.endOnRight == endOnRight;
+
+  @override
+  int get hashCode => Object.hash(startOnRight, endOnRight);
+
+  @override
+  String toString() =>
+      'ErAnchorSide(startOnRight: $startOnRight, endOnRight: $endOnRight)';
+}
+
+/// 默认锚点「左进右出」：源卡片在目标左侧时源右边界出、目标左边界进；
+/// 源在右侧时镜像；同 x（或重叠）时按上下选更顺的一侧（源在上方走默认路由）。
+ErAnchorSide relationAnchorSide(ErCanvasLayout layout, ErRelation relation) {
+  final localPosition = layout.positions[relation.localTable];
+  final refPosition = layout.positions[relation.refTable];
+  if (localPosition == null || refPosition == null) {
+    return const ErAnchorSide(startOnRight: true, endOnRight: false);
+  }
+  final metrics = layout.metrics;
+  final localCenter = localPosition.dx + metrics.cardWidth / 2;
+  final refCenter = refPosition.dx + metrics.cardWidth / 2;
+  final sourceOnLeft = localCenter == refCenter
+      ? localPosition.dy <= refPosition.dy
+      : localCenter < refCenter;
+  return ErAnchorSide(startOnRight: sourceOnLeft, endOnRight: !sourceOnLeft);
+}
+
+/// 按当前布局计算一条关系的曲线（默认锚点「左进右出」）。
+///
+/// 源卡片在目标左侧：源字段右边界出、目标字段左边界进（箭头在左端）；
+/// 源在右侧镜像（左边界出、右边界进）；自引用从右侧出、右侧回。
+/// [startFan] / [endFan] 给同一字段的多条边做垂直扇出，避免叠成一条线。
+ErRelationCurve? relationCurve(
+  ErCanvasLayout layout,
+  ErRelation relation, {
+  double startFan = 0,
+  double endFan = 0,
+}) {
   final localTable = layout.tableNamed(relation.localTable);
   final refTable = layout.tableNamed(relation.refTable);
   final localPosition = layout.positions[relation.localTable];
@@ -914,10 +1196,12 @@ ErRelationCurve? relationCurve(ErCanvasLayout layout, ErRelation relation) {
   final metrics = layout.metrics;
   final localIndex = localTable.indexOfColumn(relation.localColumn) ?? 0;
   final refIndex = refTable.indexOfColumn(relation.refColumn) ?? 0;
-  final start = relColumnFocus(localPosition, localIndex, metrics);
-  final end = relColumnFocus(refPosition, refIndex, metrics);
+  // 扇出偏移作用在锚点 y 上（同一字段的多条边上下错开），切线保持水平。
   if (relation.localTable == relation.refTable) {
-    // 自引用：右侧出、右侧回。
+    final start =
+        metrics.rightBoundary(localPosition, localIndex) + Offset(0, startFan);
+    final end =
+        metrics.rightBoundary(refPosition, refIndex) + Offset(0, endFan);
     return ErRelationCurve(
       relation: relation,
       start: start,
@@ -926,8 +1210,19 @@ ErRelationCurve? relationCurve(ErCanvasLayout layout, ErRelation relation) {
       control2: end + const Offset(72, 0),
     );
   }
+  final side = relationAnchorSide(layout, relation);
+  final start =
+      (side.startOnRight
+          ? metrics.rightBoundary(localPosition, localIndex)
+          : metrics.leftBoundary(localPosition, localIndex)) +
+      Offset(0, startFan);
+  final end =
+      (side.endOnRight
+          ? metrics.rightBoundary(refPosition, refIndex)
+          : metrics.leftBoundary(refPosition, refIndex)) +
+      Offset(0, endFan);
   final dx = end.dx - start.dx;
-  if (dx >= 48) {
+  if (dx.abs() >= 48) {
     return ErRelationCurve(
       relation: relation,
       start: start,
@@ -936,32 +1231,57 @@ ErRelationCurve? relationCurve(ErCanvasLayout layout, ErRelation relation) {
       control2: end - Offset(dx / 2, 0),
     );
   }
-  // 目标在左侧（回绕）：从右侧绕出去再回来。
+  // 水平间距太小（两卡几乎重叠）：先向中间绕一小圈再进，避免直线穿过卡片。
+  final sign = side.startOnRight ? 1.0 : -1.0;
   return ErRelationCurve(
     relation: relation,
     start: start,
     end: end,
-    control1: start + const Offset(84, 0),
-    control2: end - const Offset(84, 0),
-  );
-}
-
-/// 关系起点 / 终点在卡片上的锚点（行不存在时落在卡片中部）。
-Offset relColumnFocus(Offset node, int columnIndex, ErNodeMetrics metrics) {
-  return Offset(
-    node.dx + metrics.cardWidth - metrics.borderInset - metrics.circleInset,
-    metrics.rowCenterY(node, columnIndex),
+    control1: start + Offset(sign * 84, 0),
+    control2: end - Offset(sign * 84, 0),
   );
 }
 
 /// 画布上的全部关系曲线（任一端不在画布上的关系被跳过）。
+///
+/// 同一字段（同一行锚点）有多条边时按 [fanGap] 做垂直扇出：起点/终点分组，
+/// 组内按顺序上下分布，避免多条线叠成一条。
 List<ErRelationCurve> relationCurves(
   ErCanvasLayout layout,
-  List<ErRelation> relations,
-) {
-  final out = <ErRelationCurve>[];
+  List<ErRelation> relations, {
+  double fanGap = 12,
+}) {
+  final base = <ErRelationCurve>[];
   for (final relation in relations) {
     final curve = relationCurve(layout, relation);
+    if (curve != null) base.add(curve);
+  }
+  if (base.length <= 1) return base;
+  String pointKey(Offset point) => '${point.dx.round()}:${point.dy.round()}';
+  final startGroups = <String, List<int>>{};
+  final endGroups = <String, List<int>>{};
+  for (var i = 0; i < base.length; i++) {
+    startGroups.putIfAbsent(pointKey(base[i].start), () => <int>[]).add(i);
+    endGroups.putIfAbsent(pointKey(base[i].end), () => <int>[]).add(i);
+  }
+  final out = <ErRelationCurve>[];
+  for (var i = 0; i < base.length; i++) {
+    final startGroup = startGroups[pointKey(base[i].start)]!;
+    final endGroup = endGroups[pointKey(base[i].end)]!;
+    final startIndex = startGroup.indexOf(i);
+    final endIndex = endGroup.indexOf(i);
+    final startFan = startGroup.length <= 1
+        ? 0.0
+        : (startIndex - (startGroup.length - 1) / 2) * fanGap;
+    final endFan = endGroup.length <= 1
+        ? 0.0
+        : (endIndex - (endGroup.length - 1) / 2) * fanGap;
+    final curve = relationCurve(
+      layout,
+      base[i].relation,
+      startFan: startFan,
+      endFan: endFan,
+    );
     if (curve != null) out.add(curve);
   }
   return out;
@@ -1145,7 +1465,7 @@ ErRelationCurve? manyToManyCurve(ErCanvasLayout layout, ErManyToManyLink link) {
   }
   final metrics = layout.metrics;
   final start = Offset(
-    positionA.dx + metrics.cardWidth - metrics.borderInset,
+    positionA.dx + metrics.cardWidth,
     positionA.dy + metrics.heightOf(tableA) / 2,
   );
   final end = Offset(positionB.dx, positionB.dy + metrics.heightOf(tableB) / 2);

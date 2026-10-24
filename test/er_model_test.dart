@@ -396,7 +396,8 @@ void main() {
       expect(positions['a']!.dy, positions['b']!.dy);
       expect(positions['a']!.dx, lessThan(positions['b']!.dx));
       expect(positions['b']!.dx, lessThan(positions['c']!.dx));
-      expect(positions['b']!.dx - positions['a']!.dx, 230 + 48);
+      // 非 compact 卡片宽 244（略加宽，类型列更可读）。
+      expect(positions['b']!.dx - positions['a']!.dx, 244 + 48);
     });
 
     test('窄画布折行，行距取该行最高卡片', () {
@@ -462,7 +463,7 @@ void main() {
       expect(point, isNotNull);
       expect(point!.dy, layout.metrics.rowCenterY(positions['books']!, 1));
       // 卡片边框会把内容缩进 1px，连接点建在内容右边缘。
-      expect(point.dx, 400 + 230 - 1 - 8);
+      expect(point.dx, 400 + 244 - 1 - 8);
       final anchor = layout.refAnchor('authors', 'id');
       expect(anchor!.dx, 24);
       expect(layout.connectionPoint('books', 'missing'), isNull);
@@ -542,9 +543,10 @@ void main() {
       );
       final curve = relationCurve(selfLayout, relation);
       expect(curve, isNotNull);
-      expect(curve!.start.dx, 230 - 1 - 8);
-      expect(curve.end.dx, 230 - 1 - 8);
-      expect(curve.control1.dx, greaterThan(230));
+      // 自引用：右侧边界出、右侧边界回，箭头在卡片外侧。
+      expect(curve!.start.dx, 244);
+      expect(curve.end.dx, 244);
+      expect(curve.control1.dx, greaterThan(244));
     });
   });
 
@@ -581,8 +583,27 @@ void main() {
       expect(head.left.dy, isNot(head.right.dy));
     });
 
-    test('目标在左侧时箭头仍指向目标（底边在尖端左侧）', () {
-      final reversed = ErCanvasLayout(
+    test('默认左进右出：源在左 → 源右边界出、目标左边界进', () {
+      const metrics = ErNodeMetrics();
+      const relation = ErRelation(
+        localTable: 'a',
+        localColumn: 'id',
+        refTable: 'b',
+        refColumn: 'id',
+      );
+      final side = relationAnchorSide(layout, relation);
+      expect(side.startOnRight, isTrue);
+      expect(side.endOnRight, isFalse);
+      final curve = relationCurve(layout, relation)!;
+      expect(curve.start, metrics.rightBoundary(const Offset(24, 24), 0));
+      expect(curve.end, metrics.leftBoundary(const Offset(400, 24), 0));
+      // 水平切线：控制点与端点同高。
+      expect(curve.control1.dy, curve.start.dy);
+      expect(curve.control2.dy, curve.end.dy);
+    });
+
+    test('源在右侧镜像：源左边界出、目标右边界进，箭头朝左', () {
+      final mirrored = ErCanvasLayout(
         tables: tables,
         positions: <String, Offset>{
           'a': const Offset(400, 24),
@@ -595,10 +616,74 @@ void main() {
         refTable: 'b',
         refColumn: 'id',
       );
-      final curve = relationCurve(reversed, relation)!;
+      final side = relationAnchorSide(mirrored, relation);
+      expect(side.startOnRight, isFalse);
+      expect(side.endOnRight, isTrue);
+      final curve = relationCurve(mirrored, relation)!;
+      expect(curve.start.dx, 400); // 源左边界
+      expect(curve.end.dx, 24 + 244); // 目标右边界
       final head = ErArrowHead.forCurve(curve)!;
       expect(head.tip, curve.end);
-      expect(head.base.dx, lessThan(head.tip.dx));
+      expect(head.direction.dx, lessThan(0));
+      expect(head.base.dx, greaterThan(head.tip.dx));
+    });
+
+    test('同一水平位置按上下选更顺的一侧', () {
+      final stacked = ErCanvasLayout(
+        tables: tables,
+        positions: <String, Offset>{
+          'a': const Offset(100, 24),
+          'b': const Offset(100, 300),
+        },
+      );
+      const relation = ErRelation(
+        localTable: 'a',
+        localColumn: 'id',
+        refTable: 'b',
+        refColumn: 'id',
+      );
+      // 源在上方 → 走默认「右出左进」，不用绕圈。
+      final side = relationAnchorSide(stacked, relation);
+      expect(side.startOnRight, isTrue);
+      expect(side.endOnRight, isFalse);
+    });
+
+    test('同一字段多条边扇出（控制点上下错开）', () {
+      final three = <ErTable>[
+        table('a', <ErColumn>[column('id', type: 'INTEGER', primary: true)]),
+        table('b', <ErColumn>[column('id', type: 'INTEGER', primary: true)]),
+        table('c', <ErColumn>[column('id', type: 'INTEGER', primary: true)]),
+      ];
+      final wide = ErCanvasLayout(
+        tables: three,
+        positions: <String, Offset>{
+          'a': const Offset(24, 24),
+          'b': const Offset(400, 24),
+          'c': const Offset(400, 200),
+        },
+      );
+      const r1 = ErRelation(
+        localTable: 'a',
+        localColumn: 'id',
+        refTable: 'b',
+        refColumn: 'id',
+      );
+      const r2 = ErRelation(
+        localTable: 'a',
+        localColumn: 'id',
+        refTable: 'c',
+        refColumn: 'id',
+      );
+      final curves = relationCurves(wide, <ErRelation>[r1, r2]);
+      expect(curves.length, 2);
+      // 起点 x 相同（同一字段右锚点），y 上下扇开；切线仍然水平。
+      expect(curves[0].start.dx, curves[1].start.dx);
+      expect(
+        (curves[0].start.dy - curves[1].start.dy).abs(),
+        closeTo(12, 0.001),
+      );
+      expect(curves[0].control1.dy, curves[0].start.dy);
+      expect(curves[1].control1.dy, curves[1].start.dy);
     });
   });
 
@@ -695,7 +780,7 @@ void main() {
       final link = manyToManyLinks(junctions).single;
       final curve = manyToManyCurve(layout, link);
       expect(curve, isNotNull);
-      expect(curve!.start.dx, 24 + 230 - 1);
+      expect(curve!.start.dx, 24 + 244);
       expect(curve.end.dx, 400);
       expect(
         curve.start.dy,
@@ -934,6 +1019,107 @@ void main() {
         'indexes': <dynamic>[],
       });
       expect(unique, isEmpty);
+    });
+  });
+
+  group('分层自动布局', () {
+    ErTable node(String name) =>
+        table(name, <ErColumn>[column('id', type: 'INTEGER', primary: true)]);
+    ErRelation edge(String from, String to) => ErRelation(
+      localTable: from,
+      localColumn: 'id',
+      refTable: to,
+      refColumn: 'id',
+    );
+
+    test('外键方向从左到右分层（输入顺序无关）', () {
+      final tables = <ErTable>[node('c'), node('a'), node('b')];
+      final positions = layeredErLayout(tables, <ErRelation>[
+        edge('a', 'b'),
+        edge('b', 'c'),
+      ], viewportWidth: 1200);
+      expect(positions['a']!.dx, lessThan(positions['b']!.dx));
+      expect(positions['b']!.dx, lessThan(positions['c']!.dx));
+    });
+
+    test('有环（中间表双向边）也能收敛', () {
+      final positions = layeredErLayout(
+        <ErTable>[node('a'), node('b')],
+        <ErRelation>[edge('a', 'b'), edge('b', 'a')],
+        viewportWidth: 800,
+      );
+      expect(positions.length, 2);
+      expect(positions['a']!.dx, isNot(positions['b']!.dx));
+    });
+
+    test('层内重心排序减少交叉：a→d、b→c 时 d 排在 c 上方', () {
+      final tables = <ErTable>[node('a'), node('b'), node('c'), node('d')];
+      final positions = layeredErLayout(tables, <ErRelation>[
+        edge('a', 'd'),
+        edge('b', 'c'),
+      ], viewportWidth: 1200);
+      expect(positions['d']!.dy, lessThan(positions['c']!.dy));
+    });
+
+    test('没有关系边时全部第 0 层，竖直排列', () {
+      final positions = layeredErLayout(
+        <ErTable>[node('a'), node('b')],
+        const <ErRelation>[],
+        viewportWidth: 900,
+      );
+      expect(positions['a']!.dx, positions['b']!.dx);
+      expect(positions['a']!.dy, lessThan(positions['b']!.dy));
+    });
+
+    test('同一源表两条建议边按源列顺序排目标，不交叉', () {
+      ErTable tableWith(String name, List<ErColumn> extra) => table(
+        name,
+        <ErColumn>[column('id', type: 'INTEGER', primary: true), ...extra],
+      );
+      final users = tableWith('users', const <ErColumn>[]);
+      final categories = tableWith('categories', const <ErColumn>[]);
+      final products = tableWith('products', <ErColumn>[
+        column('category_id', type: 'INTEGER'),
+      ]);
+      final orders = tableWith('orders', <ErColumn>[
+        column('user_id', type: 'INTEGER'),
+      ]);
+      final orderItems = tableWith('order_items', <ErColumn>[
+        column('order_id', type: 'INTEGER'),
+        column('product_id', type: 'INTEGER'),
+      ]);
+      // 与 golden 截图一致的 seed 顺序：users/categories/products/orders/order_items。
+      final tables = <ErTable>[users, categories, products, orders, orderItems];
+      final suggestions = suggestRelations(
+        tables: tables,
+        relationsByTable: <String, List<ErRelation>>{},
+      );
+      expect(suggestions.length, 4);
+      final positions = layeredErLayout(
+        tables,
+        suggestions,
+        viewportWidth: 1600,
+      );
+      // 分层：order_items 最左，orders/products 同层，users/categories 最右。
+      expect(positions['order_items']!.dx, lessThan(positions['orders']!.dx));
+      expect(positions['orders']!.dx, positions['products']!.dx);
+      expect(positions['products']!.dx, lessThan(positions['users']!.dx));
+      // 层内：order_id 在 order_items 第 1 行、product_id 第 2 行，
+      // 所以 orders 必须排在 products 上面（否则两条建议边交叉成 X）。
+      expect(positions['orders']!.dy, lessThan(positions['products']!.dy));
+      expect(positions['users']!.dy, lessThan(positions['categories']!.dy));
+    });
+
+    test('层距 = 卡片宽 + 间距', () {
+      final positions = layeredErLayout(
+        <ErTable>[node('a'), node('b')],
+        <ErRelation>[edge('a', 'b')],
+        viewportWidth: 1200,
+      );
+      expect(
+        positions['b']!.dx - positions['a']!.dx,
+        const ErNodeMetrics().cardWidth + 72,
+      );
     });
   });
 }

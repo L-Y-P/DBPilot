@@ -969,6 +969,51 @@ void main() {
     expect(state.createdTablesForTest, <String>['hook_people']);
     expect(await countRows(tester, 'hook_people'), 3);
   });
+
+  testWidgets('类型下拉：中文说人话，英文显示 SQL 类型', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final csvPath = await tester.runAsync(
+        () => writeFile('typed.csv', 'id,name\n1,Alice\n2,Bob\n'));
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    addTearDown(() => I18n.setLang(AppLang.zh));
+    final stateKey = GlobalKey<QuickCreateTableWizardState>();
+    await tester.pumpWidget(MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: buildAppTheme(),
+      home: Scaffold(
+        body: Builder(
+          builder: (context) => Btn(
+            'open-typed',
+            onPressed: () => showQuickCreateTableWizard(
+              context,
+              database: 'main',
+              notice: notice,
+              initialPath: csvPath,
+              stateKey: stateKey,
+            ),
+          ),
+        ),
+      ),
+    ));
+    await tester.tap(find.text('open-typed'));
+    await settle(tester, rounds: 18);
+    final state = stateKey.currentState!;
+    await tester.runAsync(state.advanceForTest);
+    await settle(tester, rounds: 24);
+    expect(state.stepForTest, 1);
+    // 中文界面：类型控件说人话，不再直接显示 SQL 关键字。
+    expect(find.text('整数'), findsWidgets);
+    expect(find.text('文本'), findsWidgets);
+    // 英文界面：回到原始 SQL 类型。
+    I18n.setLang(AppLang.en);
+    await settle(tester, rounds: 6);
+    expect(find.text('INTEGER'), findsWidgets);
+    expect(find.text('TEXT'), findsWidgets);
+  });
 }
 
 /// 生成一份最小可用的 SpreadsheetML（Excel 2003 XML）工作簿文本。

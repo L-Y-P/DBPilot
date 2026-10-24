@@ -16,6 +16,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rust_myadmin_desktop/src/api.dart';
 import 'package:rust_myadmin_desktop/src/app_state.dart';
+import 'package:rust_myadmin_desktop/src/i18n.dart';
 import 'package:rust_myadmin_desktop/src/rust/frb_generated.dart';
 import 'package:rust_myadmin_desktop/src/theme.dart';
 import 'package:rust_myadmin_desktop/src/views/create_table_dialog.dart';
@@ -176,5 +177,39 @@ void main() {
     // The designer closes first, then hands over to the wizard callback.
     expect(find.byType(CreateTableDialog), findsNothing);
     expect(quickCreateCalled, isTrue);
+  });
+
+  testWidgets('类型下拉：中文说人话，英文显示 SQL 类型', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(() => I18n.setLang(AppLang.zh));
+
+    await tester.pumpWidget(host());
+    await settle(tester);
+
+    // 中文界面：关闭态是中文类型名（不是 TEXT / INTEGER 这类关键字）。
+    expect(
+      find.byWidgetPredicate((widget) =>
+          widget is Text &&
+          const <String>['整数', '大整数', '文本', '小数', '日期时间']
+              .contains(widget.data)),
+      findsWidgets,
+    );
+    expect(find.text('TEXT'), findsNothing);
+
+    I18n.setLang(AppLang.en);
+    // 这个 host 没有语言监听，重新构建一次让控件按新语言渲染。
+    await tester.pumpWidget(host());
+    await settle(tester);
+    // 英文界面：回到原始 SQL 类型。
+    expect(
+      find.byWidgetPredicate((widget) =>
+          widget is Text &&
+          const <String>['INTEGER', 'BIGINT', 'TEXT', 'REAL', 'NUMERIC']
+              .contains(widget.data)),
+      findsWidgets,
+    );
   });
 }

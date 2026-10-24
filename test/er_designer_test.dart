@@ -143,7 +143,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-reviews')), findsOneWidget);
     expect(find.text('books.author_id → authors.id'), findsOneWidget);
     expect(find.text('reviews.book_id → books.id'), findsOneWidget);
-    expect(find.text('已加入 3/5'), findsOneWidget);
+    expect(find.text('已加入 3/10'), findsOneWidget);
 
     // 移除 books：它的外键边、以及 reviews → books 的边都不再显示。
     await tester.tap(find.byKey(const ValueKey('er-remove-books')));
@@ -151,7 +151,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
     expect(find.text('books.author_id → authors.id'), findsNothing);
     expect(find.text('reviews.book_id → books.id'), findsNothing);
-    expect(find.text('已加入 2/5'), findsOneWidget);
+    expect(find.text('已加入 2/10'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -162,6 +162,7 @@ void main() {
         RelationDesigner(
           database: 'main',
           initialTables: const <String>['t1', 't2', 't3', 't4', 't5', 't6'],
+          maxTables: 5,
           height: 520,
         ),
       ),
@@ -192,7 +193,7 @@ void main() {
     expect(find.text('还没有添加表'), findsOneWidget);
     expect(find.text('添加表后，从字段右侧的圆点拖到另一张表的字段即可创建外键'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
-    expect(find.text('已加入 0/5'), findsOneWidget);
+    expect(find.text('已加入 0/10'), findsOneWidget);
   });
 
   testWidgets('seed 表自动带入关联表；可撤销且不自动加回', (tester) async {
@@ -210,7 +211,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
     expect(find.byKey(const ValueKey('er-node-books')), findsOneWidget);
     expect(find.byKey(const ValueKey('er-node-reviews')), findsOneWidget);
-    expect(find.text('已加入 3/5'), findsOneWidget);
+    expect(find.text('已加入 3/10'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-auto-added-hint')), findsOneWidget);
     expect(find.text('已自动加入关联表：books、reviews'), findsOneWidget);
     // 自动带入的外键直接画出来。
@@ -221,7 +222,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
     expect(find.byKey(const ValueKey('er-node-reviews')), findsNothing);
     expect(find.byKey(const ValueKey('er-auto-added-hint')), findsNothing);
-    expect(find.text('已加入 1/5'), findsOneWidget);
+    expect(find.text('已加入 1/10'), findsOneWidget);
 
     // 手动再加一张无外键的表：撤销掉的关联表不能被自动带回来。
     await tester.tap(find.byKey(const ValueKey('er-add-table')));
@@ -245,6 +246,7 @@ void main() {
         RelationDesigner(
           database: 'main',
           initialTables: const <String>['c1'],
+          maxTables: 5,
           height: 520,
         ),
       ),
@@ -323,11 +325,33 @@ void main() {
     );
     expect(find.byKey(const ValueKey('er-apply-suggestions')), findsOneWidget);
     expect(find.text('建立建议外键 (1)'), findsOneWidget);
-    // SQLite 不能 ALTER 加外键 → 批量按钮禁用（建议只读展示）。
+    // SQLite 不能 ALTER 加外键，但按钮仍然可点：点击给出明确说明（不再静默禁用）。
     final applyButton = tester.widget<Btn>(
       find.byKey(const ValueKey('er-apply-suggestions')),
     );
-    expect(applyButton.onPressed, isNull);
+    expect(applyButton.onPressed, isNotNull);
+    await tester.tap(find.byKey(const ValueKey('er-apply-suggestions')));
+    await settle(tester);
+    expect(find.text('SQLite 不支持用 ALTER 新增外键'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('dialog-close')));
+    await settle(tester, rounds: 2);
+
+    // 点击「建议」胶囊（等价点击建议虚线）同样给出 SQLite 说明，而不是无反应。
+    await tester.tap(
+      find.byKey(const ValueKey('er-suggestion-members.shop_id>shops.id')),
+    );
+    await settle(tester);
+    expect(find.text('SQLite 不支持用 ALTER 新增外键'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('dialog-close')));
+    await settle(tester, rounds: 2);
+
+    // 帮助入口说明建议是怎么推导的。
+    await tester.tap(find.byKey(const ValueKey('er-suggestion-help')));
+    await settle(tester);
+    expect(find.text('建议关系是怎么推导的？'), findsOneWidget);
+    expect(find.textContaining('members.shop_id'), findsWidgets);
+    await tester.tap(find.byKey(const ValueKey('dialog-close')));
+    await settle(tester, rounds: 2);
     expect(tester.takeException(), isNull);
   });
 
@@ -513,6 +537,7 @@ void main() {
         RelationDesigner(
           database: 'main',
           initialTables: const <String>['c1'],
+          maxTables: 5,
           height: 520,
         ),
       ),
@@ -709,7 +734,7 @@ void main() {
     expect(find.text('E-R diagram'), findsOneWidget);
     expect(find.text('+ Add table'), findsOneWidget);
     // authors/books + 自动带入的 reviews。
-    expect(find.text('Added 3/5'), findsOneWidget);
+    expect(find.text('Added 3/10'), findsOneWidget);
     expect(
       find.text('Related tables added automatically: reviews'),
       findsOneWidget,

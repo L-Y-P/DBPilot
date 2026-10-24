@@ -61,19 +61,42 @@ String erColumnPath(String table, String column) => '$table.$column';
 String erJunctionTarget(String column, String refTable, String refColumn) =>
     '$column → $refTable.$refColumn';
 
+/// 建议关系的完整标签：建议：a.b → c.d。
+String erSuggestionLabel(ErRelation relation) =>
+    pickText('建议：', 'Suggested: ') + relation.displayLabel;
+
+/// 建议关系的推导原因（帮助对话框与 hover tooltip 共用）。
+String erSuggestionReason(ErRelation relation) {
+  final column = relation.localColumn;
+  final base = suggestedForeignKeyBase(column) ?? column;
+  final target = relation.refTable;
+  final keyColumn = relation.refColumn;
+  return pickText(
+    '列名 $column 以 _id / Id 结尾，基名 $base 匹配到表 $target（x / xs / xes），$keyColumn 是它的单列主键。',
+    'Column $column ends with _id / Id; the base name $base matches table $target (x / xs / xes), and $keyColumn is its single-column primary key.',
+  );
+}
+
+/// 建议关系的完整悬浮提示：建议：a.b → c.d（原因）。
+String erSuggestionTooltip(ErRelation relation) {
+  final label = erSuggestionLabel(relation);
+  final reason = erSuggestionReason(relation);
+  return pickText('$label（$reason）', '$label ($reason)');
+}
+
 /// E-R 关系设计器。
 ///
 /// 公开接口由 §5.1 固定（导入向导第 5 步与快速建表向导第 4 步都依赖它）：
 /// [database] 是当前数据库 / 模式，[initialTables] 是打开时预置加入的表，
 /// [onChanged] 在关系变化（创建 / 删除 / 建中间表）后回调，[maxTables] 是画布
-/// 上限（默认 5），[height] 决定嵌入高度，[compact] 让向导内嵌更紧凑。
+/// 上限（默认 10），[height] 决定嵌入高度，[compact] 让向导内嵌更紧凑。
 class RelationDesigner extends StatefulWidget {
   const RelationDesigner({
     super.key,
     required this.database,
     this.initialTables = const <String>[],
     this.onChanged,
-    this.maxTables = 5,
+    this.maxTables = 10,
     this.height = 460,
     this.compact = false,
   });
@@ -119,6 +142,9 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   /// 当前 hover 的多对多连线 key（"m2m:中间表名"）；hover 时才显示它的标签。
   String? _hoverM2MKey;
+
+  /// 当前 hover 的建议虚线 key（关系 key）；hover 时高亮虚线并展开完整标签。
+  String? _hoverSuggestionKey;
   String? _hoverDot;
 
   /// 用户手动拖过位置的表：自动布局 / 自动带入时保留这些坐标。
@@ -213,7 +239,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
     return out;
   }
 
-  /// 按列名推导的建议关系（虚线，尚未写库）；最多 8 条，防止宽表把画布铺满。
+  /// 按列名推导的建议关系（虚线，尚未写库）；默认最多 20 条，防止宽表把画布铺满。
   List<ErRelation> get _suggestions {
     final cached = _suggestionCache;
     if (cached != null && _suggestionCacheRevision == _graphRevision) {
@@ -586,9 +612,15 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   // ------------------------------------------------------- 建议关系（虚线）
 
-  /// 批量（或单条）建立按列名推导的建议外键；SQLite 不支持 ALTER 增删外键。
+  /// 批量（或单条）建立按列名推导的建议外键。
+  ///
+  /// 按钮/建议线在 SQLite 下也保持可点：点击弹明确说明（而不是静默禁用）。
   Future<void> _applySuggestions({ErRelation? only}) async {
-    if (_isSqlite || _applyingSuggestions) return;
+    if (_applyingSuggestions) return;
+    if (_isSqlite) {
+      await _showSqliteAlterFkNotice();
+      return;
+    }
     final targets = <ErRelation>[if (only != null) only else ..._suggestions];
     if (targets.isEmpty) return;
     setState(() {
@@ -624,7 +656,12 @@ class _RelationDesignerState extends State<RelationDesigner> {
         appliedTables.add(suggestion.localTable);
       }
     } catch (error) {
-      if (mounted) setState(() => _actionError = error.toString());
+      final prefix = pickText(
+        '建立建议外键失败：',
+        'Failed to create the suggested foreign key: ',
+      );
+      final detail = error.toString();
+      if (mounted) setState(() => _actionError = '$prefix$detail');
     } finally {
       for (final name in appliedTables) {
         await _reloadTable(name);
@@ -634,6 +671,51 @@ class _RelationDesignerState extends State<RelationDesigner> {
         if (appliedTables.isNotEmpty) await widget.onChanged?.call();
       }
     }
+  }
+
+  /// SQLite 下点建议外键时的明确说明（可点但无法 ALTER，不是静默失败）。
+  Future<void> _showSqliteAlterFkNotice() async {
+    await showAppModal<void>(
+      context: context,
+      title: pickText(
+        'SQLite 不支持用 ALTER 新增外键',
+        'SQLite does not support adding foreign keys with ALTER TABLE',
+      ),
+      builder: (context) => Text(
+        pickText(
+          'SQLite 不支持用 ALTER TABLE 给已有表新增外键，所以建议关系只能查看。'
+              '如需外键，请在「从文件建表」时直接在建表语句里带上外键，或重建该表。',
+          'SQLite cannot add foreign keys to an existing table with ALTER TABLE, '
+              'so suggested relations are read-only here. To create foreign keys, '
+              'include them when the table is created with "Create tables from file", '
+              'or recreate the table.',
+        ),
+        style: kSmallMuted,
+      ),
+      actions: <Widget>[
+        Builder(
+          builder: (context) =>
+              Btn('关闭', onPressed: () => Navigator.of(context).pop()),
+        ),
+      ],
+    );
+  }
+
+  /// 建议关系推导帮助：规则说明 + 当前每条建议的原因。
+  Future<void> _showSuggestionHelp() async {
+    final suggestions = _suggestions;
+    await showAppModal<void>(
+      context: context,
+      title: pickText('建议关系是怎么推导的？', 'How are suggested relations derived?'),
+      wide: true,
+      builder: (context) => _SuggestionHelpDialog(suggestions: suggestions),
+      actions: <Widget>[
+        Builder(
+          builder: (context) =>
+              Btn('关闭', onPressed: () => Navigator.of(context).pop()),
+        ),
+      ],
+    );
   }
 
   // ------------------------------------------------------------ 关系增删
@@ -1020,32 +1102,55 @@ class _RelationDesignerState extends State<RelationDesigner> {
   void _handleHover(
     Offset local,
     List<ErRelationCurve> curves,
+    List<ErRelationCurve> suggestionCurves,
     List<ErRelationCurve> m2mCurves,
     List<ErManyToManyLink> m2mLinks,
   ) {
     final hit = hitTestRelationCurves(curves, local);
+    int? suggestionHit;
+    if (hit == null && suggestionCurves.isNotEmpty) {
+      suggestionHit = hitTestRelationCurves(suggestionCurves, local);
+    }
     int? m2mHit;
-    if (hit == null && m2mCurves.isNotEmpty) {
+    if (hit == null && suggestionHit == null && m2mCurves.isNotEmpty) {
       m2mHit = hitTestRelationCurves(m2mCurves, local);
     }
+    final suggestionKey = suggestionHit == null
+        ? null
+        : suggestionCurves[suggestionHit].relation.key;
     final m2mKey = m2mHit == null ? null : m2mLinks[m2mHit].key;
-    if (hit != _hoverRelation || m2mKey != _hoverM2MKey) {
+    if (hit != _hoverRelation ||
+        suggestionKey != _hoverSuggestionKey ||
+        m2mKey != _hoverM2MKey) {
       setState(() {
         _hoverRelation = hit;
+        _hoverSuggestionKey = suggestionKey;
         _hoverM2MKey = m2mKey;
       });
     }
   }
 
-  void _handleCanvasTap(Offset local, List<ErRelationCurve> curves) {
+  void _handleCanvasTap(
+    Offset local,
+    List<ErRelationCurve> curves,
+    List<ErRelationCurve> suggestionCurves,
+  ) {
     final hit = hitTestRelationCurves(curves, local);
-    if (hit == null) {
-      if (_selectedRelationKey != null) {
-        setState(() => _selectedRelationKey = null);
-      }
+    if (hit != null) {
+      _selectRelation(curves[hit].relation);
       return;
     }
-    _selectRelation(curves[hit].relation);
+    // 点建议虚线 = 只建立这一条建议外键（SQLite 会给出说明）。
+    if (suggestionCurves.isNotEmpty) {
+      final suggestionHit = hitTestRelationCurves(suggestionCurves, local);
+      if (suggestionHit != null) {
+        _applySuggestions(only: suggestionCurves[suggestionHit].relation);
+        return;
+      }
+    }
+    if (_selectedRelationKey != null) {
+      setState(() => _selectedRelationKey = null);
+    }
   }
 
   /// 选中一条边（画布高亮 + 标签显示）并打开详情。
@@ -1138,10 +1243,8 @@ class _RelationDesignerState extends State<RelationDesigner> {
             key: const ValueKey('er-apply-suggestions'),
             small: widget.compact,
             icon: Icons.auto_fix_high,
-            tooltip: _isSqlite ? 'SQLite 不支持用 ALTER 新增外键' : '按列名推导的建议关系批量建立外键',
-            onPressed: _isSqlite || _applyingSuggestions
-                ? null
-                : _applySuggestions,
+            tooltip: '按列名推导的建议关系批量建立外键',
+            onPressed: _applyingSuggestions ? null : _applySuggestions,
           ),
           const SizedBox(width: 8),
         ],
@@ -1151,6 +1254,15 @@ class _RelationDesignerState extends State<RelationDesigner> {
           small: widget.compact,
           icon: Icons.grid_view,
           onPressed: _tables.isEmpty ? null : _autoLayout,
+        ),
+        const SizedBox(width: 8),
+        IconBtn(
+          Icons.help_outline,
+          key: const ValueKey('er-suggestion-help'),
+          tooltip: '建议关系是怎么推导的',
+          dimension: 24,
+          glyphSize: 14,
+          onPressed: _showSuggestionHelp,
         ),
         const SizedBox(width: 10),
         Pill(
@@ -1286,20 +1398,31 @@ class _RelationDesignerState extends State<RelationDesigner> {
           width: content.width,
           height: content.height,
           child: MouseRegion(
-            onHover: (event) =>
-                _handleHover(event.localPosition, curves, m2mCurves, m2mLinks),
+            onHover: (event) => _handleHover(
+              event.localPosition,
+              curves,
+              suggestionCurves,
+              m2mCurves,
+              m2mLinks,
+            ),
             onExit: (_) {
-              if (_hoverRelation != null || _hoverM2MKey != null) {
+              if (_hoverRelation != null ||
+                  _hoverSuggestionKey != null ||
+                  _hoverM2MKey != null) {
                 setState(() {
                   _hoverRelation = null;
+                  _hoverSuggestionKey = null;
                   _hoverM2MKey = null;
                 });
               }
             },
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapUp: (details) =>
-                  _handleCanvasTap(details.localPosition, curves),
+              onTapUp: (details) => _handleCanvasTap(
+                details.localPosition,
+                curves,
+                suggestionCurves,
+              ),
               child: Stack(
                 key: const ValueKey('er-canvas-stack'),
                 clipBehavior: Clip.none,
@@ -1318,6 +1441,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
                           m2mCurves: m2mCurves,
                           drag: _drag,
                           hoveredRelation: _hoverRelation,
+                          hoveredSuggestionKey: _hoverSuggestionKey,
                           hoveredM2MKey: _hoverM2MKey,
                           selectedRelationKey: _selectedRelationKey,
                           dropTarget: dropTarget,
@@ -1683,23 +1807,26 @@ class _RelationDesignerState extends State<RelationDesigner> {
     );
   }
 
-  /// 建议关系的虚线标签：默认只显示小号「建议」胶囊，完整文案放 tooltip；
-  /// 点击即建立这一条建议外键（SQLite 只读）。
+  /// 建议关系的虚线标签：默认只显示小号「建议」胶囊；hover 时展开完整
+  /// 「建议：a.b → c.d」，tooltip 里是完整文案 + 推导原因；点击建立这一条
+  /// 建议外键（SQLite 会弹说明，不再静默）。
   Widget _suggestionLabel(ErRelationCurve curve) {
     final relation = curve.relation;
     final relationKey = relation.key;
-    final fullText = pickText('建议：', 'Suggested: ') + relation.displayLabel;
+    final hovered =
+        _hoverSuggestionKey == relationKey ||
+        _hoverSuggestionKey == null && false;
     return _edgeLabel(
       left: curve.labelAnchor,
-      tooltip: fullText,
+      tooltip: erSuggestionTooltip(relation),
       keyValue: 'er-suggestion-$relationKey',
-      background: AppColors.warnBg,
+      background: hovered ? AppColors.focusRing : AppColors.warnBg,
       borderColor: AppColors.warnBorder,
       child: Text(
-        '建议',
+        hovered ? erSuggestionLabel(relation) : '建议',
         style: TextStyle(fontSize: 9, color: AppColors.warnText),
       ),
-      onTap: _isSqlite ? null : () => _applySuggestions(only: relation),
+      onTap: () => _applySuggestions(only: relation),
     );
   }
 
@@ -1852,6 +1979,7 @@ class _ErCanvasPainter extends CustomPainter {
     required this.m2mCurves,
     required this.drag,
     required this.hoveredRelation,
+    required this.hoveredSuggestionKey,
     required this.hoveredM2MKey,
     required this.selectedRelationKey,
     required this.dropTarget,
@@ -1864,6 +1992,9 @@ class _ErCanvasPainter extends CustomPainter {
   final List<ErRelationCurve> m2mCurves;
   final _ConnectDrag? drag;
   final int? hoveredRelation;
+
+  /// 当前 hover 的建议虚线（关系 key）：虚线加粗 + 光晕。
+  final String? hoveredSuggestionKey;
   final String? hoveredM2MKey;
   final String? selectedRelationKey;
   final ErFieldRef? dropTarget;
@@ -1875,8 +2006,19 @@ class _ErCanvasPainter extends CustomPainter {
     _paintGrid(canvas, size);
     // 建议关系在最底层（虚线、橙色），中间表多对多其次，真实外键最上层。
     for (final curve in suggestionCurves) {
-      _paintDashedCurve(canvas, curve, AppColors.warnBorder);
-      _paintArrow(canvas, curve, AppColors.warnBorder, scale: _arrowScale);
+      final highlighted = curve.relation.key == hoveredSuggestionKey;
+      _paintDashedCurve(
+        canvas,
+        curve,
+        AppColors.warnBorder,
+        highlighted: highlighted,
+      );
+      _paintArrow(
+        canvas,
+        curve,
+        AppColors.warnBorder,
+        scale: _arrowScale * (highlighted ? 1.25 : 1.0),
+      );
     }
     for (var i = 0; i < m2mCurves.length; i++) {
       final highlighted =
@@ -1993,16 +2135,53 @@ class _ErCanvasPainter extends CustomPainter {
     );
   }
 
-  /// 虚线：按采样折线交替画线段，建议关系用。
-  void _paintDashedCurve(Canvas canvas, ErRelationCurve curve, Color color) {
+  /// 虚线：按采样折线交替画线段，建议关系用；hover 时加粗并加一层光晕。
+  void _paintDashedCurve(
+    Canvas canvas,
+    ErRelationCurve curve,
+    Color color, {
+    bool highlighted = false,
+  }) {
     final points = curve.sample(segments: 48);
+    if (highlighted) {
+      _paintDashedSegments(
+        canvas,
+        points,
+        color.withValues(alpha: 0.18),
+        width: 8,
+        dash: 7,
+        gap: 5,
+      );
+    }
+    _paintDashedSegments(
+      canvas,
+      points,
+      color,
+      width: highlighted ? 2.6 : 1.6,
+      dash: 7,
+      gap: 5,
+    );
+    canvas.drawCircle(
+      curve.start,
+      highlighted ? 3.4 : 2.4,
+      Paint()..color = color,
+    );
+  }
+
+  /// 按采样折线交替画虚线段。
+  void _paintDashedSegments(
+    Canvas canvas,
+    List<Offset> points,
+    Color color, {
+    required double width,
+    required double dash,
+    required double gap,
+  }) {
     final paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.6
+      ..strokeWidth = width
       ..strokeCap = StrokeCap.round;
-    const dash = 7.0;
-    const gap = 5.0;
     var drawing = true;
     var remaining = dash;
     for (var i = 0; i + 1 < points.length; i++) {
@@ -2023,7 +2202,6 @@ class _ErCanvasPainter extends CustomPainter {
         }
       }
     }
-    canvas.drawCircle(curve.start, 2.4, Paint()..color = color);
   }
 
   /// 目标端箭头：尖端在曲线终点，沿贝塞尔终点切线方向回退成实心三角。
@@ -2837,6 +3015,96 @@ class _JunctionDialogState extends State<_JunctionDialog> {
           const SizedBox(height: 8),
           AlertBox(_error!),
         ],
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------- 建议关系帮助弹窗
+
+/// 建议关系帮助：推导规则 + 当前每条建议的原因。
+class _SuggestionHelpDialog extends StatelessWidget {
+  const _SuggestionHelpDialog({required this.suggestions});
+
+  final List<ErRelation> suggestions;
+
+  @override
+  Widget build(BuildContext context) {
+    final rules = <String>[
+      pickText(
+        '只对画布上还没有外键的表推导建议。',
+        'Suggestions are derived only for tables that have no foreign key yet.',
+      ),
+      pickText(
+        '列名以 _id / Id / ID 结尾时，取前面的部分作为基名（例如 category_id → category）。',
+        'When a column ends with _id / Id / ID, the part before it is the base name (for example category_id → category).',
+      ),
+      pickText(
+        '在已加入的表里找 x / xs / xes（y → ies）形式、且有单列主键的表作为目标（例如 category → categories）。',
+        'Among the added tables, x / xs / xes (y → ies) forms with a single-column primary key are used as targets (for example category → categories).',
+      ),
+      pickText(
+        '最多显示 20 条建议；只画虚线，不会写入数据库。',
+        'At most 20 suggestions are shown; they are drawn as dashed lines and never written to the database.',
+      ),
+      pickText(
+        '点工具栏「建立建议外键 (N)」批量建立，或直接点某条建议线只建立这一条（执行 ALTER TABLE ADD FOREIGN KEY）。SQLite 不支持 ALTER 加外键，会弹出说明。',
+        'Use "Create suggested FKs (N)" to create them all, or click one suggested line to create just that one (ALTER TABLE ADD FOREIGN KEY). SQLite does not support ALTER and will show an explanation.',
+      ),
+    ];
+    final count = suggestions.length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        for (var i = 0; i < rules.length; i++) ...<Widget>[
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                '${i + 1}. ',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.cardHeading,
+                ),
+              ),
+              Expanded(child: Text(rules[i], style: kSmall)),
+            ],
+          ),
+          const SizedBox(height: 6),
+        ],
+        const Divider(height: 20),
+        Text(
+          pickText('当前建议（$count 条）', 'Current suggestions ($count)'),
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: AppColors.cardHeading,
+          ),
+        ),
+        const SizedBox(height: 8),
+        if (suggestions.isEmpty)
+          Text(
+            pickText('当前没有可推导的建议关系', 'No suggested relations right now'),
+            style: kSmallMuted,
+          )
+        else
+          for (final relation in suggestions)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    erSuggestionLabel(relation),
+                    style: monoStyle(size: 11.5),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(erSuggestionReason(relation), style: kSmallMuted),
+                ],
+              ),
+            ),
       ],
     );
   }

@@ -5,6 +5,7 @@ import '../api.dart';
 import '../app_state.dart';
 import '../db_options.dart';
 import '../i18n.dart';
+import '../type_labels.dart';
 import '../theme.dart';
 import '../widgets.dart';
 
@@ -621,19 +622,16 @@ class CreateTableDialogState extends State<CreateTableDialog> {
         _textCell(column.name, label: '${t('column_name')} #${index + 1}', onChanged: (_) => refreshPreview()),
         Padding(
           padding: const EdgeInsets.all(4),
-          child: SizedBox(
+          // 中文界面说人话（整数 / 文本（VARCHAR(255)）…），英文界面仍是原始
+          // SQL 类型；选择值始终是 SQL 类型，DDL 预览不受影响。
+          child: ColumnTypePicker(
+            value: column.type,
+            types: typeItems,
             width: 150,
-            child: SelectBox<String>(
-              value: column.type,
-              onChanged: (v) {
-                setState(() => column.type = v ?? column.type);
-                refreshPreview();
-              },
-              items: [
-                for (final type in typeItems)
-                  DropdownMenuItem(value: type, child: Text(type)),
-              ],
-            ),
+            onChanged: (v) {
+              setState(() => column.type = v ?? column.type);
+              refreshPreview();
+            },
           ),
         ),
         _checkCell(column.nullable, (v) {

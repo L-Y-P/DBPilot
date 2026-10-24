@@ -1540,12 +1540,13 @@ String? suggestedForeignKeyBase(String column) {
 /// （y -> ies）的单列主键。返回的 ErRelation 带 [ErRelationOrigin.suggested]，
 /// 由画布画成虚线，用户点「建立建议外键」后才会真正写库。
 ///
-/// [maxResults] 限制虚线建议边数量（默认 8）：一批宽表可能推出几十条建议，
-/// 全画出来会让画布拥挤、命中检测变慢；剩下的可以在应用后重新推导。
+/// [maxResults] 限制虚线建议边数量（默认 20，支持 10 张表的批次）：一批宽表
+/// 可能推出几十条建议，全画出来会让画布拥挤、命中检测变慢；剩下的可以在应用
+/// 后重新推导。
 List<ErRelation> suggestRelations({
   required List<ErTable> tables,
   required Map<String, List<ErRelation>> relationsByTable,
-  int maxResults = 8,
+  int maxResults = 20,
 }) {
   final byLowerName = <String, ErTable>{
     for (final table in tables) table.name.toLowerCase(): table,

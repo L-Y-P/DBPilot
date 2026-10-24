@@ -903,7 +903,7 @@ void main() {
       );
     });
 
-    test('默认最多 8 条建议边；可显式收紧', () {
+    test('默认最多 20 条建议边；可显式收紧', () {
       final targets = <ErTable>[for (var i = 1; i <= 10; i++) idTable('t$i')];
       final wide = table('wide', <ErColumn>[
         column('id', type: 'INTEGER', primary: true),
@@ -913,7 +913,7 @@ void main() {
         tables: <ErTable>[wide, ...targets],
         relationsByTable: <String, List<ErRelation>>{},
       );
-      expect(capped.length, 8, reason: '默认上限 8 条，避免画布被虚线铺满');
+      expect(capped.length, 10, reason: '默认上限 20 条，这里 10 条都应保留');
       final tighter = suggestRelations(
         tables: batch(),
         relationsByTable: <String, List<ErRelation>>{},

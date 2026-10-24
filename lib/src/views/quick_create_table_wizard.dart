@@ -4,12 +4,14 @@ import 'package:flutter/material.dart' hide Text, Tooltip;
 
 import '../api.dart';
 import '../app_state.dart';
+import '../i18n.dart';
 import '../i18n_literals.dart';
 import '../import_rules.dart';
 import '../notice.dart';
 import '../sqlite_sources.dart';
 import '../text.dart';
 import '../theme.dart';
+import '../type_labels.dart';
 import '../widgets.dart';
 import 'relation_designer.dart';
 
@@ -653,6 +655,37 @@ String? validatePlans(
   return null;
 }
 
+
+/// E-R 画布最多同时容纳的表数（与 RelationDesigner 的 maxTables 对齐）。
+const int kRelationSeedLimit = 10;
+
+/// 从已创建的表里挑出要带进 E-R 画布的种子（最多 [limit] 张）。
+///
+/// 多出来的表不画在画布上，但用户仍可从数据库页的「关系图」入口再添加，
+/// 所以这里只截断、不丢数据。
+List<String> relationSeedTables(
+  List<String> createdTables, {
+  int limit = kRelationSeedLimit,
+}) {
+  if (limit <= 0) return const <String>[];
+  return createdTables.take(limit).toList();
+}
+
+/// 种子被截断时的提示；没有超出时返回 null。
+String? relationSeedWarning(
+  int createdCount, {
+  int limit = kRelationSeedLimit,
+}) {
+  if (createdCount <= limit) return null;
+  return pickText(
+    '本次创建了 $createdCount 张表，关系图最多同时显示 $limit 张；'
+    '其余表可以在数据库页的「关系图」里继续添加。',
+    'Created $createdCount tables; the relationship canvas shows up to '
+    '$limit at once. Add the rest later from Relationships on the database '
+    'page.',
+  );
+}
+
 // =========================================================================
 // 运行期模型
 // =========================================================================
@@ -827,6 +860,11 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
   /// 是否全部表都已导入完成。
   @visibleForTesting
   bool get importsDoneForTest => _importsDone;
+
+  /// 第 4 步实际会带进关系图的种子表（最多 [kRelationSeedLimit] 张）。
+  @visibleForTesting
+  List<String> get relationSeedTablesForTest =>
+      relationSeedTables(_createdTables);
 
   String get _driver => AppState.instance.driver;
 
@@ -1270,6 +1308,16 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
 
   @override
   Widget build(BuildContext context) {
+    // 类型标签、提示语都在 build 时按当前语言计算。这个向导是自绘 Dialog
+    // （不经过 showAppModal 的语言重建外壳），所以自己监听语言变化，保证
+    // 对话框打开期间切到英文也能立即换成原始 SQL 类型。
+    return ValueListenableBuilder<AppLang>(
+      valueListenable: I18n.lang,
+      builder: (context, lang, _) => _buildDialog(context),
+    );
+  }
+
+  Widget _buildDialog(BuildContext context) {
     final screen = MediaQuery.of(context).size;
     final width = screen.width < 1140 ? screen.width * 0.96 : 1100.0;
     final height = screen.height < 900 ? screen.height * 0.94 : 820.0;
@@ -1760,20 +1808,16 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
         ),
         Padding(
           padding: const EdgeInsets.all(4),
-          child: SizedBox(
+          child: ColumnTypePicker(
+            key: ValueKey<String>('quick-col-type-$formIndex-$columnIndex'),
+            value: column.sqlType,
+            types: choices,
+            enabled: !_executing,
             width: 170,
-            child: SelectBox<String>(
-              value: column.sqlType,
-              enabled: !_executing,
-              onChanged: (value) {
-                if (value == null) return;
-                setState(() => column.sqlType = value);
-              },
-              items: [
-                for (final type in choices)
-                  DropdownMenuItem(value: type, child: Text(type)),
-              ],
-            ),
+            onChanged: (value) {
+              if (value == null) return;
+              setState(() => column.sqlType = value);
+            },
           ),
         ),
         Padding(
@@ -1973,7 +2017,9 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
   // ------------------------------------------------------------ step 4 UI
 
   Widget _stepRelations() {
-    final tables = _createdTables.take(5).toList();
+    final created = _createdTables;
+    final tables = relationSeedTables(created);
+    final overflowHint = relationSeedWarning(created.length);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1981,6 +2027,10 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
           '关系修改会立即写入数据库；也可以稍后从数据库页的「关系图」入口再配置。',
           style: kSmallMuted,
         ),
+        if (overflowHint != null) ...[
+          const SizedBox(height: 8),
+          AlertBox(overflowHint, tone: AlertTone.warn),
+        ],
         const SizedBox(height: 10),
         if (tables.isEmpty)
           const AlertBox('没有已创建的表可以建立关联。', tone: AlertTone.info)
@@ -1988,6 +2038,8 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
           RelationDesigner(
             database: widget.database,
             initialTables: tables,
+            // 关系画布上限（第 50 轮由 5 调到 10）：种子最多带 10 张表。
+            maxTables: kRelationSeedLimit,
             height: 440,
             compact: true,
           ),

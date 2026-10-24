@@ -98,12 +98,12 @@ keyset 游标分页；自动列宽开关与大字段延迟加载（设置 → �
 一次 CREATE TABLE + 批量导入，失败保留已建表并可重试。
 
 **E-R 关系图** —— 导入/快速建表后的最后一步，也可从数据库页「关系图」随时打开：
-最多同时展示 5 张表；已存在的外键自动画成**带箭头的连线**（目标端实心三角、hover 高亮）；
+最多同时展示 10 张表；已存在的外键自动画成**带箭头的连线**（目标端实心三角、hover 高亮）；
 加入一张表会**自动带入与它关联的父/子表**（可撤销）；从字段连接点拖到另一张表的字段即可创建外键，
 点击箭头查看/删除或设置约束（级联 / 置空 / 限制 / 不操作，中文界面不出现 SQL 关键字）；
 **多对多推导**：恰好两个单列外键的表识别为「中间表」，在两端实体表之间画出「多对多 · 中间表」关系线（可折叠）；
-新建外键可选「多对多（自动创建中间表）」；对同一批导入、尚无外键的表按 `xxx_id` 列名推导「建议关系」虚线边，工具栏可一键批量建立。
-示例文件：`desktop/rust/tests/fixtures/relational_multi.xlsx`（5 个工作表 users/categories/products/orders/order_items）。
+新建外键可选「多对多（自动创建中间表）」；对同一批导入、尚无外键的表按 `xxx_id` 列名推导「建议关系」虚线边（点击虚线可单条建立，工具栏可一键批量建立，帮助入口解释推导规则）。
+示例文件：`desktop/rust/tests/fixtures/relational_multi.xlsx`（5 表 users/categories/products/orders/order_items）与 `chinese_grade.xlsx`（中文：学生名单 / 年级成绩单）。
 
 **导出** —— SQL / CSV / JSON / XML / HTML / TXT / Excel / Markdown 八种格式；
 表页、整库、查询结果共用同一套 writer，全部流式写出。

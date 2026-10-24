@@ -187,7 +187,10 @@ final List<Rewrite> rewritesCommon = <Rewrite>[
       (m) => 'Line ${m[1]} (byte ${m[2]}): ${trLiteral(m[3]!)}'),
   // Snippet prefix inside an import issue row.
   Rewrite(RegExp(r'^内容：(.*)$', dotAll: true), (m) => 'Content: ${m[1]}'),
-  // Pagination on the table browser and result grids.
+  // Pagination on the table browser and result grids. The single-page form is
+  // rendered while the row count is still loading (pages == null), and an
+  // untranslated 「第 N 页」 there made the English UI test flake under load.
+  Rewrite(RegExp(r'^第 (\d+) 页$'), (m) => 'Page ${m[1]}'),
   Rewrite(RegExp(r'^第 (\d+) / (\d+) 页$'),
       (m) => 'Page ${m[1]} / ${m[2]}'),
   Rewrite(RegExp(r'^显示 (\d+) / (\d+) 行$'),

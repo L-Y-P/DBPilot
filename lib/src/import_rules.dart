@@ -27,6 +27,8 @@ class ImportReadRule {
     this.skipBlank = true,
     this.trim = true,
     this.maxRecordBytes = 8 * 1024 * 1024,
+    this.sheet,
+    this.skipRows = 0,
   });
 
   /// line: one record per line; wrapped: file-level wrapper + separator.
@@ -40,7 +42,23 @@ class ImportReadRule {
   bool trim;
   int maxRecordBytes;
 
+  /// Excel / ODS workbooks: worksheet to read, by name.
+  ///
+  /// Null (or empty) means "the first worksheet", which is also what every
+  /// non-workbook format ignores. The Rust importer accepts a 0-based index
+  /// too, but the wizard always sends the name shown in the worksheet picker.
+  String? sheet;
+
+  /// Excel / ODS workbooks: leading rows to skip before the header is detected.
+  ///
+  /// Real workbooks often start with a report title in row 1 and the column
+  /// names in row 2, so "first row is a header" alone is not enough.
+  int skipRows;
+
   bool get isWrapped => mode == 'wrapped';
+
+  /// True when the rule targets one worksheet of a workbook.
+  bool get isWorksheet => (sheet ?? '').trim().isNotEmpty;
 
   ImportReadRule copyWith({
     String? mode,
@@ -51,6 +69,9 @@ class ImportReadRule {
     bool? balance,
     bool? skipBlank,
     bool? trim,
+    int? skipRows,
+    String? sheet,
+    bool clearSheet = false,
   }) {
     return ImportReadRule(
       mode: mode ?? this.mode,
@@ -62,36 +83,58 @@ class ImportReadRule {
       skipBlank: skipBlank ?? this.skipBlank,
       trim: trim ?? this.trim,
       maxRecordBytes: maxRecordBytes,
+      sheet: clearSheet ? null : (sheet ?? this.sheet),
+      skipRows: skipRows ?? this.skipRows,
     );
   }
 
-  Map<String, dynamic> toJson() => <String, dynamic>{
-        'mode': mode,
-        'wrapper_start': wrapperStart,
-        'wrapper_end': wrapperEnd,
-        'record_sep': recordSep,
-        'quote': quote,
-        'balance': balance,
-        'skip_blank': skipBlank,
-        'trim': trim,
-        'max_record_bytes': maxRecordBytes,
-      };
+  Map<String, dynamic> toJson() {
+    final json = <String, dynamic>{
+      'mode': mode,
+      'wrapper_start': wrapperStart,
+      'wrapper_end': wrapperEnd,
+      'record_sep': recordSep,
+      'quote': quote,
+      'balance': balance,
+      'skip_blank': skipBlank,
+      'trim': trim,
+      'max_record_bytes': maxRecordBytes,
+    };
+    // Worksheet keys only exist for workbook formats. Omitting them for plain
+    // text keeps that payload exactly the pre-round-50 shape, so an unchanged
+    // import keeps producing the same JSON (and older Rust builds ignore them
+    // anyway — both fields are serde-defaulted).
+    final worksheet = (sheet ?? '').trim();
+    if (worksheet.isNotEmpty) json['sheet'] = worksheet;
+    if (worksheet.isNotEmpty || skipRows > 0) json['skip_rows'] = skipRows;
+    return json;
+  }
 
-  factory ImportReadRule.fromJson(Json json) => ImportReadRule(
-        mode: (json['mode'] ?? 'line').toString(),
-        wrapperStart: (json['wrapper_start'] ?? '').toString(),
-        wrapperEnd: (json['wrapper_end'] ?? '').toString(),
-        recordSep: (json['record_sep'] ?? '\n').toString(),
-        quote: (json['quote'] ?? '"').toString(),
-        balance: json['balance'] != false,
-        skipBlank: json['skip_blank'] != false,
-        trim: json['trim'] != false,
-        maxRecordBytes:
-            (json['max_record_bytes'] as num?)?.toInt() ?? 8 * 1024 * 1024,
-      );
+  factory ImportReadRule.fromJson(Json json) {
+    final worksheet = (json['sheet'] ?? '').toString().trim();
+    return ImportReadRule(
+      mode: (json['mode'] ?? 'line').toString(),
+      wrapperStart: (json['wrapper_start'] ?? '').toString(),
+      wrapperEnd: (json['wrapper_end'] ?? '').toString(),
+      recordSep: (json['record_sep'] ?? '\n').toString(),
+      quote: (json['quote'] ?? '"').toString(),
+      balance: json['balance'] != false,
+      skipBlank: json['skip_blank'] != false,
+      trim: json['trim'] != false,
+      maxRecordBytes:
+          (json['max_record_bytes'] as num?)?.toInt() ?? 8 * 1024 * 1024,
+      sheet: worksheet.isEmpty ? null : worksheet,
+      skipRows: (json['skip_rows'] as num?)?.toInt() ?? 0,
+    );
+  }
 
   /// Human-readable one-line description used in the wizard summary.
   String describe() {
+    final worksheet = (sheet ?? '').trim();
+    if (worksheet.isNotEmpty) {
+      final skip = skipRows > 0 ? ' · 跳过开头 $skipRows 行' : '';
+      return 'Excel 工作表 "$worksheet"$skip';
+    }
     if (isWrapped) {
       final open = encodeEscapes(wrapperStart);
       final close = encodeEscapes(wrapperEnd);
@@ -116,7 +159,9 @@ class ImportFieldRule {
     this.header = false,
   });
 
-  /// delimited: CSV-style; json: one JSON value per record.
+  /// delimited: CSV-style; json: one JSON value per record; xml / html /
+  /// markdown / spreadsheet: structural formats; excel: a workbook record,
+  /// exposed to the engine as a JSON array so it reuses the json conversion.
   String mode;
   String fieldSep;
   String quote;
@@ -125,6 +170,10 @@ class ImportFieldRule {
   bool header;
 
   bool get isJson => mode == 'json';
+
+  /// One worksheet record: the type of every value comes from the cell itself,
+  /// so the delimiter/quote/escape controls do not apply.
+  bool get isExcel => mode == 'excel';
 
   ImportFieldRule copyWith({
     String? mode,
@@ -145,27 +194,30 @@ class ImportFieldRule {
   }
 
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'mode': mode,
-        'field_sep': fieldSep,
-        'quote': quote,
-        'escape': escape,
-        'trim': trim,
-        'header': header,
-      };
+    'mode': mode,
+    'field_sep': fieldSep,
+    'quote': quote,
+    'escape': escape,
+    'trim': trim,
+    'header': header,
+  };
 
   factory ImportFieldRule.fromJson(Json json) => ImportFieldRule(
-        mode: (json['mode'] ?? 'delimited').toString(),
-        fieldSep: (json['field_sep'] ?? ',').toString(),
-        quote: (json['quote'] ?? '"').toString(),
-        escape: (json['escape'] ?? '').toString(),
-        trim: json['trim'] != false,
-        header: json['header'] == true,
-      );
+    mode: (json['mode'] ?? 'delimited').toString(),
+    fieldSep: (json['field_sep'] ?? ',').toString(),
+    quote: (json['quote'] ?? '"').toString(),
+    escape: (json['escape'] ?? '').toString(),
+    trim: json['trim'] != false,
+    header: json['header'] == true,
+  );
 
   String describe() {
     if (isJson) return '字典/JSON 记录';
-    final header = this.header ? '首行为列名' : '无列名（按位置）';
-    return '分隔符 "${encodeEscapes(fieldSep)}" · $header';
+    if (isExcel) {
+      return header ? 'Excel 单元格 · 首行为列名' : 'Excel 单元格 · 无列名（按位置）';
+    }
+    final headerLabel = header ? '首行为列名' : '无列名（按位置）';
+    return '分隔符 "${encodeEscapes(fieldSep)}" · $headerLabel';
   }
 }
 
@@ -175,8 +227,10 @@ class ImportColumnMap {
   String column;
   Object source; // String or int
 
-  Map<String, dynamic> toJson() =>
-      <String, dynamic>{'column': column, 'source': source};
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'column': column,
+    'source': source,
+  };
 
   ImportColumnMap copy() => ImportColumnMap(column: column, source: source);
 }
@@ -189,8 +243,8 @@ class ImportMappingRule {
     this.emptyAsNull = false,
     List<String>? nullTokens,
     this.trimValues = true,
-  })  : columns = columns ?? <ImportColumnMap>[],
-        nullTokens = nullTokens ?? <String>['\\N'];
+  }) : columns = columns ?? <ImportColumnMap>[],
+       nullTokens = nullTokens ?? <String>['\\N'];
 
   List<ImportColumnMap> columns;
   bool ignoreUnknown;
@@ -199,20 +253,20 @@ class ImportMappingRule {
   bool trimValues;
 
   ImportMappingRule copy() => ImportMappingRule(
-        columns: columns.map((c) => c.copy()).toList(),
-        ignoreUnknown: ignoreUnknown,
-        emptyAsNull: emptyAsNull,
-        nullTokens: List<String>.from(nullTokens),
-        trimValues: trimValues,
-      );
+    columns: columns.map((c) => c.copy()).toList(),
+    ignoreUnknown: ignoreUnknown,
+    emptyAsNull: emptyAsNull,
+    nullTokens: List<String>.from(nullTokens),
+    trimValues: trimValues,
+  );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'columns': columns.map((c) => c.toJson()).toList(),
-        'ignore_unknown': ignoreUnknown,
-        'empty_as_null': emptyAsNull,
-        'null_tokens': nullTokens,
-        'trim_values': trimValues,
-      };
+    'columns': columns.map((c) => c.toJson()).toList(),
+    'ignore_unknown': ignoreUnknown,
+    'empty_as_null': emptyAsNull,
+    'null_tokens': nullTokens,
+    'trim_values': trimValues,
+  };
 }
 
 /// Interpret escape sequences typed into rule fields so a user can write \n or

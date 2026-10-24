@@ -1,0 +1,414 @@
+// E-R 关系设计器的端到端测试：SQLite 真库 + 真实 FFI。
+//
+// 覆盖 §5.3 的验收点：
+//  * 已有外键自动显示；移除表后关系消失；
+//  * 添加表弹窗（搜索 / 复选 / 加入）与画布上限；
+//  * SQLite 下连接点禁用并给出原因（ALTER 不能增删外键）；
+//  * 多对多中间表通过 createTable 一次建表成功（SQLite 内联外键）；
+//  * 中文动作文案不出现 SQL 关键字，英文界面才出现。
+
+import 'dart:io';
+
+import 'package:flutter/material.dart' hide Text, Tooltip;
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:rust_myadmin_desktop/src/api.dart';
+import 'package:rust_myadmin_desktop/src/app_state.dart';
+import 'package:rust_myadmin_desktop/src/i18n.dart';
+import 'package:rust_myadmin_desktop/src/i18n_literals.dart' as lit;
+import 'package:rust_myadmin_desktop/src/rust/frb_generated.dart';
+import 'package:rust_myadmin_desktop/src/text.dart' as app_text;
+import 'package:rust_myadmin_desktop/src/theme.dart';
+import 'package:rust_myadmin_desktop/src/views/er_model.dart';
+import 'package:rust_myadmin_desktop/src/views/relation_designer.dart';
+import 'package:rust_myadmin_desktop/src/widgets.dart';
+
+void main() {
+  late Directory temporary;
+  late String connectionId;
+
+  /// 等待真实 FFI 完成 + 几帧 UI 重绘（CircularProgressIndicator 会让
+  /// pumpAndSettle 永远无法收敛，所以手动泵）。
+  Future<void> settle(WidgetTester tester, {int rounds = 16}) async {
+    for (var i = 0; i < rounds; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 25)),
+      );
+      await tester.pump(const Duration(milliseconds: 25));
+    }
+  }
+
+  Widget host(Widget child) => MaterialApp(
+    theme: buildAppTheme(),
+    home: Scaffold(
+      body: Padding(padding: const EdgeInsets.all(12), child: child),
+    ),
+  );
+
+  Future<void> setSurface(WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+  }
+
+  setUpAll(() async {
+    final dylib = File('rust/target/debug/librust_myadmin_core.dylib');
+    if (!dylib.existsSync()) {
+      fail('Run cargo build --lib in rust/ first: missing ${dylib.path}');
+    }
+    await RustLib.init(externalLibrary: ExternalLibrary.open(dylib.path));
+    temporary = await Directory.systemTemp.createTemp('rma-er-ffi-');
+    final init = await Api.init(temporary.path);
+    expect(init['ok'], isTrue, reason: 'init_app failed: $init');
+    await AppState.instance.bootstrap(temporary.path);
+    final dirPath = temporary.path;
+    final dbFile = File('$dirPath/er.sqlite');
+    dbFile.createSync(recursive: true);
+    final created = await Api.instance.createConnection(<String, dynamic>{
+      'name': 'ER FFI',
+      'driver': 'sqlite',
+      'database': dbFile.path,
+    });
+    connectionId = ((created['connection'] as Map)['id']).toString();
+    await AppState.instance.connect(connectionId);
+    const fixtures = <String>[
+      'CREATE TABLE authors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)',
+      'CREATE TABLE books (id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER REFERENCES authors(id), title TEXT)',
+      'CREATE TABLE reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER REFERENCES books(id), body TEXT)',
+      'CREATE TABLE t1 (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE t2 (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE t3 (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE t4 (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE t5 (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE t6 (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE people (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, score INTEGER)',
+      'CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER)',
+      'CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+    ];
+    for (final sql in fixtures) {
+      await Api.instance.query(sql);
+    }
+  });
+
+  tearDownAll(() async {
+    try {
+      await Api.instance.disconnect();
+    } catch (_) {}
+    try {
+      temporary.deleteSync(recursive: true);
+    } catch (_) {}
+    I18n.setLang(AppLang.zh);
+  });
+
+  testWidgets('SQLite：已有外键自动显示，移除表后关系消失', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books', 'reviews'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+
+    expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-node-books')), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-node-reviews')), findsOneWidget);
+    expect(find.text('books.author_id → authors.id'), findsOneWidget);
+    expect(find.text('reviews.book_id → books.id'), findsOneWidget);
+    expect(find.text('已加入 3/5'), findsOneWidget);
+
+    // 移除 books：它的外键边、以及 reviews → books 的边都不再显示。
+    await tester.tap(find.byKey(const ValueKey('er-remove-books')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
+    expect(find.text('books.author_id → authors.id'), findsNothing);
+    expect(find.text('reviews.book_id → books.id'), findsNothing);
+    expect(find.text('已加入 2/5'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('画布最多只加入 maxTables 张表', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['t1', 't2', 't3', 't4', 't5', 't6'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    for (final name in <String>['t1', 't2', 't3', 't4', 't5']) {
+      expect(
+        find.byKey(ValueKey('er-node-$name')),
+        findsOneWidget,
+        reason: 'node $name',
+      );
+    }
+    expect(find.byKey(const ValueKey('er-node-t6')), findsNothing);
+    expect(find.text('已加入 5/5'), findsOneWidget);
+    // 画布满了以后「+ 添加表」禁用。
+    final addButton = tester.widget<Btn>(
+      find.byKey(const ValueKey('er-add-table')),
+    );
+    expect(addButton.onPressed, isNull);
+  });
+
+  testWidgets('空画布显示引导文案与 SQLite 提示', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(RelationDesigner(database: 'main', height: 400)),
+    );
+    await settle(tester);
+    expect(find.text('还没有添加表'), findsOneWidget);
+    expect(find.text('添加表后，从字段右侧的圆点拖到另一张表的字段即可创建外键'), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
+    expect(find.text('已加入 0/5'), findsOneWidget);
+  });
+
+  testWidgets('添加表弹窗：搜索 + 复选 + 加入', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('er-add-table')));
+    await settle(tester, rounds: 4);
+    expect(find.byKey(const ValueKey('er-picker-books')), findsOneWidget);
+    // 已在画布上的表仍然列出，但不可再勾选（灰显 + 已加入）。
+    final existing = tester.widget<InkWell>(
+      find.byKey(const ValueKey('er-picker-authors')),
+    );
+    expect(existing.onTap, isNull);
+    expect(find.text('已加入'), findsOneWidget);
+
+    // 搜索缩小列表。
+    await tester.enterText(find.byType(TextField).last, 'book');
+    await settle(tester, rounds: 3);
+    expect(find.byKey(const ValueKey('er-picker-books')), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-picker-reviews')), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('er-picker-books')));
+    await settle(tester, rounds: 3);
+    await tester.tap(find.byKey(const ValueKey('er-picker-join')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-books')), findsOneWidget);
+    expect(find.text('books.author_id → authors.id'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('SQLite 下连接点禁用并给出提示', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
+    final dot = tester.widget<GestureDetector>(
+      find.byKey(const ValueKey('er-connect-books-author_id')),
+    );
+    expect(dot.onPanStart, isNull, reason: '连接点在 SQLite 下必须禁用');
+    // 只读：已有外键仍然显示。
+    expect(find.text('books.author_id → authors.id'), findsOneWidget);
+  });
+
+  testWidgets('SQLite：中间表通过 createTable 一次建表成功', (tester) async {
+    await setSurface(tester);
+    final schema = await tester.runAsync(
+      () => Api.instance.builderSchema('main'),
+    );
+    final rows = erRowsOf(schema!['tables']);
+    final byName = <String, Map<String, dynamic>>{
+      for (final row in rows) erStringOf(row['name']): row,
+    };
+    final orders = ErTable.fromSchema(byName['orders']!);
+    final users = ErTable.fromSchema(byName['users']!);
+    expect(orders.primaryColumn?.name, 'id');
+    expect(users.primaryColumn?.name, 'id');
+
+    final plan = planJunction(
+      driver: ErDriver.sqlite,
+      localTable: orders,
+      refTable: users,
+      existingTableNames: byName.keys.toSet(),
+    );
+    expect(plan, isNotNull);
+    expect(plan!.idType, 'INTEGER');
+
+    await tester.runAsync(
+      () => Api.instance.createTable('main', plan.createTableBody()),
+    );
+    final structure = await tester.runAsync(
+      () => Api.instance.structure('main', plan.name),
+    );
+    final columns = erRowsOf(structure!['columns']);
+    final foreignKeys = erRowsOf(structure['foreign_keys']);
+    expect(columns.length, 3, reason: 'id + 两个外键列: $columns');
+    expect(erStringOf(columns.first['COLUMN_KEY']), 'PRI');
+    expect(foreignKeys.length, 2, reason: '两个内联外键: $foreignKeys');
+
+    // 画布上 junction 表 + 两条关系（SQLite 无约束名，标签是 表.字段 → 表.字段）。
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: <String>['orders', 'users', plan.name],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(ValueKey('er-node-${plan.name}')), findsOneWidget);
+    expect(find.text('orders_users.orders_id → orders.id'), findsOneWidget);
+    expect(find.text('orders_users.users_id → users.id'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('compact 模式嵌入向导：1 张 3 列表格 height 440 不溢出', (tester) async {
+    await setSurface(tester);
+    // 模拟 quick-create 向导第 4 步：SingleChildScrollView 里放 compact 设计器。
+    await tester.pumpWidget(
+      host(
+        SingleChildScrollView(
+          child: RelationDesigner(
+            database: 'main',
+            initialTables: const <String>['people'],
+            compact: true,
+            height: 440,
+          ),
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-people')), findsOneWidget);
+    final box = tester.getSize(find.byKey(const ValueKey('er-node-people')));
+    expect(box.width, 200, reason: 'compact 卡片宽度');
+    // 修复前 Container 边框会把内容缩进 1px，导致节点 Column 底部溢出 2px。
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('点击关系标签打开外键详情；SQLite 下删除按钮禁用', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    await tester.tap(find.text('books.author_id → authors.id'));
+    await settle(tester, rounds: 5);
+    expect(find.text('外键关系'), findsWidgets);
+    expect(find.text('books.author_id'), findsOneWidget);
+    expect(find.text('authors.id'), findsOneWidget);
+    // SQLite 不能用 ALTER 删除外键：按钮存在但禁用。
+    final deleteButton = tester.widget<Btn>(find.widgetWithText(Btn, '删除关系'));
+    expect(deleteButton.onPressed, isNull);
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 12); // 等对话框退出动画结束
+    expect(find.text('books.author_id'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('showRelationDesigner 作为对话框入口可用', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(),
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => Btn(
+              'open',
+              onPressed: () => showRelationDesigner(
+                context,
+                database: 'main',
+                initialTables: const <String>['authors'],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await settle(tester, rounds: 8);
+    expect(find.text('E-R 关系图'), findsWidgets);
+    expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
+    expect(find.widgetWithText(Btn, '关闭'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('英文模式：工具条与画布无中文残留', (tester) async {
+    I18n.setLang(AppLang.en);
+    addTearDown(() => I18n.setLang(AppLang.zh));
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 480,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.text('E-R diagram'), findsOneWidget);
+    expect(find.text('+ Add table'), findsOneWidget);
+    expect(find.text('Added 2/5'), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
+    // 表名 / 列名 / 箭头标签是数据，其它可见文案必须是英文。
+    final offenders = <String>{};
+    for (final widget in tester.allWidgets) {
+      if (widget is app_text.Text) {
+        final rendered = lit.trLiteral(widget.data);
+        if (RegExp(r'[一-鿿]').hasMatch(rendered)) {
+          offenders.add(rendered);
+        }
+      }
+    }
+    expect(offenders, isEmpty, reason: '未翻译的中文: $offenders');
+    expect(find.text('books.author_id → authors.id'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  test('中文动作文案不出现 SQL 关键字；英文界面才显示 SQL', () {
+    for (final action in kErFkActions) {
+      final deleteLabel = erFkActionLabel(action, onDelete: true);
+      final updateLabel = erFkActionLabel(action, onDelete: false);
+      for (final label in <String>[deleteLabel, updateLabel]) {
+        expect(label.contains('CASCADE'), isFalse, reason: label);
+        expect(label.contains('SET NULL'), isFalse, reason: label);
+        expect(label.contains('RESTRICT'), isFalse, reason: label);
+      }
+    }
+    expect(erFkActionLabel('CASCADE', onDelete: true), '级联（一并删除子行）');
+    expect(erFkActionLabel('SET NULL', onDelete: true), '置空（仅可空字段）');
+
+    I18n.setLang(AppLang.en);
+    addTearDown(() => I18n.setLang(AppLang.zh));
+    expect(erFkActionLabel('CASCADE', onDelete: true), 'ON DELETE CASCADE');
+    expect(erFkActionLabel('SET NULL', onDelete: false), 'ON UPDATE SET NULL');
+    expect(erFkActionLabel('', onDelete: true), 'NO ACTION');
+  });
+}

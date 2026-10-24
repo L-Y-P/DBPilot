@@ -13,6 +13,8 @@ import '../sqlite_actions.dart';
 import '../theme.dart';
 import '../widgets.dart';
 import 'create_table_dialog.dart';
+import 'quick_create_table_wizard.dart';
+import 'relation_designer.dart';
 
 /// Rows per page in the 数据表 and 对象 cards.
 ///
@@ -595,6 +597,19 @@ class _DatabaseViewState extends State<DatabaseView> {
                   onPressed: _denied(_actionCreateTable)
                       ? null
                       : () => _showCreateTableDialog()),
+              // Round 50: the second way to create tables — from a data file.
+              // It goes through the same CREATE TABLE + import pipeline as the
+              // import wizard instead of writing SQL by hand.
+              Btn('从文件建表',
+                  tooltip: '选择 CSV / Excel 等数据文件，按工作表快速建表并导入数据',
+                  onPressed:
+                      _denied(_actionCreateTable) ? null : _showQuickCreateWizard),
+              // Round 50: the place to configure relationships created during an
+              // import. The importer's last step opens the same designer seeded
+              // with the imported table; this entry reopens it later.
+              Btn('关系图',
+                  tooltip: '查看并编辑表之间的外键关系',
+                  onPressed: _showRelationDesigner),
               if (isSqlite) ...[
                 Btn('打开目录', onPressed: _revealDatabaseFolder),
                 // The primary file *is* the connection: deleting it would break
@@ -1088,11 +1103,41 @@ class _DatabaseViewState extends State<DatabaseView> {
           _learnPermissionFailure(_actionCreateTable, error);
         }
       },
+      // The title-bar entry closes the designer and hands over to the wizard.
+      onQuickCreate: _showQuickCreateWizard,
     );
     if (!created || !mounted) return;
     widget.notice.show('表已创建');
     AppState.instance.bumpExplorer();
     await _load();
+  }
+
+  /// 从文件建表（第 50 轮）：选择数据文件 → 工作表与字段 → 建表并导入 → 建立关联。
+  ///
+  /// The wizard shows its own success toast ("已创建 N 张表") because it alone
+  /// knows the final count; this page only refreshes the table list afterwards.
+  Future<void> _showQuickCreateWizard() async {
+    final created = await showQuickCreateTableWizard(
+      context,
+      database: _namespace,
+      notice: widget.notice,
+    );
+    if (!created || !mounted) return;
+    AppState.instance.bumpExplorer();
+    await _load();
+  }
+
+  /// 打开独立的 E-R 关系设计器，用于稍后继续配置导入时建立/遗漏的外键。
+  Future<void> _showRelationDesigner() async {
+    await showRelationDesigner(
+      context,
+      database: _namespace,
+      notice: widget.notice,
+      onChanged: () async {
+        AppState.instance.bumpExplorer();
+        await _load();
+      },
+    );
   }
 }
 /// Text of the 大小 cell for one table row.

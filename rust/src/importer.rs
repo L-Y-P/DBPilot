@@ -41,6 +41,9 @@ pub const DEFAULT_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SQL_STATEMENT_BYTES: usize = 16 * 1024 * 1024;
 /// Preview reads at most this many records.
 pub const MAX_PREVIEW_RECORDS: usize = 20;
+/// 超过这个大小的 Excel 文件，inspect 只加载第一张可见工作表（其余工作表只给名字），
+/// 避免选文件时把几十 MB 的所有工作表都解析一遍。行数/列数在选中工作表后读取。
+pub const INSPECT_LIGHT_EXCEL_BYTES: u64 = 8 * 1024 * 1024;
 
 fn default_true() -> bool {
     true
@@ -110,6 +113,13 @@ pub struct ReadSpec {
     pub trim: bool,
     #[serde(default = "default_max_record")]
     pub max_record_bytes: usize,
+    /// Excel 系格式：要导入的工作表名；也接受 0-based 序号字符串（"0"）。
+    /// 空/缺省表示第一张可见工作表。其他格式忽略本字段。
+    #[serde(default, deserialize_with = "deserialize_sheet_selector")]
+    pub sheet: Option<String>,
+    /// Excel 系格式：跳过工作表最前面的 N 行（表头判定在跳过之后）。
+    #[serde(default)]
+    pub skip_rows: usize,
 }
 
 impl Default for ReadSpec {
@@ -124,8 +134,25 @@ impl Default for ReadSpec {
             skip_blank: true,
             trim: true,
             max_record_bytes: default_max_record(),
+            sheet: None,
+            skip_rows: 0,
         }
     }
+}
+
+/// read.sheet 允许字符串（工作表名）或数字（0-based 序号），统一成字符串。
+fn deserialize_sheet_selector<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if text.trim().is_empty() => None,
+        Some(Value::String(text)) => Some(text),
+        Some(Value::Number(number)) => Some(number.to_string()),
+        Some(_) => None,
+    })
 }
 
 /// How the fields of one record are written.
@@ -524,7 +551,7 @@ pub fn detect_bom(head: &[u8]) -> (usize, &'static str) {
 // ---------------------------------------------------------------- record scan
 
 /// One record's text plus where it was found in the file.
-struct RecordScanner {
+struct TextScanner {
     stream: ByteStream,
     read: ReadSpec,
     fields: FieldSpec,
@@ -536,11 +563,11 @@ struct RecordScanner {
     explicit_end: bool,
 }
 
-impl RecordScanner {
-    fn open(spec: &ParseSpec) -> AppResult<RecordScanner> {
+impl TextScanner {
+    fn open(spec: &ParseSpec) -> AppResult<TextScanner> {
         std::fs::metadata(&spec.path)
             .map_err(|e| AppError::bad(format!("无法读取文件: {e}")))?;
-        Ok(RecordScanner {
+        Ok(TextScanner {
             stream: ByteStream::open(&spec.path)?,
             read: normalize_read(&spec.read),
             fields: spec.fields.clone(),
@@ -995,6 +1022,140 @@ impl RecordScanner {
     }
 }
 
+// ---------------------------------------------------------------- record scan
+
+/// Record scanner used by preview / validate / probe / execute.
+///
+/// Text formats keep the streaming byte reader (never loads the file); Excel
+/// formats read the selected worksheet up front (calamine has no streaming API)
+/// and hand the pipeline one JSON-array record per row, so header parsing,
+/// mapping and conversion are shared with the CSV path.
+enum RecordScanner {
+    Text(TextScanner),
+    Excel(ExcelScanner),
+}
+
+/// Excel 类型的进度：没有字节偏移，按「已读行 / 表总行数」计算百分比。
+struct ExcelProgress {
+    sheet: String,
+    done: u64,
+    total: u64,
+}
+
+/// 工作簿的表目录 + 当前选中的表（preview 回显用）。
+struct ExcelMeta {
+    sheet: String,
+    total_rows: u64,
+    sheets: Vec<Value>,
+}
+
+/// Excel 行扫描器：选中的工作表一次性载入，逐行序列化成 JSON 数组记录。
+struct ExcelScanner {
+    rows: std::vec::IntoIter<Vec<Value>>,
+    /// 当前行号（相当于工作表里的第几行；skip_rows 之后的物理位置）。
+    first_line: u64,
+    next_index: u64,
+    meta: ExcelMeta,
+}
+
+impl ExcelScanner {
+    fn open(spec: &ParseSpec) -> AppResult<ExcelScanner> {
+        let kind = crate::excel_import::detect(&spec.path)?.ok_or_else(|| {
+            AppError::bad("无法识别为 Excel 文件（支持 xlsx/xls/xlsb/ods/SpreadsheetML）")
+        })?;
+        let crate::excel_import::SelectedSheet { sheet, sheets, .. } =
+            crate::excel_import::read_selected(
+                &spec.path,
+                kind,
+                spec.read.sheet.as_deref(),
+                spec.read.skip_rows,
+            )?;
+        let meta = ExcelMeta {
+            sheet: sheet.name,
+            total_rows: sheet.rows.len() as u64,
+            sheets: sheets.iter().map(|brief| brief.to_json()).collect(),
+        };
+        Ok(ExcelScanner {
+            rows: sheet.rows.into_iter(),
+            first_line: spec.read.skip_rows as u64 + 1,
+            next_index: 0,
+            meta,
+        })
+    }
+
+    fn next(&mut self) -> Option<ScanItem> {
+        let values = self.rows.next()?;
+        let index = self.next_index;
+        self.next_index += 1;
+        let text = serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
+        Some(ScanItem::Record(RawRecord {
+            index,
+            // Excel 没有字节偏移：offset 恒为 0，行号按工作表实际行号报告。
+            offset: 0,
+            line: self.first_line + index,
+            text,
+        }))
+    }
+}
+
+impl RecordScanner {
+    fn open(spec: &ParseSpec) -> AppResult<RecordScanner> {
+        if spec.fields.mode == "excel" {
+            Ok(RecordScanner::Excel(ExcelScanner::open(spec)?))
+        } else {
+            Ok(RecordScanner::Text(TextScanner::open(spec)?))
+        }
+    }
+
+    fn next(&mut self) -> AppResult<Option<ScanItem>> {
+        match self {
+            RecordScanner::Text(scanner) => scanner.next(),
+            RecordScanner::Excel(scanner) => Ok(scanner.next()),
+        }
+    }
+
+    /// Excel 的按行进度；文本格式返回 None（继续用字节进度）。
+    fn excel_progress(&self) -> Option<ExcelProgress> {
+        match self {
+            RecordScanner::Excel(scanner) => Some(ExcelProgress {
+                sheet: scanner.meta.sheet.clone(),
+                done: scanner.next_index,
+                total: scanner.meta.total_rows,
+            }),
+            RecordScanner::Text(_) => None,
+        }
+    }
+
+    /// 当前工作表/表目录（preview 回显）；文本格式返回 None。
+    fn excel_meta(&self) -> Option<&ExcelMeta> {
+        match self {
+            RecordScanner::Excel(scanner) => Some(&scanner.meta),
+            RecordScanner::Text(_) => None,
+        }
+    }
+}
+
+/// Excel 进度是行数而不是字节：percent 按「已读行 / 总行数」，message 说明工作表。
+fn apply_excel_progress(
+    state: &mut Progress,
+    progress: &ExcelProgress,
+    total_bytes: u64,
+    started: Instant,
+) {
+    let total = progress.total.max(1);
+    let done = progress.done.min(total);
+    state.percent = (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
+    if total_bytes > 0 {
+        // 先乘后除，保证 done == total 时正好等于总字节数（避免整数除法余数）。
+        state.bytes = total_bytes.saturating_mul(done) / total;
+    }
+    state.message = format!(
+        "工作表 {} · 第 {}/{} 行",
+        progress.sheet, progress.done, progress.total
+    );
+    state.refresh(started);
+}
+
 fn normalize_read(read: &ReadSpec) -> ReadSpec {
     let mut read = read.clone();
     read.mode = match read.mode.as_str() {
@@ -1118,7 +1279,9 @@ pub fn parse_row(text: &str, spec: &FieldSpec) -> Result<ParsedRow, String> {
         "html" => return parse_html_row(text),
         "spreadsheet" => return parse_spreadsheet_row(text),
         "markdown" => return parse_markdown_row(text),
-        "json" => match serde_json::from_str::<Value>(text) {
+        // "excel" 是 Excel 扫描器序列化出来的一行（JSON 数组文本），
+        // 与 JSON 数组共用同一套解析/NULL 语义（契约 §2.2）。
+        "json" | "excel" => match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(map)) => Ok(ParsedRow::Keyed(map)),
             Ok(Value::Array(values)) => Ok(ParsedRow::Positional(values)),
             Ok(other) => Err(format!(
@@ -1159,7 +1322,7 @@ pub fn parse_row(text: &str, spec: &FieldSpec) -> Result<ParsedRow, String> {
 //   CSV/TXT    \N                            vs (empty)
 
 /// Unescape the five XML entities the exporter writes.
-fn xml_unescape(text: &str) -> String {
+pub(crate) fn xml_unescape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(amp) = rest.find('&') {
@@ -1202,7 +1365,7 @@ fn inner_of<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 /// Value of `name="..."` inside the first tag of `text`.
-fn attr_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn attr_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let needle = format!("{name}=\"");
     let start = text.find(&needle)? + needle.len();
     let end = text[start..].find('"')? + start;
@@ -1285,7 +1448,7 @@ fn parse_html_row(text: &str) -> Result<ParsedRow, String> {
 ///
 /// `<Cell/>` is NULL; `ss:Index` (which Excel writes for sparse rows) skips
 /// positions so the values stay aligned with the header.
-fn parse_spreadsheet_row(text: &str) -> Result<ParsedRow, String> {
+pub(crate) fn parse_spreadsheet_row(text: &str) -> Result<ParsedRow, String> {
     let mut values: Vec<Value> = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("<Cell") {
@@ -1315,11 +1478,11 @@ fn parse_spreadsheet_row(text: &str) -> Result<ParsedRow, String> {
                     .unwrap_or("String");
                 let raw = xml_unescape(data);
                 values.push(match kind {
+                    // 整数值输出成 JSON 整数（1.0 → 1）：记录文本/样本与类型推断
+                    // 都不再需要区分「Excel 数字是浮点」这件事。
                     "Number" => raw
                         .parse::<f64>()
-                        .ok()
-                        .and_then(serde_json::Number::from_f64)
-                        .map(Value::Number)
+                        .map(crate::excel_import::normalize_number)
                         .unwrap_or(Value::String(raw)),
                     "Boolean" => Value::Bool(raw == "1" || raw.eq_ignore_ascii_case("true")),
                     _ => Value::String(raw),
@@ -1439,6 +1602,20 @@ fn header_of(text: &str, spec: &FieldSpec) -> Result<Vec<String>, String> {
                 .collect(),
             ParsedRow::Keyed(map) => map.keys().cloned().collect(),
         },
+        // Excel 的一行是 JSON 数组文本（见 excel_import）；表头按数组规则取列名。
+        "excel" => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Array(values)) => values
+                .into_iter()
+                .map(|value| match value {
+                    Value::String(s) => s,
+                    Value::Null => String::new(),
+                    other => other.to_string(),
+                })
+                .collect(),
+            Ok(Value::Object(map)) => map.keys().cloned().collect(),
+            Ok(_) => return Err("Excel 记录不是 JSON 数组".to_string()),
+            Err(e) => return Err(format!("JSON 解析失败: {e}")),
+        },
         _ => split_fields(text, &spec.field_sep, &spec.quote, &spec.escape, true)?,
     };
     if fields.is_empty() {
@@ -1448,6 +1625,11 @@ fn header_of(text: &str, spec: &FieldSpec) -> Result<Vec<String>, String> {
     for (i, name) in fields.iter().enumerate() {
         let name = name.trim().to_string();
         if name.is_empty() {
+            // Excel 表头允许留空单元格：按位置补列名，映射/建表都能继续。
+            if spec.mode == "excel" {
+                names.push(format!("column_{}", i + 1));
+                continue;
+            }
             return Err(format!("表头第 {} 列为空", i + 1));
         }
         if names.iter().any(|n| n == &name) {
@@ -1456,6 +1638,14 @@ fn header_of(text: &str, spec: &FieldSpec) -> Result<Vec<String>, String> {
         names.push(name);
     }
     Ok(names)
+}
+
+/// 哪些字段方式会消费「第一条记录 = 表头」（Excel 的 excel 模式同 CSV 数组规则）。
+fn is_header_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "delimited" | "xml" | "html" | "spreadsheet" | "markdown" | "excel"
+    )
 }
 
 // ---------------------------------------------------------------- table types
@@ -1773,10 +1963,26 @@ fn convert_value(raw: Value, column: &TableColumn, mapping: &MappingSpec) -> Res
             Value::Bool(value) => Ok(if value { json!(1) } else { json!(0) }),
             _ => Err(format!("列 '{}' 需要数字", column.name)),
         },
-        ColumnKind::Bool => Err(format!(
-            "列 '{}' 需要布尔值（true/false/1/0），但值是 ''",
-            column.name
-        )),
+        // Structured formats (JSON / Excel cells) deliver real booleans and
+        // 0/1 numbers instead of text. This branch used to reject them outright,
+        // which made a PostgreSQL BOOLEAN target unimportable from a workbook
+        // even though the cell *was* a boolean.
+        ColumnKind::Bool => match raw {
+            Value::Bool(value) => Ok(Value::Bool(value)),
+            Value::Number(number) => match number.as_i64() {
+                Some(0) => Ok(Value::Bool(false)),
+                Some(1) => Ok(Value::Bool(true)),
+                _ => Err(format!(
+                    "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
+                    column.name, number
+                )),
+            },
+            other => Err(format!(
+                "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
+                column.name,
+                snippet(&other.to_string(), 40)
+            )),
+        },
         ColumnKind::Date => Err(format!(
             "列 '{}' 是日期时间类型，请使用文本格式（如 2024-01-02 03:04:05）",
             column.name
@@ -2268,12 +2474,22 @@ pub fn read_suffix(path: &str, max: usize) -> AppResult<Vec<u8>> {
 }
 
 /// Inspect a data file and suggest a read/field rule.
+///
+/// Excel 系格式先按文件内容识别（ZIP/OLE2 魔数优先于扩展名），再走工作簿分支：
+/// 返回 sheets / sheet / read.sheet / read.skip_rows / fields.mode = "excel"；
+/// 其余文本格式保持原来的检测顺序。
 pub fn inspect(path: &str) -> AppResult<Value> {
     let info = file_info(path)?;
     let head = read_prefix(path, 16 * 1024)?;
     let tail = read_suffix(path, 8 * 1024)?;
     let (bom, encoding) = detect_bom(&head);
     let mut warnings: Vec<String> = Vec::new();
+
+    // 内容优先：xlsx/xls/xlsb/ods/SpreadsheetML 都是工作簿，走上表分支。
+    if let Some(kind) = crate::excel_import::detect(path)? {
+        return inspect_excel(path, &info, kind, &head, &tail, bom, encoding, warnings);
+    }
+
     if encoding == "utf-16le" || encoding == "utf-16be" {
         warnings.push("文件是 UTF-16 编码，暂不支持；请另存为 UTF-8".to_string());
     }
@@ -2292,7 +2508,7 @@ pub fn inspect(path: &str) -> AppResult<Value> {
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     let trimmed = head_str
-        .trim_start_matches('\u{feff}')
+        .trim_start_matches('﻿')
         .trim_start()
         .to_string();
     let tail_trimmed = tail_str.trim_end().to_string();
@@ -2303,20 +2519,8 @@ pub fn inspect(path: &str) -> AppResult<Value> {
     // The structural formats the exporter writes. Each one is recognised by
     // its extension OR by its own opening marker, because a file renamed to
     // .txt still has to import.
-    // Excel (SpreadsheetML) is XML too, so it has to be tested FIRST or the
-    // generic XML branch would claim the workbook and look for <rows>.
-    if ext == "xls" || trimmed.contains("mso-application progid=\"Excel.Sheet\"") {
-        format = "excel".to_string();
-        fields.mode = "spreadsheet".to_string();
-        fields.header = true;
-        read.mode = "wrapped".to_string();
-        // The workbook opens with an <?xml?> prolog, so the wrapper PREFIX cannot
-        // match, but </Table> terminates the row list.
-        read.wrapper_start = String::new();
-        read.wrapper_end = "</Table>".to_string();
-        read.record_sep = "</Row>".to_string();
-        read.quote = String::new();
-    } else if ext == "xml" || trimmed.starts_with("<?xml") || trimmed.starts_with("<rows") {
+    // Excel (SpreadsheetML) is handled by excel_import above (content-first).
+    if ext == "xml" || trimmed.starts_with("<?xml") || trimmed.starts_with("<rows") {
         format = "xml".to_string();
         fields.mode = "xml".to_string();
         read.mode = "wrapped".to_string();
@@ -2396,6 +2600,135 @@ pub fn inspect(path: &str) -> AppResult<Value> {
     }))
 }
 
+/// Excel 系文件的 inspect：列出工作表、给出默认的 read/fields 规则。
+///
+/// 大文件（超过 [INSPECT_LIGHT_EXCEL_BYTES]）走轻量路径：只解析第一张可见工作表，
+/// 其余工作表只返回名字（契约允许 sheets[] 不带 rows/cols，选表后再按需读取），
+/// 否则每次打开文件选择器都要把所有工作表整表读进内存。
+fn inspect_excel(
+    path: &str,
+    info: &FileInfo,
+    kind: crate::excel_import::ExcelKind,
+    head: &[u8],
+    tail: &[u8],
+    bom: usize,
+    encoding: &'static str,
+    mut warnings: Vec<String>,
+) -> AppResult<Value> {
+    let light = info.size > INSPECT_LIGHT_EXCEL_BYTES;
+    let mut sheets: Vec<Value> = Vec::new();
+    let hidden_sheets: usize;
+    let default_name: String;
+    let default_rows: Vec<Vec<Value>>;
+
+    if light {
+        let selected = crate::excel_import::read_selected(path, kind, None, 0)?;
+        hidden_sheets = selected.hidden_sheets;
+        let sheet = selected.sheet;
+        default_name = sheet.name.clone();
+        let sheet_cols = sheet.cols;
+        default_rows = sheet.rows;
+        for (index, brief) in selected.sheets.iter().enumerate() {
+            if index == 0 {
+                sheets.push(json!({
+                    "index": index,
+                    "name": brief.name,
+                    "rows": default_rows.len(),
+                    "cols": sheet_cols,
+                }));
+            } else {
+                sheets.push(json!({ "index": index, "name": brief.name }));
+            }
+        }
+        warnings.push(format!(
+            "文件较大（{} MB）：为加快识别只读取第一张工作表的行数/列数；其余工作表在选中后加载",
+            info.size / (1024 * 1024)
+        ));
+    } else {
+        let crate::excel_import::ExcelBook {
+            sheets: all_sheets,
+            hidden_sheets: hidden,
+        } = crate::excel_import::read_book(path, kind)?;
+        let mut iter = all_sheets.into_iter();
+        let default_sheet = iter
+            .next()
+            .ok_or_else(|| AppError::bad("工作簿里没有可见的工作表"))?;
+        let rest: Vec<_> = iter.collect();
+        hidden_sheets = hidden;
+        default_name = default_sheet.name.clone();
+        let total_cells = default_sheet
+            .rows
+            .len()
+            .saturating_mul(default_sheet.cols)
+            .saturating_add(
+                rest.iter()
+                    .map(|sheet| sheet.rows.len().saturating_mul(sheet.cols))
+                    .sum::<usize>(),
+            );
+        if total_cells > 100_000 || info.size > 20 * 1024 * 1024 {
+            warnings.push(format!(
+                "工作表已整体载入内存（当前表 {} 行 × {} 列）：超大工作簿会占用较多内存",
+                default_sheet.rows.len(),
+                default_sheet.cols
+            ));
+        }
+        sheets.push(default_sheet.brief());
+        for sheet in &rest {
+            sheets.push(sheet.brief());
+        }
+        default_rows = default_sheet.rows;
+    }
+
+    if sheets.len() > 1 {
+        warnings.push(format!(
+            "检测到 {} 个工作表：当前导入所选工作表；一次导入多个工作表请用「从文件建表」",
+            sheets.len()
+        ));
+    }
+    if hidden_sheets > 0 {
+        warnings.push(format!("已忽略 {} 个隐藏工作表", hidden_sheets));
+    }
+    // 表头启发式与 CSV 一致：首行全是非空文本且至少还有一行数据。
+    let header = default_rows.len() > 1
+        && default_rows[0]
+            .iter()
+            .all(|value| matches!(value, Value::String(text) if !text.trim().is_empty()));
+
+    let mut read = ReadSpec::default();
+    read.mode = "line".to_string();
+    read.sheet = Some(default_name.clone());
+    read.skip_rows = 0;
+    let mut fields = FieldSpec::default();
+    fields.mode = "excel".to_string();
+    fields.header = header;
+
+    // 二进制工作簿没有可读文本预览；SpreadsheetML 仍是 XML 文本。
+    let (head_text, tail_text, encoding) = if kind.is_binary() {
+        (String::new(), String::new(), "binary")
+    } else {
+        (
+            snippet_keep(&String::from_utf8_lossy(&head[bom.min(head.len())..]), 4000),
+            snippet_keep(&String::from_utf8_lossy(tail), 2000),
+            encoding,
+        )
+    };
+
+    Ok(json!({
+        "path": path,
+        "name": info.name,
+        "size": info.size,
+        "encoding": encoding,
+        "format": kind.format(),
+        "read": read,
+        "fields": fields,
+        "sheets": sheets,
+        "sheet": default_name,
+        "head": head_text,
+        "tail": tail_text,
+        "warnings": warnings,
+    }))
+}
+
 /// First line starts with `|` and the second is a `| --- |` rule.
 fn looks_like_markdown(text: &str) -> bool {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
@@ -2449,8 +2782,49 @@ fn snippet_keep(text: &str, max_chars: usize) -> String {
 
 // ---------------------------------------------------------------- preview
 
+/// Collect one parsed data row for the schema inference sample.
+///
+/// Keyed records (XML / JSON) have no header record in the wizard's sense, so
+/// the key order of the first row becomes the column order; when a header was
+/// parsed, the row is reordered to that header so values stay aligned.
+fn push_schema_row(
+    keys: &mut Option<Vec<String>>,
+    rows: &mut Vec<Vec<Value>>,
+    header: Option<&[String]>,
+    row: ParsedRow,
+) {
+    match row {
+        ParsedRow::Positional(values) => rows.push(mark_null_tokens(values)),
+        ParsedRow::Keyed(map) => {
+            if let Some(header) = header {
+                rows.push(
+                    header
+                        .iter()
+                        .map(|key| mark_null_token(map.get(key).cloned().unwrap_or(Value::Null)))
+                        .collect(),
+                );
+                return;
+            }
+            if keys.is_none() {
+                *keys = Some(map.keys().cloned().collect());
+            }
+            let ordered = keys.as_ref().expect("keys set above");
+            rows.push(
+                ordered
+                    .iter()
+                    .map(|key| mark_null_token(map.get(key).cloned().unwrap_or(Value::Null)))
+                    .collect(),
+            );
+        }
+    }
+}
+
 /// Read a few records and parse them so the wizard can echo back exactly how
 /// the current rule splits the file.
+///
+/// Besides the echoed records this samples up to SCHEMA_SAMPLE_ROWS data rows
+/// (header excluded) and returns the inferred schema used by the "create tables
+/// from file" wizard. The echo itself is still capped by the limit argument.
 pub fn preview(spec: &ParseSpec, limit: usize) -> AppResult<Value> {
     let info = file_info(&spec.path)?;
     let limit = limit.clamp(1, MAX_PREVIEW_RECORDS);
@@ -2458,8 +2832,11 @@ pub fn preview(spec: &ParseSpec, limit: usize) -> AppResult<Value> {
     let mut records: Vec<Value> = Vec::new();
     let mut issues: Vec<Value> = Vec::new();
     let mut header: Option<Vec<String>> = None;
-    let mut header_done = !spec.fields.header || !matches!(spec.fields.mode.as_str(), "delimited" | "xml" | "html" | "spreadsheet" | "markdown");
+    let mut header_done = !spec.fields.header || !is_header_mode(&spec.fields.mode);
     let mut read_bytes = 0u64;
+    // 类型推断样本与回显分开：回显只看前 limit 条，schema 最多扫 1000 行。
+    let mut schema_rows: Vec<Vec<Value>> = Vec::new();
+    let mut schema_keys: Option<Vec<String>> = None;
     while records.len() < limit {
         match scanner.next()? {
             None => break,
@@ -2519,12 +2896,20 @@ pub fn preview(spec: &ParseSpec, limit: usize) -> AppResult<Value> {
                         for (k, v) in map {
                             marked.insert(k, mark_null_token(v));
                         }
-                        item["values"] = json!(marked);
+                        item["values"] = json!(marked.clone());
+                        push_schema_row(
+                            &mut schema_keys,
+                            &mut schema_rows,
+                            header.as_deref(),
+                            ParsedRow::Keyed(marked),
+                        );
                     }
                     Ok(ParsedRow::Positional(values)) => {
                         item["kind"] = json!("array");
                         item["field_count"] = json!(values.len());
-                        item["values"] = json!(mark_null_tokens(values));
+                        let marked = mark_null_tokens(values);
+                        item["values"] = json!(marked.clone());
+                        schema_rows.push(marked);
                     }
                     Err(message) => {
                         item["error"] = json!(message.clone());
@@ -2543,6 +2928,55 @@ pub fn preview(spec: &ParseSpec, limit: usize) -> AppResult<Value> {
             }
         }
     }
+    // 继续扫到 1000 行数据，只用于 schema，不进入回显。
+    while schema_rows.len() < crate::excel_import::SCHEMA_SAMPLE_ROWS {
+        match scanner.next()? {
+            None => break,
+            Some(ScanItem::Problem(problem)) => {
+                if issues.len() < DEFAULT_MAX_ISSUES {
+                    issues.push(issue_json(
+                        records.len() as u64,
+                        problem.line,
+                        problem.offset,
+                        &problem.message,
+                        "",
+                    ));
+                }
+                if problem.fatal {
+                    break;
+                }
+            }
+            Some(ScanItem::Record(record)) => match parse_row(&record.text, &spec.fields) {
+                Ok(row) => push_schema_row(
+                    &mut schema_keys,
+                    &mut schema_rows,
+                    header.as_deref(),
+                    row,
+                ),
+                Err(message) => {
+                    if issues.len() < DEFAULT_MAX_ISSUES {
+                        issues.push(issue_json(
+                            record.index,
+                            record.line,
+                            record.offset,
+                            &message,
+                            &record.text,
+                        ));
+                    }
+                }
+            },
+        }
+    }
+    let schema_header = header.clone().or(schema_keys);
+    let schema = crate::excel_import::infer_schema(
+        schema_header.as_deref(),
+        &schema_rows,
+        crate::excel_import::SCHEMA_SAMPLE_ROWS,
+    );
+    let (sheet_used, sheets) = match scanner.excel_meta() {
+        Some(meta) => (json!(meta.sheet), json!(meta.sheets)),
+        None => (Value::Null, Value::Null),
+    };
     Ok(json!({
         "path": spec.path,
         "size": info.size,
@@ -2550,6 +2984,9 @@ pub fn preview(spec: &ParseSpec, limit: usize) -> AppResult<Value> {
         "header": header,
         "issues": issues,
         "read_bytes": read_bytes,
+        "sheet_used": sheet_used,
+        "sheets": sheets,
+        "schema": schema,
     }))
 }
 
@@ -2575,7 +3012,7 @@ pub fn probe_first_row(spec: &ValidateSpec, table_columns: &[TableColumn]) -> Ap
     let resolved = resolve_mapping(mapping, table_columns)?;
     let mut scanner = RecordScanner::open(&spec.parse)?;
     let mut header: Option<Vec<String>> = None;
-    let mut header_pending = spec.parse.fields.header && matches!(spec.parse.fields.mode.as_str(), "delimited" | "xml" | "html" | "spreadsheet" | "markdown");
+    let mut header_pending = spec.parse.fields.header && is_header_mode(&spec.parse.fields.mode);
     loop {
         match scanner.next()? {
             None => return Err(AppError::bad("文件中没有可导入的数据记录")),
@@ -2694,7 +3131,7 @@ pub fn validate(
     let mut invalid = 0u64;
     let mut fatal = false;
     let mut header: Option<Vec<String>> = None;
-    let mut header_pending = spec.parse.fields.header && matches!(spec.parse.fields.mode.as_str(), "delimited" | "xml" | "html" | "spreadsheet" | "markdown");
+    let mut header_pending = spec.parse.fields.header && is_header_mode(&spec.parse.fields.mode);
     let mut cancelled = false;
 
     loop {
@@ -2734,6 +3171,14 @@ pub fn validate(
                             progress_state.records = records;
                             progress_state.bytes = bytes_read;
                             progress_state.refresh(started);
+                            if let Some(excel) = scanner.excel_progress() {
+                                apply_excel_progress(
+                                    &mut progress_state,
+                                    &excel,
+                                    total_bytes,
+                                    started,
+                                );
+                            }
                             progress(&progress_state);
                             continue;
                         }
@@ -2806,6 +3251,9 @@ pub fn validate(
         progress_state.rows = data_records;
         progress_state.failed = invalid;
         progress_state.refresh(started);
+        if let Some(excel) = scanner.excel_progress() {
+            apply_excel_progress(&mut progress_state, &excel, total_bytes, started);
+        }
         progress(&progress_state);
     }
     if !fatal && !cancelled && bytes_read < total_bytes {
@@ -2817,6 +3265,9 @@ pub fn validate(
     progress_state.rows = data_records;
     progress_state.failed = invalid;
     progress_state.refresh(started);
+    if let Some(excel) = scanner.excel_progress() {
+        apply_excel_progress(&mut progress_state, &excel, total_bytes, started);
+    }
     progress(&progress_state);
 
     Ok(json!({
@@ -2894,8 +3345,10 @@ pub async fn execute(
     let mut issues: Vec<Value> = Vec::new();
     let mut header: Option<Vec<String>> = None;
     let mut header_plan: Option<HeaderPlan> = None;
-    let mut header_pending =
-        spec.validate.parse.fields.header && spec.validate.parse.fields.mode == "delimited";
+    // execute 一直只给 delimited 跳过表头；"excel" 的记录同样是「首条 = 表头」，
+    // 因此必须一起处理，否则表头行会被当成数据插进去。
+    let mut header_pending = spec.validate.parse.fields.header
+        && matches!(spec.validate.parse.fields.mode.as_str(), "delimited" | "excel");
     let mut cancelled = false;
     let mut stopped = false;
     let mut stop_message = String::new();
@@ -3027,6 +3480,14 @@ pub async fn execute(
                             progress_state.records = records;
                             progress_state.bytes = bytes_read;
                             progress_state.refresh(started);
+                            if let Some(excel) = scanner.excel_progress() {
+                                apply_excel_progress(
+                                    &mut progress_state,
+                                    &excel,
+                                    total_bytes,
+                                    started,
+                                );
+                            }
                             progress(&progress_state);
                             continue;
                         }
@@ -3115,6 +3576,9 @@ pub async fn execute(
             progress_state.rows = rows_inserted;
             progress_state.failed = rows_failed;
             progress_state.refresh(started);
+            if let Some(excel) = scanner.excel_progress() {
+                apply_excel_progress(&mut progress_state, &excel, total_bytes, started);
+            }
             progress(&progress_state);
         }
         if stopped {
@@ -3137,6 +3601,9 @@ pub async fn execute(
     progress_state.rows = rows_inserted;
     progress_state.failed = rows_failed;
     progress_state.refresh(started);
+    if let Some(excel) = scanner.excel_progress() {
+        apply_excel_progress(&mut progress_state, &excel, total_bytes, started);
+    }
     progress(&progress_state);
 
     Ok(json!({
@@ -4208,5 +4675,686 @@ mod round_trip_tests {
                 "{format}: entities must be decoded again: {text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod excel_tests {
+    use super::*;
+    use crate::drivers::{ConnSpec, DriverKind};
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
+    }
+
+    fn temp_file(name: &str, content: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("rma-excel-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn parse_spec(path: &str, read: ReadSpec, fields: FieldSpec) -> ParseSpec {
+        ParseSpec {
+            path: path.to_string(),
+            read,
+            fields,
+        }
+    }
+
+    fn csv_fields(header: bool, sep: &str) -> FieldSpec {
+        FieldSpec {
+            mode: "delimited".to_string(),
+            field_sep: sep.to_string(),
+            quote: "\"".to_string(),
+            escape: String::new(),
+            trim: true,
+            header,
+        }
+    }
+
+    fn spec_from_inspect(path: &str) -> (Value, ParseSpec) {
+        let info = inspect(path).expect("inspect");
+        let spec = ParseSpec {
+            path: path.to_string(),
+            read: serde_json::from_value(info["read"].clone()).expect("read spec"),
+            fields: serde_json::from_value(info["fields"].clone()).expect("fields spec"),
+        };
+        (info, spec)
+    }
+
+    fn sheet_spec(path: &str, sheet: Option<&str>, skip_rows: usize, header: bool) -> ParseSpec {
+        let (_, mut spec) = spec_from_inspect(path);
+        spec.read.sheet = sheet.map(str::to_string);
+        spec.read.skip_rows = skip_rows;
+        spec.fields.header = header;
+        spec
+    }
+
+    fn column(name: &str, data_type: &str, nullable: bool) -> TableColumn {
+        TableColumn {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            type_name: data_type.to_string(),
+            nullable,
+            auto_increment: false,
+        }
+    }
+
+    fn named_mapping(columns: &[(&str, &str)]) -> MappingSpec {
+        MappingSpec {
+            columns: columns
+                .iter()
+                .map(|(column, source)| ColumnMap {
+                    column: column.to_string(),
+                    source: json!(source),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn schema_column(schema: &Value, index: usize) -> &Value {
+        &schema["columns"][index]
+    }
+
+    const XLSX: &str = "excel_multi.xlsx";
+    const XLS: &str = "excel_multi.xls";
+
+    #[test]
+    fn inspect_detects_xlsx_and_lists_visible_sheets() {
+        let path = fixture(XLSX);
+        let info = inspect(&path).unwrap();
+        assert_eq!(info["format"], json!("xlsx"), "{info}");
+        assert_eq!(info["encoding"], json!("binary"));
+        assert_eq!(info["fields"]["mode"], json!("excel"));
+        assert_eq!(info["fields"]["header"], json!(true));
+        assert_eq!(info["read"]["sheet"], json!("员工"));
+        assert_eq!(info["read"]["skip_rows"], json!(0));
+        assert_eq!(info["sheet"], json!("员工"));
+        let sheets = info["sheets"].as_array().expect("sheets");
+        let names: Vec<&str> = sheets
+            .iter()
+            .map(|sheet| sheet["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["员工", "订单", "配置"], "{info}");
+        assert_eq!(sheets[0]["index"], json!(0));
+        assert_eq!(sheets[0]["rows"], json!(5)); // 表头 + 4 行数据
+        assert_eq!(sheets[0]["cols"], json!(8));
+        let warnings = info["warnings"].to_string();
+        assert!(warnings.contains("3 个工作表"), "{warnings}");
+        assert!(warnings.contains("隐藏工作表"), "{warnings}");
+        assert_eq!(info["head"], json!(""), "binary workbook has no text preview");
+    }
+
+    #[test]
+    fn inspect_detects_xls_biff_workbook() {
+        let path = fixture(XLS);
+        let info = inspect(&path).unwrap();
+        assert_eq!(info["format"], json!("xls"), "{info}");
+        assert_eq!(info["sheet"], json!("员工"));
+        let sheets = info["sheets"].as_array().expect("sheets");
+        assert_eq!(sheets.len(), 3, "{info}");
+        assert_eq!(info["fields"]["mode"], json!("excel"));
+    }
+
+    #[test]
+    fn preview_reads_excel_cells_with_their_native_types() {
+        for fixture_name in [XLSX, XLS] {
+            let path = fixture(fixture_name);
+            let (_, spec) = spec_from_inspect(&path);
+            let preview = preview(&spec, 10).unwrap();
+            assert_eq!(preview["sheet_used"], json!("员工"), "{fixture_name}");
+            assert_eq!(
+                preview["header"],
+                json!([
+                    "id",
+                    "姓名",
+                    "入职日期",
+                    "活跃",
+                    "评分",
+                    "备注",
+                    "登录时间",
+                    "打卡时间"
+                ]),
+                "{fixture_name}: {}",
+                preview["header"]
+            );
+            let records = preview["records"].as_array().unwrap();
+            // 1 条表头 + 4 条数据。
+            assert_eq!(records.len(), 5, "{fixture_name}: {preview}");
+            assert_eq!(records[0]["header"], json!(true));
+            // records[..].text 是 JSON 数组文本（Dart 侧「分割结果回显」直接展示）。
+            assert!(
+                records[1]["text"].as_str().unwrap().starts_with('['),
+                "{fixture_name}"
+            );
+            // 数字/布尔/日期/时间/NULL 都保留 Excel 原类型。
+            assert_eq!(
+                records[1]["values"],
+                json!([1, "张伟", "2021-03-05", true, 88.5, null, "2021-03-05 09:30:00", "09:30:00"]),
+                "{fixture_name}: {}",
+                records[1]["values"]
+            );
+            assert_eq!(records[2]["values"][5], json!("优秀"), "{fixture_name}");
+            assert_eq!(records[3]["values"][5], Value::Null, "{fixture_name}");
+            assert_eq!(records[2]["values"][3], json!(false), "{fixture_name}");
+        }
+    }
+
+    #[test]
+    fn preview_switches_worksheet_by_name_or_index() {
+        let path = fixture(XLSX);
+        // 名字选表。
+        let by_name = preview(&sheet_spec(&path, Some("订单"), 0, true), 10).unwrap();
+        assert_eq!(by_name["sheet_used"], json!("订单"));
+        assert_eq!(by_name["header"], json!(["订单号", "客户", "金额"]));
+        assert_eq!(
+            by_name["records"][1]["values"],
+            json!([1001, "甲公司", 299.5])
+        );
+        // 字符串形式的 0-based 序号（契约：read.sheet 也接受序号）。
+        let by_index = preview(&sheet_spec(&path, Some("1"), 0, true), 10).unwrap();
+        assert_eq!(by_index["sheet_used"], json!("订单"));
+        assert_eq!(by_index["header"], json!(["订单号", "客户", "金额"]));
+        // 第二张表数据与第一张不同。
+        let employees = preview(&sheet_spec(&path, None, 0, true), 10).unwrap();
+        assert_eq!(employees["sheet_used"], json!("员工"));
+
+        // JSON 数字形式的工作表序号也要能反序列化（Dart 可能直接传 int）。
+        let read: ReadSpec = serde_json::from_value(json!({ "sheet": 2 })).unwrap();
+        assert_eq!(read.sheet.as_deref(), Some("2"));
+        let read: ReadSpec = serde_json::from_value(json!({ "sheet": "配置" })).unwrap();
+        assert_eq!(read.sheet.as_deref(), Some("配置"));
+    }
+
+    #[test]
+    fn preview_reports_a_missing_worksheet_by_name() {
+        let path = fixture(XLSX);
+        let error = preview(&sheet_spec(&path, Some("不存在"), 0, true), 10).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("找不到工作表"), "{message}");
+        assert!(message.contains("员工"), "{message}");
+    }
+
+    #[test]
+    fn skip_rows_moves_the_first_data_row_down() {
+        let path = fixture(XLSX);
+        // 跳过表头行后，第一条记录就是原来的第 1 行数据。
+        let spec = sheet_spec(&path, None, 1, false);
+        let first = preview(&spec, 10).unwrap();
+        let records = first["records"].as_array().unwrap();
+        assert_eq!(records.len(), 4, "{first}");
+        assert_eq!(
+            records[0]["values"],
+            json!([1, "张伟", "2021-03-05", true, 88.5, null, "2021-03-05 09:30:00", "09:30:00"])
+        );
+        // skip_rows 在表头判定之前生效：跳 1 行后首行（原数据第 1 行）按表头解析。
+        let spec = sheet_spec(&path, None, 1, true);
+        let shifted = preview(&spec, 10).unwrap();
+        assert_eq!(shifted["header"][1], json!("张伟"), "{}", shifted["header"]);
+        assert_eq!(
+            shifted["records"][1]["values"][1],
+            json!("李娜"),
+            "{}",
+            shifted
+        );
+    }
+
+    #[test]
+    fn schema_infers_employee_column_types() {
+        for fixture_name in [XLSX, XLS] {
+            let path = fixture(fixture_name);
+            let (_, spec) = spec_from_inspect(&path);
+            let preview = preview(&spec, 5).unwrap();
+            let schema = &preview["schema"];
+            assert_eq!(schema["sample_count"], json!(4), "{fixture_name}: {schema}");
+            let columns = schema["columns"].as_array().unwrap();
+            assert_eq!(columns.len(), 8, "{fixture_name}: {schema}");
+
+            assert_eq!(columns[0]["name"], json!("id"));
+            assert_eq!(columns[0]["source"], json!(0));
+            assert_eq!(columns[0]["type"], json!("integer"));
+            assert_eq!(columns[0]["nullable"], json!(false));
+            assert_eq!(columns[0]["primary_candidate"], json!(true));
+            assert_eq!(columns[0]["samples"], json!([1, 2, 3]));
+
+            assert_eq!(columns[1]["name"], json!("姓名"));
+            assert_eq!(columns[1]["type"], json!("text"));
+            assert_eq!(columns[1]["max_length"], json!(2));
+            assert_eq!(columns[1]["nullable"], json!(false));
+
+            assert_eq!(columns[2]["name"], json!("入职日期"));
+            assert_eq!(columns[2]["type"], json!("date"), "{fixture_name}: {schema}");
+
+            assert_eq!(columns[3]["name"], json!("活跃"));
+            assert_eq!(columns[3]["type"], json!("boolean"));
+
+            assert_eq!(columns[4]["name"], json!("评分"));
+            assert_eq!(columns[4]["type"], json!("decimal"));
+
+            assert_eq!(columns[5]["name"], json!("备注"));
+            assert_eq!(columns[5]["type"], json!("text"));
+            assert_eq!(columns[5]["nullable"], json!(true));
+
+            assert_eq!(columns[6]["name"], json!("登录时间"));
+            assert_eq!(columns[6]["type"], json!("datetime"));
+
+            assert_eq!(columns[7]["name"], json!("打卡时间"));
+            assert_eq!(columns[7]["type"], json!("time"), "{fixture_name}: {schema}");
+        }
+    }
+
+    #[test]
+    fn schema_infers_order_sheet_types() {
+        let path = fixture(XLSX);
+        let preview = preview(&sheet_spec(&path, Some("订单"), 0, true), 10).unwrap();
+        let columns = preview["schema"]["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["name"], json!("订单号"));
+        assert_eq!(columns[0]["type"], json!("integer"));
+        assert_eq!(columns[1]["name"], json!("客户"));
+        assert_eq!(columns[1]["type"], json!("text"));
+        assert_eq!(columns[1]["max_length"], json!(3));
+        assert_eq!(columns[2]["name"], json!("金额"));
+        assert_eq!(columns[2]["type"], json!("decimal"));
+    }
+
+    #[test]
+    fn schema_handles_bigint_identifier_cleanup_and_dedup() {
+        let header = vec![
+            "id".to_string(),
+            "大 数字".to_string(),
+            "".to_string(),
+            "dup".to_string(),
+            "dup".to_string(),
+        ];
+        let rows = vec![
+            vec![json!(1), json!(3_000_000_000_i64), json!("x"), json!("a"), json!(true)],
+            vec![json!(2), json!(4_000_000_000_i64), json!("y"), json!("b"), json!(false)],
+        ];
+        let schema = crate::excel_import::infer_schema(Some(&header), &rows, 1000);
+        let columns = schema["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["type"], json!("integer"));
+        assert_eq!(columns[1]["name"], json!("大_数字"));
+        assert_eq!(columns[1]["type"], json!("bigint"));
+        assert_eq!(columns[2]["name"], json!("column_3"));
+        assert_eq!(columns[3]["name"], json!("dup"));
+        assert_eq!(columns[4]["name"], json!("dup_2"));
+        assert_eq!(columns[4]["type"], json!("boolean"));
+        assert_eq!(schema["sample_count"], json!(2));
+    }
+
+    #[test]
+    fn schema_falls_back_to_numeric_positional_columns() {
+        // header=false 的 Excel：列名是 column_1..N。
+        let path = fixture(XLSX);
+        let preview = preview(&sheet_spec(&path, None, 1, false), 10).unwrap();
+        let columns = preview["schema"]["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["name"], json!("column_1"));
+        assert_eq!(columns[0]["type"], json!("integer"));
+    }
+
+    #[test]
+    fn schema_is_returned_for_text_formats_too() {
+        let path = temp_file(
+            "schema.csv",
+            "id,score,when,label\n1,2.5,2024-01-01,x\n2,3.5,2024-01-02,y\n",
+        );
+        let spec = parse_spec(&path, ReadSpec::default(), csv_fields(true, ","));
+        let preview_json = preview(&spec, 5).unwrap();
+        let columns = preview_json["schema"]["columns"].as_array().unwrap();
+        assert_eq!(
+            columns[0]["type"],
+            json!("integer"),
+            "{}",
+            preview_json["schema"]
+        );
+        assert_eq!(columns[1]["type"], json!("decimal"));
+        assert_eq!(columns[2]["type"], json!("date"));
+        assert_eq!(columns[3]["type"], json!("text"));
+        assert_eq!(preview_json["sheet_used"], Value::Null);
+    }
+
+    fn multi_sheet_spreadsheetml() -> String {
+        [
+            "<?xml version=\"1.0\"?>",
+            "<?mso-application progid=\"Excel.Sheet\"?>",
+            "<Workbook xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">",
+            "<Worksheet ss:Name=\"第一表\"><Table>",
+            "<Row><Cell><Data ss:Type=\"String\">id</Data></Cell><Cell><Data ss:Type=\"String\">名称</Data></Cell></Row>",
+            "<Row><Cell><Data ss:Type=\"Number\">1</Data></Cell><Cell><Data ss:Type=\"String\">甲</Data></Cell></Row>",
+            "<Row><Cell><Data ss:Type=\"Number\">2</Data></Cell><Cell><Data ss:Type=\"String\">乙</Data></Cell></Row>",
+            "</Table></Worksheet>",
+            "<Worksheet ss:Name=\"第二表\"><Table>",
+            "<Row><Cell><Data ss:Type=\"String\">code</Data></Cell><Cell><Data ss:Type=\"String\">金额</Data></Cell></Row>",
+            "<Row><Cell><Data ss:Type=\"String\">A</Data></Cell><Cell><Data ss:Type=\"Number\">9.5</Data></Cell></Row>",
+            "</Table></Worksheet>",
+            "</Workbook>",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn spreadsheetml_supports_multiple_worksheets() {
+        let path = temp_file("multi.xls", &multi_sheet_spreadsheetml());
+        let info = inspect(&path).unwrap();
+        assert_eq!(info["format"], json!("excel"), "{info}");
+        let sheets = info["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 2, "{info}");
+        assert_eq!(sheets[0]["name"], json!("第一表"));
+        assert_eq!(sheets[1]["name"], json!("第二表"));
+        assert_eq!(info["sheet"], json!("第一表"));
+        assert_eq!(info["fields"]["header"], json!(true));
+
+        let (_, mut spec) = spec_from_inspect(&path);
+        let first = preview(&spec, 10).unwrap();
+        assert_eq!(first["header"], json!(["id", "名称"]));
+        assert_eq!(first["records"][1]["values"], json!([1, "甲"]));
+        // SpreadsheetML 的 Number 历史上是 f64（1.0），必须规范成整数并推断为 integer。
+        let schema = &first["schema"];
+        assert_eq!(schema["columns"][0]["type"], json!("integer"), "{schema}");
+        assert_eq!(schema["columns"][0]["samples"], json!([1, 2]), "{schema}");
+
+        spec.read.sheet = Some("第二表".to_string());
+        let second = preview(&spec, 10).unwrap();
+        assert_eq!(second["header"], json!(["code", "金额"]));
+        assert_eq!(second["records"][1]["values"], json!(["A", 9.5]));
+        // 多表时第二张表按序号也能选到。
+        spec.read.sheet = Some("1".to_string());
+        let by_index = preview(&spec, 10).unwrap();
+        assert_eq!(by_index["sheet_used"], json!("第二表"));
+    }
+
+    #[test]
+    fn sniff_detects_zip_ole2_and_spreadsheetml_by_content() {
+        use crate::excel_import::{sniff, ExcelKind};
+        let mut zip = vec![0x50, 0x4B, 0x03, 0x04];
+        zip.extend_from_slice(b"...xl/workbook.xml...");
+        assert_eq!(sniff(&zip, &[], "bin"), Some(ExcelKind::Xlsx));
+
+        let mut xlsb = vec![0x50, 0x4B, 0x03, 0x04];
+        xlsb.extend_from_slice(b"...xl/workbook.bin...");
+        assert_eq!(sniff(&xlsb, &[], "bin"), Some(ExcelKind::Xlsb));
+
+        let mut ods = vec![0x50, 0x4B, 0x03, 0x04];
+        ods.extend_from_slice(b"...application/vnd.oasis.opendocument.spreadsheet...");
+        assert_eq!(sniff(&ods, &[], "zip"), Some(ExcelKind::Ods));
+
+        let mut ole2 = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        ole2.extend_from_slice(b"whatever");
+        assert_eq!(sniff(&ole2, &[], "doc"), Some(ExcelKind::Xls));
+
+        let xml = b"<?xml version=\"1.0\"?>\n<?mso-application progid=\"Excel.Sheet\"?>\n<Workbook/>";
+        assert_eq!(sniff(xml, &[], "xml"), Some(ExcelKind::SpreadsheetMl));
+        assert_eq!(sniff(b"id,name\n1,Ada\n", &[], "csv"), None);
+    }
+
+    #[test]
+    fn validate_converts_excel_cells_against_table_columns() {
+        let path = fixture(XLSX);
+        let (_, spec) = spec_from_inspect(&path);
+        let columns = vec![
+            column("id", "int", false),
+            column("姓名", "varchar", true),
+            column("入职日期", "date", true),
+            column("活跃", "tinyint", true),
+            column("评分", "decimal", true),
+        ];
+        let mapping = named_mapping(&[
+            ("id", "id"),
+            ("姓名", "姓名"),
+            ("入职日期", "入职日期"),
+            ("活跃", "活跃"),
+            ("评分", "评分"),
+        ]);
+        let validate_spec = ValidateSpec {
+            parse: spec,
+            mapping: Some(mapping),
+            database: Some("main".to_string()),
+            table: Some("emp".to_string()),
+        };
+        let result = validate(
+            &validate_spec,
+            Some(&columns),
+            100,
+            std::fs::metadata(&path).unwrap().len(),
+            &(|_| {}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result["valid"], json!(4), "{result}");
+        assert_eq!(result["invalid"], json!(0), "{result}");
+        assert_eq!(
+            result["header"],
+            json!(["id", "姓名", "入职日期", "活跃", "评分", "备注", "登录时间", "打卡时间"]),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn validate_reports_a_text_value_in_an_integer_column() {
+        let path = fixture(XLSX);
+        let (_, spec) = spec_from_inspect(&path);
+        let columns = vec![column("id", "int", false), column("姓名", "varchar", true)];
+        // 把「姓名」映射到整数列 id：4 行都应该失败。
+        let mapping = named_mapping(&[("id", "姓名"), ("姓名", "id")]);
+        let validate_spec = ValidateSpec {
+            parse: spec,
+            mapping: Some(mapping),
+            database: Some("main".to_string()),
+            table: Some("emp".to_string()),
+        };
+        let result = validate(
+            &validate_spec,
+            Some(&columns),
+            100,
+            0,
+            &(|_| {}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result["invalid"], json!(4), "{result}");
+        assert!(
+            result["issues"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("整数"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn probe_first_row_reads_the_selected_sheet() {
+        let path = fixture(XLSX);
+        let (_, spec) = spec_from_inspect(&path);
+        let columns = vec![column("id", "int", false), column("姓名", "varchar", true)];
+        let mapping = named_mapping(&[("id", "id"), ("姓名", "姓名")]);
+        let mut validate_spec = ValidateSpec {
+            parse: spec,
+            mapping: Some(mapping),
+            database: Some("main".to_string()),
+            table: Some("emp".to_string()),
+        };
+        let probe = probe_first_row(&validate_spec, &columns).unwrap();
+        assert_eq!(probe["values"], json!([1, "张伟"]), "{probe}");
+        assert_eq!(probe["header"], json!(["id", "姓名", "入职日期", "活跃", "评分", "备注", "登录时间", "打卡时间"]));
+
+        // 换一张表后试插的第一行也跟着换。
+        validate_spec.parse.read.sheet = Some("订单".to_string());
+        validate_spec.mapping = Some(named_mapping(&[("id", "订单号")]));
+        let probe = probe_first_row(&validate_spec, &columns[..1]).unwrap();
+        assert_eq!(probe["values"], json!([1001]), "{probe}");
+        assert_eq!(probe["header"], json!(["订单号", "客户", "金额"]));
+    }
+
+    #[tokio::test]
+    async fn execute_imports_excel_rows_into_a_real_sqlite_table() {
+        let path = fixture(XLSX);
+        let dir = std::env::temp_dir().join(format!("rma-excel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("main.sqlite");
+        std::fs::write(&db_path, []).unwrap();
+        let conn_spec = ConnSpec {
+            driver: DriverKind::Sqlite,
+            database: Some(db_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pool = crate::drivers::connect(&conn_spec, None).await.unwrap();
+        let conn = crate::drivers::pooled_handle(pool, DriverKind::Sqlite, None);
+        let setup = conn
+            .run_raw(
+                "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, hired TEXT, active INTEGER, score REAL, note TEXT, login_at TEXT, clock TEXT)",
+            )
+            .await;
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+
+        let (_, spec) = spec_from_inspect(&path);
+        let columns = vec![
+            column("id", "INTEGER", false),
+            column("name", "TEXT", true),
+            column("hired", "TEXT", true),
+            column("active", "INTEGER", true),
+            column("score", "REAL", true),
+            column("note", "TEXT", true),
+            column("login_at", "TEXT", true),
+            column("clock", "TEXT", true),
+        ];
+        let mapping = named_mapping(&[
+            ("id", "id"),
+            ("name", "姓名"),
+            ("hired", "入职日期"),
+            ("active", "活跃"),
+            ("score", "评分"),
+            ("note", "备注"),
+            ("login_at", "登录时间"),
+            ("clock", "打卡时间"),
+        ]);
+        let execute_spec = ExecuteSpec {
+            validate: ValidateSpec {
+                parse: spec,
+                mapping: Some(mapping),
+                database: Some("main".to_string()),
+                table: Some("emp".to_string()),
+            },
+            options: ExecuteOptions::default(),
+        };
+        let progress: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
+        let report = |value: &Progress| {
+            if let Ok(mut guard) = progress.lock() {
+                guard.push(value.clone());
+            }
+        };
+        let total_bytes = std::fs::metadata(&path).unwrap().len();
+        let driver = crate::drivers::sqlite::driver::SqliteDriver;
+        let result = execute(
+            &driver,
+            &conn,
+            &execute_spec,
+            &columns,
+            total_bytes,
+            &report,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["rows_inserted"], json!(4), "{result}");
+        assert_eq!(result["rows_failed"], json!(0), "{result}");
+        assert_eq!(conn.fetch_i64("SELECT COUNT(*) FROM emp".to_string()).await.unwrap(), 4);
+        let row = conn
+            .fetch_named(
+                "SELECT id, name, hired, active, score, note, login_at, clock FROM emp WHERE id = 2"
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0]["name"], json!("李娜"));
+        assert_eq!(row[0]["score"].as_f64(), Some(92.0), "{:?}", row[0]);
+        assert_eq!(row[0]["clock"], json!("09:05:30"));
+
+        // Excel 的进度必须按行数走，并在 message 里说明工作表。
+        let last = progress.lock().unwrap().last().cloned().expect("progress");
+        assert_eq!(last.percent, 100.0, "{last:?}");
+        assert!(last.message.contains("工作表 员工"), "{last:?}");
+        assert!(last.records >= 5, "header + 4 data rows: {last:?}");
+    }
+
+    #[test]
+    fn inspect_uses_the_light_path_for_large_workbooks() {
+        // 用一个巨大的 XML 注释把文件撑过 8 MB，模拟「大工作簿」：
+        // inspect 不应把每张工作表都整表解析，只读第一张给默认 read/fields。
+        let mut xml = String::from(
+            "<?xml version=\"1.0\"?>\n<?mso-application progid=\"Excel.Sheet\"?>\n<Workbook xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">\n<!--",
+        );
+        while xml.len() < 8 * 1024 * 1024 + 1024 {
+            xml.push('x');
+        }
+        xml.push_str("-->\n");
+        xml.push_str(
+            "<Worksheet ss:Name=\"大表\"><Table><Row><Cell><Data ss:Type=\"String\">id</Data></Cell></Row><Row><Cell><Data ss:Type=\"Number\">1</Data></Cell></Row></Table></Worksheet>",
+        );
+        xml.push_str(
+            "<Worksheet ss:Name=\"第二表\"><Table><Row><Cell><Data ss:Type=\"String\">code</Data></Cell></Row><Row><Cell><Data ss:Type=\"String\">A</Data></Cell></Row></Table></Worksheet>",
+        );
+        xml.push_str("</Workbook>");
+        let path = temp_file("large.xls", &xml);
+        let info = inspect(&path).unwrap();
+        assert_eq!(info["format"], json!("excel"), "{info}");
+        assert_eq!(info["sheet"], json!("大表"));
+        let sheets = info["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 2, "{info}");
+        assert_eq!(sheets[0]["rows"], json!(2));
+        assert!(sheets[1].get("rows").is_none(), "{}", sheets[1]);
+        assert!(
+            info["warnings"].to_string().contains("文件较大"),
+            "{info}"
+        );
+        assert_eq!(info["fields"]["header"], json!(true));
+
+        // 轻量路径下选其他工作表时仍能正常 preview（此时才加载该表）。
+        let mut read: ReadSpec = serde_json::from_value(info["read"].clone()).unwrap();
+        read.sheet = Some("第二表".to_string());
+        let fields: FieldSpec = serde_json::from_value(info["fields"].clone()).unwrap();
+        let spec = parse_spec(&path, read, fields);
+        let preview = preview(&spec, 10).unwrap();
+        assert_eq!(preview["sheet_used"], json!("第二表"));
+        assert_eq!(preview["header"], json!(["code"]));
+    }
+
+    #[test]
+    fn structured_boolean_values_convert_for_boolean_columns() {
+        // Excel cells / JSON booleans arrive as Value::Bool (or 0/1), not as the
+        // text that the CSV path sees. A PostgreSQL BOOLEAN column imports from
+        // a workbook only if this path converts them.
+        let flag = column("active", "boolean", true);
+        let mapping = MappingSpec::default();
+        assert_eq!(
+            convert_value(Value::Bool(true), &flag, &mapping).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            convert_value(Value::Bool(false), &flag, &mapping).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            convert_value(json!(1), &flag, &mapping).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            convert_value(json!(0), &flag, &mapping).unwrap(),
+            Value::Bool(false)
+        );
+        assert!(convert_value(json!(2), &flag, &mapping).is_err());
+        // Text still goes through the string branch above.
+        assert_eq!(
+            convert_value(json!("YES"), &flag, &mapping).unwrap(),
+            Value::Bool(true)
+        );
+        // NULL stays NULL.
+        assert_eq!(convert_value(Value::Null, &flag, &mapping).unwrap(), Value::Null);
     }
 }

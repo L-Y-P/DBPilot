@@ -11,7 +11,12 @@ import 'package:file_picker/file_picker.dart';
 /// SQLite itself does not require one, but a scan has to draw the line
 /// somewhere: without a filter, pointing at a folder of unrelated files would
 /// produce hundreds of useless connections.
-const List<String> sqliteExtensions = <String>['sqlite', 'sqlite3', 'db', 'db3'];
+const List<String> sqliteExtensions = <String>[
+  'sqlite',
+  'sqlite3',
+  'db',
+  'db3',
+];
 
 /// Last path component, regardless of which separator the string uses.
 ///
@@ -54,7 +59,11 @@ String connectionNameFor(String path) {
 /// front, so it is walked. The walk is bounded — pointing it at a home directory
 /// must not build a 100k-entry list — and an unreadable subdirectory is skipped
 /// rather than aborting the whole scan.
-List<String> scanSqliteFolder(String root, {int maxFiles = 200, int maxDepth = 6}) {
+List<String> scanSqliteFolder(
+  String root, {
+  int maxFiles = 200,
+  int maxDepth = 6,
+}) {
   final found = <String>[];
   final visited = <String>{};
 
@@ -91,8 +100,8 @@ List<String> scanSqliteFolder(String root, {int maxFiles = 200, int maxDepth = 6
 /// Accepts what people actually paste: one or more absolute paths, one per line,
 /// each either a database file or a folder to be scanned. A typed folder is
 /// scanned; a typed file becomes a single connection.
-({List<String> files, List<String> folders, List<String> missing}) resolveSqlitePaths(
-    Iterable<String> inputs) {
+({List<String> files, List<String> folders, List<String> missing})
+resolveSqlitePaths(Iterable<String> inputs) {
   final files = <String>[];
   final folders = <String>[];
   final missing = <String>[];
@@ -113,7 +122,10 @@ List<String> scanSqliteFolder(String root, {int maxFiles = 200, int maxDepth = 6
 
 /// Everything a bulk import should add.
 class SqliteImport {
-  const SqliteImport({required this.files, this.scannedFolders = const <String>[]});
+  const SqliteImport({
+    required this.files,
+    this.scannedFolders = const <String>[],
+  });
 
   /// Absolute paths of the database files to add.
   final List<String> files;
@@ -122,10 +134,12 @@ class SqliteImport {
   final List<String> scannedFolders;
 
   SqliteImport merge(SqliteImport other) => SqliteImport(
-        files: <String>{...files, ...other.files}.toList(),
-        scannedFolders: <String>{...scannedFolders, ...other.scannedFolders}
-            .toList(),
-      );
+    files: <String>{...files, ...other.files}.toList(),
+    scannedFolders: <String>{
+      ...scannedFolders,
+      ...other.scannedFolders,
+    }.toList(),
+  );
 }
 
 /// Result of picking files / a folder.
@@ -165,9 +179,7 @@ Future<SqliteScan?> pickSqliteFolder() async {
 /// field that takes a directory, so every path input gets a real browse button
 /// instead of asking the user to type an absolute path.
 Future<String?> pickFolder({String? title}) async {
-  final dir = await FilePicker.getDirectoryPath(
-    dialogTitle: title ?? '选择文件夹',
-  );
+  final dir = await FilePicker.getDirectoryPath(dialogTitle: title ?? '选择文件夹');
   if (dir == null || dir.isEmpty) return null;
   return dir;
 }
@@ -224,20 +236,48 @@ Future<String?> pickAnyFile({String? title}) async {
 }
 
 /// Extensions the guided data import can parse out of the box.
+///
+/// Keep this list in sync with the Rust importer: every extension offered here
+/// must be recognised by inspect(), otherwise the picker filters out a file the
+/// import could read. Round 50 added the workbook formats — before that the
+/// native picker greyed out .xls/.xlsx files, which looked like "the import
+/// cannot open Excel" to the user.
+///
+/// .xls covers two very different files: BIFF (OLE2) workbooks and the
+/// SpreadsheetML (XML) workbooks the exporter writes. Both are recognised by
+/// content, so one entry is enough here.
 const List<String> dataFileExtensions = <String>[
+  // Delimited text.
   'csv',
   'tsv',
   'txt',
   'tab',
-  'json',
-  'jsonl',
-  'ndjson',
   'log',
   'dat',
   'data',
+  // Structured text the exporter also writes.
+  'json',
+  'jsonl',
+  'ndjson',
+  'xml',
+  'html',
+  'htm',
+  'md',
+  'markdown',
+  // Excel / OpenDocument workbook files (read as worksheets, not as bytes).
+  'xls',
+  'xlsx',
+  'xlsm',
+  'xlsb',
+  'ods',
 ];
 
-/// Pick a data file (CSV / TSV / JSON / JSON Lines / custom delimited text).
+/// Pick a data file.
+///
+/// Covers the delimited / structured text formats the importer reads and the
+/// Excel / ODS workbook formats (which it reads as worksheets). Keeping the
+/// workbook extensions in [dataFileExtensions] is what makes the native picker
+/// offer .xls/.xlsx files at all.
 Future<String?> pickDataFile({String? title}) async {
   try {
     final picked = await FilePicker.pickFile(
@@ -306,8 +346,8 @@ Future<bool> revealInFileManager(String path) async {
     final result = Platform.isMacOS
         ? await Process.run('open', args)
         : Platform.isWindows
-            ? await Process.run('explorer', <String>[target])
-            : await Process.run('xdg-open', <String>[target]);
+        ? await Process.run('explorer', <String>[target])
+        : await Process.run('xdg-open', <String>[target]);
     return result.exitCode == 0;
   } catch (_) {
     return false;
@@ -370,7 +410,9 @@ List<String> filterSqliteFiles(
   String? hide,
 }) {
   return files
-      .where((file) =>
-          nameVisible(only: only, hide: hide, name: connectionNameFor(file)))
+      .where(
+        (file) =>
+            nameVisible(only: only, hide: hide, name: connectionNameFor(file)),
+      )
       .toList();
 }

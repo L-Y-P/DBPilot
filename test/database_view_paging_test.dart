@@ -181,10 +181,14 @@ void main() {
     expect(cardButtonLabels(tester, '对象'),
         <String>{'查看 DDL', '删除', '刷新', '新建对象'});
 
-    // No new button copy anywhere on the page.
+    // No new button copy anywhere on the page. Round 50 added two page-level
+    // entry points (from-file table creation and the relationship designer),
+    // which are the only labels allowed beyond the paging-era set.
     const known = <String>{
       '刷新',
       '新建表',
+      '从文件建表',
+      '关系图',
       '打开目录',
       '删除数据库文件',
       '新建对象',

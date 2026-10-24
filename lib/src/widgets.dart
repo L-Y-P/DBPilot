@@ -1847,6 +1847,7 @@ Future<T?> showAppModal<T>({
   required String title,
   required WidgetBuilder builder,
   List<Widget> actions = const <Widget>[],
+  List<Widget> headerActions = const <Widget>[],
   bool wide = false,
 }) {
   // The body is stateful (ModalBody) rather than a bare builder call, so it can
@@ -1856,6 +1857,7 @@ Future<T?> showAppModal<T>({
     title: title,
     builder: (context, _) => builder(context),
     actions: actions,
+    headerActions: headerActions,
     wide: wide,
   );
 }
@@ -1867,6 +1869,11 @@ Future<T?> showModalShell<T>({
   required String title,
   required Widget Function(BuildContext context, StateSetter setModalState) builder,
   List<Widget> actions = const <Widget>[],
+  // Secondary actions that belong to the title bar (between the title and the
+  // close button). A caller can use this to offer an entry point that is about
+  // the dialog as a whole rather than about the form in its body — the
+  // create-table designer's 从文件建表 button is the first user.
+  List<Widget> headerActions = const <Widget>[],
   bool wide = false,
   ModalHandle? handle,
 }) {
@@ -1927,6 +1934,19 @@ Future<T?> showModalShell<T>({
                           ),
                         ),
                       ),
+                      // Same language-keyed rebuild as the footer actions: the
+                      // header actions are built by the caller before showDialog
+                      // runs, so an identical widget instance would keep the
+                      // language it was created with.
+                      for (var i = 0; i < headerActions.length; i++) ...[
+                        const SizedBox(width: 8),
+                        KeyedSubtree(
+                          key: ValueKey<String>(
+                              'modal-header-action-$i-${lang.name}'),
+                          child: headerActions[i],
+                        ),
+                      ],
+                      if (headerActions.isNotEmpty) const SizedBox(width: 8),
                       IconBtn(Icons.close,
                           key: const ValueKey('dialog-close'),
                           tooltip: '关闭',

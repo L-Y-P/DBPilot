@@ -9,10 +9,17 @@ import '../theme.dart';
 import '../widgets.dart';
 
 /// Open the create-table designer; returns true when a table was created.
+///
+/// [onQuickCreate] adds the 从文件建表 entry point to the dialog's title bar
+/// (round 50). The button closes the designer and delegates to the caller,
+/// which owns the quick-create wizard — the dialog itself must not open another
+/// dialog from its own context because popping it would tear the new route down
+/// with the old one.
 Future<bool> showCreateTableDialog(
   BuildContext context, {
   required String database,
   void Function(Object error)? onError,
+  VoidCallback? onQuickCreate,
 }) async {
   final key = GlobalKey<CreateTableDialogState>();
   final result = await showAppModal<bool>(
@@ -21,6 +28,23 @@ Future<bool> showCreateTableDialog(
     wide: true,
     builder: (context) =>
         CreateTableDialog(key: key, database: database, onError: onError),
+    headerActions: [
+      if (onQuickCreate != null)
+        Builder(
+          builder: (dialogContext) => Btn(
+            '从文件建表',
+            small: true,
+            icon: Icons.file_upload_outlined,
+            tooltip: '选择一个数据文件，按工作表批量建表并导入数据',
+            onPressed: () {
+              // Close the designer first; the wizard opens on the caller's
+              // context so this route cannot close it again.
+              Navigator.of(dialogContext).pop(false);
+              onQuickCreate();
+            },
+          ),
+        ),
+    ],
     actions: [
       Builder(
         builder: (context) => Btn(

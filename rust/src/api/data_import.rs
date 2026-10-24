@@ -176,6 +176,10 @@ struct PreviewRequest {
     fields: FieldSpec,
     #[serde(default)]
     limit: Option<usize>,
+    /// 快速建表向导会带 infer: true；schema 无论传不传都会返回（契约 §2.3），
+    /// 这里只是让旧前端/新前端都能安全传参。
+    #[serde(default)]
+    infer: Option<bool>,
 }
 
 /// Detect the file's format and suggest read/field rules.
@@ -187,6 +191,8 @@ pub async fn import_inspect(path: String) -> anyhow::Result<Value> {
 /// can echo one complete record back to the user.
 pub async fn import_preview(path: String, params: Value) -> anyhow::Result<Value> {
     let req: PreviewRequest = parse("params", params)?;
+    // schema 总是返回（契约 §2.3）；infer 只是新前端的显式意图标记。
+    let _infer = req.infer.unwrap_or(false);
     let spec = ParseSpec {
         path,
         read: req.read,

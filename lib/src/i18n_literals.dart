@@ -5,6 +5,8 @@ import 'i18n_en/en_builder.dart';
 import 'i18n_en/en_common.dart';
 import 'i18n_en/en_connections.dart';
 import 'i18n_en/en_import.dart';
+import 'i18n_en/en_quick_create.dart';
+import 'i18n_en/en_relations.dart';
 import 'i18n_en/en_settings.dart';
 import 'i18n_en/en_tables.dart';
 import 'i18n_en/rewrite.dart';
@@ -60,6 +62,8 @@ final Map<String, String> _exact = <String, String>{
   ...enConnections,
   ...enTables,
   ...enImport,
+  ...enQuickCreate,
+  ...enRelations,
   ...enBuilder,
   ...enAdmin,
   ...enBackend,
@@ -274,6 +278,7 @@ final List<Rewrite> _rewrites = <Rewrite>[
   ...rewritesConnections,
   ...rewritesTables,
   ...rewritesImport,
+  ...rewritesQuickCreate,
   ...rewritesBuilder,
   ...rewritesAdmin,
   ...rewritesBackend,

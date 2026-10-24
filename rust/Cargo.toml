@@ -44,6 +44,9 @@ russh-keys = "0.45"
 async-trait = "0.1"
 # Stream row-by-row for the SQL console row cap (see drivers/mysql/exec.rs).
 futures = "0.3"
+# Excel 数据文件读取（xlsx/xls/xlsb/ods）：纯 Rust，避免自己实现 BIFF/OLE2。
+# dates 特性把日期/时间单元格读成 chrono 值（见 src/excel_import.rs 的转换）。
+calamine = { version = "0.26", features = ["dates"] }
 
 [profile.release]
 lto = true

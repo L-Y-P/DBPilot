@@ -140,4 +140,41 @@ void main() {
     expect(preview, contains('STRICT'));
     expect(preview, contains('extra_col'));
   });
+
+  testWidgets('标题栏提供「从文件建表」快速建表入口', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    var quickCreateCalled = false;
+    await tester.pumpWidget(MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: buildAppTheme(),
+      home: Scaffold(
+        body: Builder(
+          builder: (context) => Btn(
+            'open-designer',
+            onPressed: () => showCreateTableDialog(
+              context,
+              database: 'main',
+              onQuickCreate: () => quickCreateCalled = true,
+            ),
+          ),
+        ),
+      ),
+    ));
+    await tester.tap(find.text('open-designer'));
+    await settle(tester);
+    expect(find.byType(CreateTableDialog), findsOneWidget);
+
+    // The entry sits in the title bar (headerActions), not in the footer.
+    expect(find.text('从文件建表'), findsOneWidget);
+    await tester.tap(find.text('从文件建表'));
+    await settle(tester, rounds: 4);
+
+    // The designer closes first, then hands over to the wizard callback.
+    expect(find.byType(CreateTableDialog), findsNothing);
+    expect(quickCreateCalled, isTrue);
+  });
 }

@@ -426,10 +426,14 @@ async fn p0_csv_import_phases() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+    let pipeline_batches: usize = std::env::var("PERF_PIPELINE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let measure_alloc = std::env::var("DBPILOT_PERF_ALLOC").map(|v| v == "1").unwrap_or(false);
 
     println!(
-        "\n== CSV 导入分阶段（{target_mb} MB, batch={batch_size}, tx_batches={transaction_batches}, passes={passes}, alloc={measure_alloc}）=="
+        "\n== CSV 导入分阶段（{target_mb} MB, batch={batch_size}, tx_batches={transaction_batches}, pipeline={pipeline_batches}, passes={passes}, alloc={measure_alloc}）=="
     );
 
     let dir = std::env::temp_dir().join("dbpilot-perf-csv");
@@ -517,6 +521,7 @@ async fn p0_csv_import_phases() {
             "on_error": "stop",
             "max_issues": 10,
             "transaction_batches": transaction_batches,
+            "pipeline_batches": pipeline_batches,
         });
 
         let baseline_rss = rss_kb();
@@ -537,6 +542,9 @@ async fn p0_csv_import_phases() {
         let non_db_ms = timings["non_db_ms"].as_f64().unwrap_or(0.0);
         let batches = result["batches"].as_u64().unwrap_or(0);
         let sql_bytes = timings["sql_bytes"].as_u64().unwrap_or(0);
+        let active_pipeline = timings["pipeline_batches"].as_u64().unwrap_or(0);
+        let queue_peak = timings["pipeline_queue_peak"].as_u64().unwrap_or(0);
+        let queue_wait_ms = timings["pipeline_wait_ms"].as_u64().unwrap_or(0);
         let mb_s = mb / (ms / 1000.0);
         let rows_s = inserted as f64 / (ms / 1000.0);
         report(
@@ -549,6 +557,11 @@ async fn p0_csv_import_phases() {
             mb / (non_db_ms / 1000.0).max(0.001),
             sql_bytes as f64 / 1024.0 / 1024.0
         );
+        if active_pipeline > 1 {
+            println!(
+                "  -> pipeline={active_pipeline} queue_peak={queue_peak} queue_wait={queue_wait_ms} ms"
+            );
+        }
         if let Some((calls, bytes)) = import_alloc {
             println!(
                 "  ↳ allocations: {calls} 次 / {:.1} MB（{:.0} 次/行）",

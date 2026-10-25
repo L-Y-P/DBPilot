@@ -174,7 +174,7 @@ MySQL 的 DDL 会隐式提交，仍按语句分组提交，界面上会说明无
 - **大字段延迟加载**：超过 200 字符只渲染前 120 字符 + 徽标，双击看全文。
 - **自动列宽可关闭**：关掉后所有列固定 160 px，完全不跑 `TextPainter` 测量。
 - **导入流式**：文本格式 64 KiB 分块；Excel 全格式按行流式解析与校验（xlsx/xlsm 用 zip+XML、xls 用 OLE2+BIFF record、xlsb 用 ZIP entry+BRT record），批量 INSERT 默认 500 行、可取消；单记录 8 MiB / 单语句 16 MiB 上限。
-  分隔文本（CSV/TSV）走零拷贝快速路径：复用记录缓冲、按字节区间切字段、直接写 INSERT 缓冲，不再逐格创建 String/Vec<Value>；带引号的记录仍走完整引号/转义状态机。批量行数可配置（默认 500，500–2000 实测接近，5000 更慢）；`transaction_batches` 为实验选项，默认 1（本机 MySQL 实测合并事务反而更慢，不建议开启）。
+  分隔文本（CSV/TSV）走零拷贝快速路径：复用记录缓冲、按字节区间切字段、直接写 INSERT 缓冲，不再逐格创建 String/Vec<Value>；带引号的记录仍走完整引号/转义状态机。批量行数可配置（默认 500，500–2000 实测接近，5000 更慢）；`transaction_batches` 与 `pipeline_batches` 为实验选项，默认均为 1：本机 MySQL 实测合并事务反而更慢，单 task 协作式“解析/写库流水线”也没有稳定收益（详见 analysis/IMPORT_PIPELINE_ROUND66.md），不建议开启。
   共享字符串表（xlsx sharedStrings / xls SST / xlsb sharedStrings）为该格式决定的字符串索引表，一次性加载。
   单文件超过 **5 GiB（5×1024³ 字节）** 时给出提示（统一 GiB 口径，并提醒共享字符串表/SST 的内存峰值风险；
   能流式读取的格式只提醒耗时；将来若出现必须整表载入的读取路径会直接拒绝）。护栏判定只读文件头，

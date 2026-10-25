@@ -397,5 +397,297 @@ async fn fast_csv_path_matches_legacy_rows_and_errors() {
         table_rows("gs_legacy", "id, name, age").await
     );
 
+    // ------------------------------- P3: bounded pipeline (capacity 2 and 4)
+    for table in ["pl2_fast", "pl2_legacy", "pl4_fast", "pl4_legacy"] {
+        let result = run(&format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, name TEXT, age INTEGER, score REAL, note TEXT);"
+        ))
+        .await;
+        assert!(result["results"][0]["error"].is_null(), "{result}");
+    }
+    let fast_pipe2 = import_into(
+        &csv,
+        &info,
+        "pl2_fast",
+        &map,
+        json!({ "batch_size": 2, "on_error": "stop", "pipeline_batches": 2 }),
+        false,
+    )
+    .await;
+    let legacy_pipe = import_into(
+        &csv,
+        &info,
+        "pl2_legacy",
+        &map,
+        json!({ "batch_size": 2, "on_error": "stop" }),
+        true,
+    )
+    .await;
+    let fast_pipe4 = import_into(
+        &csv,
+        &info,
+        "pl4_fast",
+        &map,
+        json!({ "batch_size": 2, "on_error": "stop", "pipeline_batches": 4 }),
+        false,
+    )
+    .await;
+    let legacy_pipe4 = import_into(
+        &csv,
+        &info,
+        "pl4_legacy",
+        &map,
+        json!({ "batch_size": 2, "on_error": "stop" }),
+        true,
+    )
+    .await;
+    for (fast, legacy) in [(&fast_pipe2, &legacy_pipe), (&fast_pipe4, &legacy_pipe4)] {
+        assert_eq!(fast["state"], json!("done"), "{fast}");
+        for key in [
+            "rows_inserted",
+            "rows_failed",
+            "data_records",
+            "records",
+            "ok",
+            "stopped",
+        ] {
+            assert_eq!(
+                fast["result"][key], legacy["result"][key],
+                "pipeline key {key}: fast={fast} legacy={legacy}"
+            );
+        }
+        assert_eq!(
+            fast["result"]["issues"], legacy["result"]["issues"],
+            "{fast}"
+        );
+    }
+    assert_eq!(
+        table_rows("pl2_fast", columns).await,
+        table_rows("pl2_legacy", columns).await
+    );
+    assert_eq!(
+        table_rows("pl4_fast", columns).await,
+        table_rows("pl4_legacy", columns).await
+    );
+
+    // Pipeline DB failure: duplicate PK in the middle batch (stop mode).
+    for table in ["pf_fast", "pf_legacy"] {
+        let result = run(&format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);"
+        ))
+        .await;
+        assert!(result["results"][0]["error"].is_null(), "{result}");
+    }
+    let dup_csv = write_file(
+        &root,
+        "duplicate_pk.csv",
+        "id,name,age\n1,Ada,1\n2,Bob,2\n3,Cy,3\n1,Dup,4\n5,Eve,5\n6,Fin,6\n",
+    );
+    let dup_info = api::data_import::import_inspect(dup_csv.clone())
+        .await
+        .unwrap();
+    let dup_map = mapping(&["id", "name", "age"]);
+    let fast_dup = import_into(
+        &dup_csv,
+        &dup_info,
+        "pf_fast",
+        &dup_map,
+        json!({ "batch_size": 2, "on_error": "stop", "pipeline_batches": 2 }),
+        false,
+    )
+    .await;
+    let legacy_dup = import_into(
+        &dup_csv,
+        &dup_info,
+        "pf_legacy",
+        &dup_map,
+        json!({ "batch_size": 2, "on_error": "stop" }),
+        true,
+    )
+    .await;
+    for key in [
+        "rows_inserted",
+        "rows_failed",
+        "data_records",
+        "records",
+        "batches",
+        "ok",
+        "stopped",
+    ] {
+        assert_eq!(
+            fast_dup["result"][key], legacy_dup["result"][key],
+            "pipeline DB failure key {key}: fast={fast_dup} legacy={legacy_dup}"
+        );
+    }
+    // The DB error text embeds the table name, which necessarily differs
+    // between the two target tables; compare with the names normalised.
+    assert_eq!(
+        fast_dup["result"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("pf_fast", "t"),
+        legacy_dup["result"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("pf_legacy", "t")
+    );
+    assert_eq!(
+        table_rows("pf_fast", "id, name, age").await,
+        table_rows("pf_legacy", "id, name, age").await
+    );
+
+    // Pipeline skip-errors DB failure: duplicate PK reported, others inserted.
+    for table in ["ps_fast", "ps_legacy"] {
+        let result = run(&format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);"
+        ))
+        .await;
+        assert!(result["results"][0]["error"].is_null(), "{result}");
+    }
+    let fast_dup_skip = import_into(
+        &dup_csv,
+        &dup_info,
+        "ps_fast",
+        &dup_map,
+        json!({ "batch_size": 2, "on_error": "skip", "pipeline_batches": 2 }),
+        false,
+    )
+    .await;
+    let legacy_dup_skip = import_into(
+        &dup_csv,
+        &dup_info,
+        "ps_legacy",
+        &dup_map,
+        json!({ "batch_size": 2, "on_error": "skip" }),
+        true,
+    )
+    .await;
+    for key in [
+        "rows_inserted",
+        "rows_failed",
+        "data_records",
+        "records",
+        "ok",
+    ] {
+        assert_eq!(
+            fast_dup_skip["result"][key], legacy_dup_skip["result"][key],
+            "pipeline skip key {key}: fast={fast_dup_skip} legacy={legacy_dup_skip}"
+        );
+    }
+    assert_eq!(
+        table_rows("ps_fast", "id, name, age").await,
+        table_rows("ps_legacy", "id, name, age").await
+    );
+
+    // Pipeline parse failure: unterminated quote after one complete batch.
+    for table in ["pp_fast", "pp_legacy"] {
+        let result = run(&format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);"
+        ))
+        .await;
+        assert!(result["results"][0]["error"].is_null(), "{result}");
+    }
+    let broken_csv = write_file(
+        &root,
+        "broken_quote.csv",
+        "id,name,age\n1,Ada,1\n2,Bob,2\n3,\"unterminated,3\n",
+    );
+    let broken_info = api::data_import::import_inspect(broken_csv.clone())
+        .await
+        .unwrap();
+    let fast_broken = import_into(
+        &broken_csv,
+        &broken_info,
+        "pp_fast",
+        &dup_map,
+        json!({ "batch_size": 1, "on_error": "stop", "pipeline_batches": 2 }),
+        false,
+    )
+    .await;
+    let legacy_broken = import_into(
+        &broken_csv,
+        &broken_info,
+        "pp_legacy",
+        &dup_map,
+        json!({ "batch_size": 1, "on_error": "stop" }),
+        true,
+    )
+    .await;
+    for key in [
+        "rows_inserted",
+        "rows_failed",
+        "data_records",
+        "records",
+        "ok",
+        "stopped",
+    ] {
+        assert_eq!(
+            fast_broken["result"][key], legacy_broken["result"][key],
+            "pipeline parse failure key {key}: fast={fast_broken} legacy={legacy_broken}"
+        );
+    }
+    assert_eq!(
+        table_rows("pp_fast", "id, name, age").await,
+        table_rows("pp_legacy", "id, name, age").await
+    );
+
+    // Pipeline cancellation while the bounded queue is busy: must terminate
+    // promptly (no producer stuck on send), keep rows <= total, and release
+    // resources so a following import still works.
+    let mut big = String::from("id,name,age\n");
+    for id in 1..=20_000u64 {
+        big.push_str(&format!("{id},Row{id},{}\n", id % 90));
+    }
+    let slow_csv = write_file(&root, "slow.csv", &big);
+    let slow_info = api::data_import::import_inspect(slow_csv.clone())
+        .await
+        .unwrap();
+    let result =
+        run("CREATE TABLE pc_cancel(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);").await;
+    assert!(result["results"][0]["error"].is_null(), "{result}");
+    let start = api::data_import::import_execute_start(json!({
+        "path": slow_csv,
+        "read": slow_info["read"],
+        "fields": slow_info["fields"],
+        "mapping": dup_map,
+        "database": "main",
+        "table": "pc_cancel",
+        "options": { "batch_size": 1, "on_error": "stop", "pipeline_batches": 2 },
+    }))
+    .await
+    .unwrap();
+    let job_id = start["job_id"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let _ = api::data_import::import_job_cancel(job_id.clone());
+    let cancelled_job = wait_job(&job_id).await;
+    assert!(
+        cancelled_job["state"] == json!("cancelled") || cancelled_job["state"] == json!("done"),
+        "{cancelled_job}"
+    );
+    let inserted = cancelled_job["result"]["rows_inserted"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(inserted <= 20_000, "{cancelled_job}");
+    assert_eq!(
+        cancelled_job["result"]["cancelled"],
+        json!(true),
+        "cancellation should be observed with batch_size=1: {cancelled_job}"
+    );
+    // A subsequent pipeline import must still work after cancellation.
+    let result =
+        run("CREATE TABLE pc_after(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);").await;
+    assert!(result["results"][0]["error"].is_null(), "{result}");
+    let after = import_into(
+        &bad_csv,
+        &bad_info,
+        "pc_after",
+        &bad_map,
+        json!({ "batch_size": 2, "on_error": "skip", "pipeline_batches": 2 }),
+        false,
+    )
+    .await;
+    assert_eq!(after["state"], json!("done"), "{after}");
+    assert_eq!(after["result"]["rows_inserted"], json!(2), "{after}");
+
     let _ = std::fs::remove_dir_all(&root);
 }

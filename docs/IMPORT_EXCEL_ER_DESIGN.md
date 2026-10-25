@@ -586,7 +586,13 @@ Future<void> showRelationDesigner(
 - 100 MB / 252 万行本机 MySQL 实测：batch 500/1000/2000 差异在噪声内（5.27–5.35 MB/s），batch 5000 更慢（4.99 MB/s）；transaction_batches=4 反而慢约 14%，因此默认 1，不建议开启。
 - MAX_BATCH_SQL_BYTES 仍为 512 KiB，低于服务器 max_allowed_packet（本机 64 MiB）；失败、取消、连接断开路径沿用逐批/逐行错误处理。
 
-### 21.3 LOAD DATA LOCAL INFILE（未实施）
+### 21.3 单写入连接有界流水线（实验，默认关闭）
+
+- ExecuteOptions 新增 pipeline_batches（默认 1，2..=8 启用；transaction_batches 必须为 1）。生产者解析/渲染 SQL 并把 String 所有权移交到 VecDeque 有界队列，消费者用同一 ConnectionHandle 逐批执行；在途 1 批、队列 capacity 批、缓冲回收池 capacity+2；失败时用批次 checkpoint 恢复计数，取消/解析失败会 drain 已入队完整批次。
+- 100 MB / 252 万行、容量 2 与 4 各 3 次交错实测：串行中位 19.91 s，容量 2 20.73 s、容量 4 19.18 s，未稳定低于 ROUND65 的 18.69 s；queue_wait 4.7–6.9 s，说明同 task 协作式轮询未真正重叠 DB 等待。因此默认仍为 1，保留为实验项；详见 analysis/IMPORT_PIPELINE_ROUND66.md。
+- 内存有界（队列峰值 = capacity+1），错误/取消/DB 失败与串行结果计数一致；差分测试覆盖容量 2/4、中间批失败、skip/stop、解析失败、取消后再次导入。
+
+### 21.4 LOAD DATA LOCAL INFILE（未实施）
 
 - sqlx 0.8.6 未处理 LocalInfileRequest（connection/executor.rs:161 注释 unhandled），本机 MySQL local_infile=0，离线 cargo 缓存无 mysql_async；因此未实现、未测吞吐。
 - 后续可选：patch sqlx-mysql 增加 handler，或仅在导入模块引入 mysql_async 建独立连接；需覆盖字符集、\N 与空串、日期/数字、错误行号、安全开关与回滚，不迁移全项目访问层。

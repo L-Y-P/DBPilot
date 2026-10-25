@@ -267,6 +267,38 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('er-picker-join')));
     await _settle(tester);
     _expectNoChinese(tester, 'E-R designer canvas');
+    // P2-8：这个 SQLite 库只有 people、没有任何外键，自动带入必须给出英文说明
+    // （原来什么也不发生、也没有提示）。
+    expect(
+      find.byKey(const ValueKey('er-auto-include-notice')),
+      findsOneWidget,
+    );
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is SelectableText &&
+            (widget.data ?? '').contains('no foreign keys yet'),
+      ),
+      findsOneWidget,
+    );
+
+    // P3：工具栏的术语说明入口。全树扫描覆盖 tooltip，这里再断言译名，并打开
+    // 对话框扫描正文（词条是 pickText 双语，不能漏一条中文）。
+    final glossaryTooltip = tester.widget<Tooltip>(
+      find
+          .descendant(
+            of: find.byKey(const ValueKey('er-glossary')),
+            matching: find.byType(Tooltip),
+          )
+          .first,
+    );
+    expect(glossaryTooltip.message, 'Glossary');
+    await tester.tap(find.byKey(const ValueKey('er-glossary')));
+    await _settle(tester, rounds: 4);
+    expect(find.text('Glossary (plain language)'), findsOneWidget);
+    _expectNoChinese(tester, 'E-R glossary');
+    await tester.tap(find.byKey(const ValueKey('glossary-close')));
+    await _settle(tester, rounds: 3);
     await tester.tap(find.byKey(const ValueKey('er-suggestion-help')));
     await _settle(tester, rounds: 3);
     _expectNoChinese(tester, 'E-R suggestion help');

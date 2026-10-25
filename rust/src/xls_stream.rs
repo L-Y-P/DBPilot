@@ -354,14 +354,58 @@ impl RecordReader {
     }
 }
 
+/// OLE2 容器里的流（目录项）名字，用来判断这个 CFB 到底装的是什么。
+fn cfb_stream_names(cfb: &CompoundFile<File>) -> Vec<String> {
+    cfb.walk()
+        .filter(|entry| entry.is_stream())
+        .map(|entry| entry.name().to_string())
+        .collect()
+}
+
+fn has_stream(streams: &[String], wanted: &str) -> bool {
+    streams
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(wanted))
+}
+
 fn open_workbook(path: &str) -> AppResult<OpenWorkbook> {
     let mut cfb = cfb::open(path)
         .map_err(|error| AppError::bad(format!("不是有效的 .xls（OLE2 复合文档）: {error}")))?;
+    // Office 的「密码保护」会把整个 OOXML 包（xlsx/xlsb）塞进 CFB：目录里是
+    // EncryptionInfo / EncryptedPackage，而不是 Workbook 流。以前这种文件会被
+    // 当成 xls 报「xls 里没有 Workbook/Book 数据流: No such stream」，
+    // 用户看到 xls 字样只会以为自己选错了文件——这里先识别容器内容，给中文指引。
+    let streams = cfb_stream_names(&cfb);
+    if has_stream(&streams, "EncryptionInfo") || has_stream(&streams, "EncryptedPackage") {
+        return Err(AppError::bad(
+            "文件已加密或是被 OLE2 容器包装的 Office 文件（请输入密码后另存为未加密的 .xlsx/.xlsb 再导入）",
+        ));
+    }
+    if has_stream(&streams, "WordDocument") {
+        return Err(AppError::bad(
+            "这不是 Excel 工作簿：文件是 Word 文档（.doc）；请在 Excel 中另存为 .xlsx 后再导入",
+        ));
+    }
     let mut stream = match cfb.open_stream("Workbook") {
         Ok(stream) => stream,
-        Err(_) => cfb
-            .open_stream("Book")
-            .map_err(|error| AppError::bad(format!("xls 里没有 Workbook/Book 数据流: {error}")))?,
+        Err(workbook_error) => match cfb.open_stream("Book") {
+            Ok(stream) => stream,
+            Err(book_error) => {
+                // 加密的 .xls 也是「CFB 里没有可读的 Workbook/Book 流」；
+                // 主文案给中文指引，原始 cfb 细节保留在末尾便于排查。
+                let detail = if streams.is_empty() {
+                    format!("Workbook: {workbook_error}; Book: {book_error}")
+                } else {
+                    format!(
+                        "Workbook: {workbook_error}; Book: {book_error}；目录项：{}",
+                        streams.join("、")
+                    )
+                };
+                return Err(AppError::bad(format!(
+                    "xls 文件里没有 Workbook/Book 数据流（文件可能已加密，或是被其它 Office 文档包装）；请输入密码后另存为未加密的 .xlsx/.xls 再导入。原始细节：{detail}"
+                )));
+            }
+        },
     };
     let len = stream.len();
     stream

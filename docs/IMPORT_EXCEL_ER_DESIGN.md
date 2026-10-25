@@ -323,3 +323,32 @@ Future<void> showRelationDesigner(
    - 生成脚本 `gen_relational_multi.py`；用户可直接用 `~/Downloads/DBPilot_多表测试.xlsx`。
 5. 英文文案进 `en_relations.dart`；保持 `RelationDesigner`/`showRelationDesigner` 公开接口不变。
 
+
+## 9. 第 53 轮修订（复测小问题 + 遗留项）
+
+> 来源：`test-report/round52/RETEST_REPORT.md` §4 与 ROUND51 报告 P2-3 / P2-6 / P2-8 / P2-9 / P2-11 / P3。
+> 本轮改动均有单测/widget 测试覆盖；全量 Flutter 679 passed / 14 skipped、Rust lib 256 passed / 2 ignored。
+
+### 9.1 导入后端
+
+- **5 GiB 护栏（P2-3）**：`ensure_streamable_with_limit` 只做 file_info + 轻量格式识别（`ExcelKind::is_streaming()` 常量），不再为判定而 `inspect_workbook`（旧实现会在 preview/probe/validate/execute 各完整解析一遍超大文件，xls 甚至会加载整个 SST）。阈值文案统一 GiB（「文件约 5.0 GiB（超过 5 GiB，即 5×1024³ 字节）」）并追加共享字符串表内存峰值风险提示。
+- **隐藏工作表（P2-11）**：ODS 支持 `table:display="false"` / `table:visibility="collapse"` / style 继承；SpreadsheetML 支持 `ss:Visibility=Hidden/VeryHidden`；与 xlsx/xls/xlsb 一样排除、计数并给「已忽略 N 个隐藏工作表」。全部工作表都隐藏时给中文提示。
+- **错误文案（P3）**：Office 加密的 xlsx/xlsb（OLE2/CFB 包装 EncryptionInfo/EncryptedPackage）→ 中文「已加密，请另存为未加密文件」；CFB 无 Workbook/Book 流 → 中文 + 原始细节；扩展名是 Excel 但内容是 HTML/非 SpreadsheetML XML → 中文「可能是 HTML/文本文件改了扩展名」；路径不存在/无权限 → 中文主文案 + OS 原文。合法 SpreadsheetML（含无 mso-application PI 的 Workbook/Worksheet）不误伤。
+- **测试隔离 flake**：`drivers/sqlite` 的临时库文件名改用 `static AtomicUsize` 序号（原 tag+pid+SystemTime::as_nanos() 并行时会撞名），`batch_stream_tests` 并行连跑 5/5 绿。
+
+### 9.2 快速建表向导
+
+- **主键类型显示 == DDL（复测小问题 1）**：新增 `normalizePrimaryColumnTypes()`，在列推断/重新推断/补自增主键后把「整数主键」在计划层就设成驱动主键类型（MySQL/PG BIGINT、SQLite INTEGER）；字段页、类型下拉、tooltip 与最终 DDL 不再出现「显示整数、建表 BIGINT」的割裂。
+- **失败重试不再重复预检（复测小问题 2）**：`_retry()` 保留用户已确认的外键预检签名；只有外键集合变化（重新读取/删外键/返回关系步骤）才清空。
+- **删外键走 checked（复测小问题 3）**：`_dropForeignKeyAndRetry` 改用 `alterTableChecked`，失败给中文前缀 + 原始细节并保留失败面板。
+- **关闭确认（P2-9）**：已建表但未全部导入成功时，关闭改三选一：取消 / 保留已建表并关闭 / 删除本次已建表并关闭（反序删表，失败留在向导并可「清理并重试」）；全部导入成功时仍直接关闭。
+- **术语说明（P3）**：标题栏新增「术语说明」入口，打开 `lib/src/glossary.dart` 的术语表（主键/外键/唯一/约束/索引/中间表/多对多/事务/自增/空值，中英双语 + 白话解释）。
+
+### 9.3 E-R 关系图
+
+- **多对多标签避让（P2-6）**：标签锚点由「连线中点」改为沿法线偏移（`m2mLabelAnchorFor`，默认 18px、固定偏上、夹取到画布内），折叠中间表后橙色连线中段保持可见。
+- **自动带入提示（P2-8）**：库里没有外键、或候选表到达 10 张上限时，工具栏下方给可关闭提示（`autoIncludeNotice`），并明确「自动带入=已有外键，建议关系=列名推导」是两套机制。
+- **删除外键确认（P2-9）**：`confirmDeleteForeignKeyDialog` 二次确认，说明只解除引用约束、不删数据、之后可重建。
+- **批量建议确认 + 进度（P3）**：批量（>1 条）先确认「N 条会立即写入数据库、不能一键全部撤销」，执行中显示「正在建立 X/N 条…」；单条点击不确认。
+- **术语说明（P3）**：工具栏新增术语表入口。
+

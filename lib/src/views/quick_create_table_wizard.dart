@@ -7,6 +7,7 @@ import 'package:flutter/material.dart' hide Text, Tooltip;
 
 import '../api.dart';
 import '../app_state.dart';
+import '../glossary.dart';
 import '../i18n.dart';
 import '../i18n_literals.dart';
 import '../import_rules.dart';
@@ -477,6 +478,8 @@ QuickColumn addGeneratedPrimaryKey(QuickTablePlan plan, String driver) {
   // 有了 BIGINT 主键后，表里的 *_id 业务外键列必须同步成 BIGINT，否则 MySQL
   // 建外键会以类型不兼容（ERROR 3780）拒绝。
   alignForeignKeyColumns(plan.columns, driver);
+  // 第 53 轮：主键整数列的类型必须在计划层就是主键类型（显示 == DDL）。
+  normalizePrimaryColumnTypes(plan.columns, driver);
   return column;
 }
 
@@ -503,6 +506,28 @@ bool alignForeignKeyColumns(List<QuickColumn> columns, String driver) {
     if (column.primary) continue;
     if (!looksIntegerType(column.sqlType)) continue;
     if (!fkName.hasMatch(column.name.trim())) continue;
+    if (column.sqlType == pkType) continue;
+    column.sqlType = pkType;
+    changed = true;
+  }
+  return changed;
+}
+
+/// 主键整数列在计划层统一成驱动的「主键整数类型」（第 53 轮）。
+///
+/// 复测发现：源文件的 id 列按样本推断是 INT，字段页「类型」也显示「整数」，
+/// 但建表时 [primarySqlTypeFor] 会把它映射成 BIGINT —— 用户看到的类型和实际
+/// 建出来的 DDL 不一致（类型下拉、悬停说明也跟着对不上）。这里在列组装完成后
+/// 就把整数主键提成驱动的主键类型，让显示、下拉、DDL 三处一致。
+///
+/// 只改「已经是主键」的整数列：文本/小数主键、用户手工改过的非整数类型都不动。
+/// 幂等，便于在推断 / 重新推断 / 补主键后重复调用。返回是否发生改动。
+bool normalizePrimaryColumnTypes(List<QuickColumn> columns, String driver) {
+  final pkType = pkColumnTypeFor(driver);
+  var changed = false;
+  for (final column in columns) {
+    if (!column.primary) continue;
+    if (!looksIntegerType(column.sqlType)) continue;
     if (column.sqlType == pkType) continue;
     column.sqlType = pkType;
     changed = true;
@@ -587,6 +612,8 @@ List<QuickColumn> _columnsFromRecords(Json preview, String driver) {
   }
   // 兜底路径也可能识别出整数主键：同样要对齐 *_id 业务列。
   alignForeignKeyColumns(columns, driver);
+  // 第 53 轮：主键整数列的类型在计划层就统一成主键类型。
+  normalizePrimaryColumnTypes(columns, driver);
   return columns;
 }
 
@@ -644,6 +671,9 @@ List<QuickColumn> columnsFromPreview(Json preview, {required String driver}) {
   }
   // 主键类型是 BIGINT，*_id 业务外键列要同步（否则 MySQL ERROR 3780）。
   alignForeignKeyColumns(columns, driver);
+  // 第 53 轮：主键整数列显示/计划层统一为 BIGINT（SQLite 为 INTEGER），
+  // 不再出现「字段页显示整数、实际 DDL 是 BIGINT」的割裂。
+  normalizePrimaryColumnTypes(columns, driver);
   return columns;
 }
 
@@ -1542,6 +1572,9 @@ ImportFailureCopy describeImportFailure(String message) {
 /// 外键数据预检确认框的选择。
 enum _PrecheckChoice { backToRelations, continueImport }
 
+/// 关闭向导时对「已建表但未全部导入成功」的处理方式（第 53 轮 P2-9）。
+enum _CloseChoice { cancel, keepTables, dropTables }
+
 /// 单张表的导入状态（建表在字段步骤完成，这里只跟踪导入）。
 enum _RunStatus { idle, importing, done, failed, skipped }
 
@@ -2253,6 +2286,8 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
         }
         // 重新推断可能换了主键/类型：再对齐一次 *_id 业务外键列。
         alignForeignKeyColumns(form.plan.columns, _driver);
+        // 第 53 轮：重新推断后同样把整数主键提到主键类型（显示 == DDL）。
+        normalizePrimaryColumnTypes(form.plan.columns, _driver);
         form.rebuildColumnControllers();
         _busy = false;
       });
@@ -2849,7 +2884,9 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       if (override != null) {
         await override(childTable, body);
       } else {
-        await Api.instance.alterTable(widget.database, childTable, body);
+        // 第 53 轮：Rust 的 ALTER 把失败写在返回体里（不抛错），这里必须用
+        // alterTableChecked，失败时抛异常，下面的 catch 才能显示真实错误。
+        await Api.instance.alterTableChecked(widget.database, childTable, body);
       }
       if (!mounted) return;
       // 外键已删除：从预检列表里移除（测试注入的 override 也要同步）。
@@ -2883,10 +2920,22 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       await _runImport();
     } catch (error) {
       if (!mounted) return;
+      final detail = describeDbError(error);
       setState(() {
         _busy = false;
         _fkFailure = failure;
-        _showError(describeDbError(error));
+        _showError(
+          pickText(
+            '删除外键 ' + name + ' 失败：' + detail + '。导入没有重试；可以到数据库页手动删除该外键后再重试。',
+            'Could not drop foreign key ' +
+                name +
+                ': ' +
+                detail +
+                '. The import was not retried; drop the foreign key manually '
+                    'from the database page and retry.',
+          ),
+          detail: detail,
+        );
       });
     }
   }
@@ -3117,10 +3166,8 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       _pendingDropTables = failedNames;
       _showError(
         pickText(
-          '返回字段步骤时未能删除这些已建表：' +
-              failures.join('；') +
-              '。点「清理并重试」再删一次；仍失败时可以到数据库页手动删表。',
-          'Could not drop these created tables while going back: ' +
+          '未能删除这些已建表：' + failures.join('；') + '。点「清理并重试」再删一次；仍失败时可以到数据库页手动删表。',
+          'Could not drop these created tables: ' +
               failures.join('; ') +
               '. Use "Clean up and retry" to try again; if it keeps failing, drop '
                   'them from the database page.',
@@ -3245,7 +3292,9 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       }
     }
     _fkFailure = null;
-    _precheckApprovedSignature = null;
+    // 第 53 轮：重试失败的表时保留用户已确认过的外键预检签名 —— 外键集合没有
+    // 变化（_foreignKeys 重载 / 删外键 / 返回关系步骤时才清空），失败后点重试
+    // 不应该再弹一次「外键数据可能不匹配」。
     for (final form in _forms) {
       if (!form.imported &&
           (form.status == _RunStatus.failed ||
@@ -3261,33 +3310,150 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
 
   // ---------------------------------------------------------------- close
 
-  void _close() {
+  Future<void> _close() async {
     if (_executing) return;
-    final created = _createdTables.length;
+    final created = _createdTables;
     final imported = _forms.where((form) => form.imported).length;
-    if (created > 0) {
-      if (imported == 0) {
+    final allImported =
+        _forms.isNotEmpty && _forms.every((form) => form.imported);
+    // 第 53 轮 P2-9：已建表但没有全部导入成功时，不再只弹一条 notice 就关掉
+    // （表和数据留在数据库里，用户并不知道）。先让用户明确选择：取消 / 保留
+    // 已建表并关闭 / 删除本次已建表并关闭。全部导入成功时仍然直接关闭，不打扰。
+    if (created.isNotEmpty && !allImported) {
+      final choice = await _showCloseConfirmDialog(created.length, imported);
+      if (!mounted) return;
+      switch (choice) {
+        case _CloseChoice.cancel:
+        case null:
+          return;
+        case _CloseChoice.keepTables:
+          break; // 落到下面的既有提示并关闭。
+        case _CloseChoice.dropTables:
+          await _dropCreatedTables(created);
+          if (!mounted) return;
+          if (_pendingDropTables.isNotEmpty) {
+            // 删除失败：留在向导里，由现有错误横幅 +「清理并重试」展示残留表。
+            return;
+          }
+          widget.notice.show(
+            pickText(
+              '已删除本次创建的 ' + created.length.toString() + ' 张表',
+              'Dropped the ' +
+                  created.length.toString() +
+                  ' table(s) created in this wizard',
+            ),
+          );
+          Navigator.of(context).pop(false);
+          return;
+      }
+    }
+    final createdCount = _createdTables.length;
+    final importedCount = _forms.where((form) => form.imported).length;
+    if (createdCount > 0) {
+      if (importedCount == 0) {
         // 用户建完空表就关闭：表保留，但明确提示还没有导入数据。
         widget.notice.show(
           pickText(
-            '已创建 $created 张空表（未导入数据）',
-            'Created $created empty table(s) (no data imported)',
+            '已创建 $createdCount 张空表（未导入数据）',
+            'Created $createdCount empty table(s) (no data imported)',
           ),
         );
-      } else if (imported == created) {
+      } else if (importedCount == createdCount) {
         widget.notice.show(
-          pickText('已创建 $created 张表', 'Created $created table(s)'),
+          pickText('已创建 $createdCount 张表', 'Created $createdCount table(s)'),
         );
       } else {
         widget.notice.show(
           pickText(
-            '已创建 $created 张表，已导入 $imported 张表的数据',
-            'Created $created table(s); imported data into $imported',
+            '已创建 $createdCount 张表，已导入 $importedCount 张表的数据',
+            'Created $createdCount table(s); imported data into $importedCount',
           ),
         );
       }
     }
-    Navigator.of(context).pop(created > 0);
+    Navigator.of(context).pop(createdCount > 0);
+  }
+
+  /// 关闭确认（三选一）：取消 / 保留已建表并关闭 / 删除本次已建表并关闭。
+  Future<_CloseChoice?> _showCloseConfirmDialog(int created, int imported) {
+    final notImported = created - imported;
+    return showAppModal<_CloseChoice>(
+      context: context,
+      title: pickText('关闭向导', 'Close the wizard'),
+      builder: (context) => ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 620),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              imported == 0
+                  ? pickText(
+                      '本次已创建 ' +
+                          created.toString() +
+                          ' 张表，但还没有导入任何数据。关闭向导后这些空表会留在数据库里。',
+                      'This wizard created ' +
+                          created.toString() +
+                          ' table(s) but no data has been imported yet. They will '
+                              'stay in the database after you close the wizard.',
+                    )
+                  : pickText(
+                      '本次已创建 ' +
+                          created.toString() +
+                          ' 张表，其中 ' +
+                          imported.toString() +
+                          ' 张已导入数据、' +
+                          notImported.toString() +
+                          ' 张没有导入成功。关闭向导后已建的表会留在数据库里。',
+                      'This wizard created ' +
+                          created.toString() +
+                          ' table(s): ' +
+                          imported.toString() +
+                          ' imported and ' +
+                          notImported.toString() +
+                          ' not imported successfully. They will stay in the '
+                              'database after you close the wizard.',
+                    ),
+              style: kSmall,
+            ),
+            const SizedBox(height: 10),
+            AlertBox(
+              pickText(
+                '「删除本次已建表并关闭」会连同已导入的数据一起删除，无法撤销；'
+                    '不确定时选「保留已建表并关闭」，之后可以在数据库页手动清理。',
+                '"Drop the tables and close" also deletes any imported data and '
+                    'cannot be undone. If unsure, keep the tables and clean them up '
+                    'later from the database page.',
+              ),
+              tone: AlertTone.warn,
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        Builder(
+          builder: (context) => Btn(
+            pickText('取消', 'Cancel'),
+            key: const ValueKey<String>('quick-close-cancel'),
+            onPressed: () => Navigator.of(context).pop(_CloseChoice.cancel),
+          ),
+        ),
+        Builder(
+          builder: (context) => Btn(
+            pickText('保留已建表并关闭', 'Keep tables and close'),
+            key: const ValueKey<String>('quick-close-keep'),
+            onPressed: () => Navigator.of(context).pop(_CloseChoice.keepTables),
+          ),
+        ),
+        Builder(
+          builder: (context) => Btn(
+            pickText('删除已建表并关闭', 'Drop tables and close'),
+            key: const ValueKey<String>('quick-close-drop'),
+            danger: true,
+            onPressed: () => Navigator.of(context).pop(_CloseChoice.dropTables),
+          ),
+        ),
+      ],
+    );
   }
 
   // ---------------------------------------------------------------- build
@@ -3444,8 +3610,18 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
               ),
             ),
           const SizedBox(width: 8),
+          // 第 53 轮 P3：界面上全是「主键/外键/唯一/事务」这类行话，给文员一个
+          // 随时能查的术语说明入口（标题右侧、关闭按钮之前）。
+          IconBtn(
+            Icons.menu_book_outlined,
+            key: const ValueKey<String>('quick-glossary'),
+            tooltip: pickText('术语说明', 'Glossary'),
+            onPressed: () => showGlossaryDialog(context),
+          ),
+          const SizedBox(width: 4),
           IconBtn(
             Icons.close,
+            key: const ValueKey<String>('quick-wizard-close'),
             tooltip: '关闭',
             onPressed: _executing ? null : _close,
           ),
@@ -4527,14 +4703,14 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
         });
       case 3:
         if (_importsDone) {
-          _close();
+          await _close();
         } else if (_hasRetryableFailure) {
           await _retry();
         } else if (_hasPendingWork) {
           await _runImport();
         }
       default:
-        _close();
+        await _close();
     }
   }
 

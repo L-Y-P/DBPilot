@@ -26,6 +26,9 @@ const ZIP_MAGIC: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
 const OLE2_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// SpreadsheetML 2003 的 processing instruction。
 const SPREADSHEETML_MARKER: &str = "mso-application progid=\"Excel.Sheet\"";
+/// 扩展名是 Excel、内容却是 HTML/XML 文本时的统一提示。
+const FAKE_EXCEL_MESSAGE: &str =
+    "扩展名是 Excel，但文件内容不是 Excel 二进制格式（可能是 HTML/文本文件改了扩展名）；请另存为 .xlsx/.xls 或用 CSV 导入";
 /// 类型推断最多扫描的数据行数（表头之后）。
 pub const SCHEMA_SAMPLE_ROWS: usize = 1000;
 
@@ -57,6 +60,22 @@ impl ExcelKind {
     /// 二进制格式（编码显示为 binary；SpreadsheetML 仍是 UTF-8 文本）。
     pub fn is_binary(self) -> bool {
         !matches!(self, ExcelKind::SpreadsheetMl)
+    }
+
+    /// 该格式是否走逐行流式读取（只看格式的常量属性，不解析文件内容）。
+    ///
+    /// 当前五种格式（xlsx/xls/xlsb/ods/SpreadsheetML）都是流式的；大文件护栏
+    /// （importer::ensure_large_file_streamable）依赖这个常量判断，绝不能为了
+    /// 判定去解析工作簿内容。将来若有必须整表载入的格式，在这里返回 false。
+    pub fn is_streaming(self) -> bool {
+        matches!(
+            self,
+            ExcelKind::Xlsx
+                | ExcelKind::Xls
+                | ExcelKind::Xlsb
+                | ExcelKind::Ods
+                | ExcelKind::SpreadsheetMl
+        )
     }
 }
 
@@ -123,10 +142,51 @@ fn zip_kind(head: &[u8], tail: &[u8], ext: &str) -> Option<ExcelKind> {
     }
 }
 
+/// 文本内容冒充 Excel 时的分类（只看开头 16 KiB，不做 XML 解析）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextExcel {
+    /// 合法的 SpreadsheetML 2003（有 mso-application PI，或 Workbook/Worksheet 根元素）。
+    SpreadsheetMl,
+    /// HTML（网页表格、系统导出的表格改了扩展名）。
+    Html,
+    /// 是 XML，但不是 SpreadsheetML。
+    OtherXml,
+}
+
+/// 把「以 '<' 开头的文本内容」分类。
+///
+/// 关键是不能误伤合法的 SpreadsheetML .xls：它同样以 `<?xml` 开头，只能靠
+/// mso-application PI 或 Workbook/Worksheet 根元素认出来；HTML 或其它 XML
+/// 才是伪装文件。
+fn classify_text_excel(head: &[u8]) -> Option<TextExcel> {
+    let text = String::from_utf8_lossy(head);
+    if text.contains(SPREADSHEETML_MARKER) {
+        return Some(TextExcel::SpreadsheetMl);
+    }
+    let trimmed = text.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    if !trimmed.starts_with('<') {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<!doctype")
+        || lower.starts_with("<html")
+        || lower.starts_with("<meta")
+        || lower.starts_with("<table")
+        || lower.contains("<html")
+    {
+        return Some(TextExcel::Html);
+    }
+    if lower.contains("<workbook") || lower.contains("<worksheet") {
+        return Some(TextExcel::SpreadsheetMl);
+    }
+    Some(TextExcel::OtherXml)
+}
+
 /// 纯内容识别（head 至少 16 KiB；ZIP 需要 tail 覆盖中央目录）。
 ///
 /// 检测顺序是契约规定的「内容优先、扩展名兜底」：
 /// ZIP → xlsx/xlsb/ods；OLE2 → xls；文本 SpreadsheetML → excel。
+/// HTML/其它 XML 不算 Excel 内容：交给 detect 报中文提示（sniff 保持纯函数）。
 pub fn sniff(head: &[u8], tail: &[u8], ext: &str) -> Option<ExcelKind> {
     if head.starts_with(&ZIP_MAGIC) {
         return zip_kind(head, tail, ext);
@@ -135,15 +195,10 @@ pub fn sniff(head: &[u8], tail: &[u8], ext: &str) -> Option<ExcelKind> {
         // OLE2 是复合文档容器；真正的解析交给 xls_stream（BIFF8 record 级流式）。
         return Some(ExcelKind::Xls);
     }
-    let text = String::from_utf8_lossy(head);
-    if text.contains(SPREADSHEETML_MARKER) {
-        return Some(ExcelKind::SpreadsheetMl);
+    match classify_text_excel(head) {
+        Some(TextExcel::SpreadsheetMl) => Some(ExcelKind::SpreadsheetMl),
+        _ => None,
     }
-    let trimmed = text.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
-    if ext == "xls" && trimmed.starts_with('<') {
-        return Some(ExcelKind::SpreadsheetMl);
-    }
-    None
 }
 
 /// 从磁盘识别 Excel 系格式；不是 Excel 系返回 None。
@@ -156,7 +211,18 @@ pub fn detect(path: &str) -> AppResult<Option<ExcelKind>> {
     } else {
         Vec::new()
     };
-    Ok(sniff(&head, &tail, &ext))
+    if let Some(kind) = sniff(&head, &tail, &ext) {
+        return Ok(Some(kind));
+    }
+    // 伪装文件：扩展名是 Excel、内容却是 HTML/XML 文本。以前这种文件会被当成
+    // SpreadsheetML 解析，把 quick-xml 的英文内部错误（Expecting </meta>…）
+    // 直接吐给用户；现在在格式识别阶段就给可执行的中文提示。
+    if matches!(ext.as_str(), "xls" | "xlsx" | "xlsm" | "xlsb") {
+        if let Some(TextExcel::Html | TextExcel::OtherXml) = classify_text_excel(&head) {
+            return Err(AppError::bad(FAKE_EXCEL_MESSAGE));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------- 单元格转换

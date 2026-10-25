@@ -6,6 +6,7 @@
 import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rust_myadmin_desktop/src/i18n.dart';
 import 'package:rust_myadmin_desktop/src/views/er_model.dart';
 
 ErTable table(String name, List<ErColumn> columns) =>
@@ -791,6 +792,105 @@ void main() {
     });
   });
 
+  group('多对多标签避让锚点（P2-6）', () {
+    Offset midpointOf(Offset a, Offset b) =>
+        Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
+
+    test('水平连线：锚点从中点沿法线向上偏移，连线中段不再被盖住', () {
+      const a = Offset(100, 200);
+      const b = Offset(500, 200);
+      final midpoint = midpointOf(a, b);
+      final anchor = m2mLabelAnchorFor(start: a, end: b);
+      expect(anchor, isNot(midpoint), reason: '锚点必须离开曲线中点');
+      expect(anchor.dx, closeTo(midpoint.dx, 0.0001), reason: '水平线只上下偏移');
+      expect(anchor.dy, lessThan(midpoint.dy));
+      expect(midpoint.dy - anchor.dy, closeTo(18, 0.0001));
+      // 锚点到中点的向量与连线方向垂直（点积 0）：标签不会压住线的中段。
+      final delta = anchor - midpoint;
+      final direction = b - a;
+      expect(
+        delta.dx * direction.dx + delta.dy * direction.dy,
+        closeTo(0, 0.0001),
+      );
+    });
+
+    test('垂直连线：向上没有意义时横向偏移，y 不变', () {
+      const a = Offset(300, 100);
+      const b = Offset(300, 500);
+      final midpoint = midpointOf(a, b);
+      final anchor = m2mLabelAnchorFor(start: a, end: b);
+      expect(anchor.dy, closeTo(midpoint.dy, 0.0001));
+      expect(anchor.dx, lessThan(midpoint.dx));
+      expect((anchor - midpoint).distance, closeTo(18, 0.0001));
+    });
+
+    test('斜线：法线偏移并优先选 y 更小的一侧；offset 可调', () {
+      const a = Offset(0, 0);
+      const b = Offset(400, 400);
+      final midpoint = midpointOf(a, b);
+      final anchor = m2mLabelAnchorFor(start: a, end: b);
+      expect(anchor.dy, lessThan(midpoint.dy), reason: '优先偏向上方空白侧');
+      expect((anchor - midpoint).distance, closeTo(18, 0.0001));
+      final far = m2mLabelAnchorFor(start: a, end: b, offset: 36);
+      expect((far - midpoint).distance, closeTo(36, 0.0001));
+      final delta = far - midpoint;
+      final direction = b - a;
+      expect(
+        delta.dx * direction.dx + delta.dy * direction.dy,
+        closeTo(0, 0.0001),
+      );
+    });
+
+    test('两点重合 / offset 为 0 时退回中点', () {
+      expect(
+        m2mLabelAnchorFor(
+          start: const Offset(10, 10),
+          end: const Offset(10, 10),
+        ),
+        const Offset(10, 10),
+      );
+      expect(
+        m2mLabelAnchorFor(
+          start: const Offset(0, 0),
+          end: const Offset(100, 0),
+          offset: 0,
+        ),
+        const Offset(50, 0),
+      );
+    });
+
+    test('接上真实多对多连线：标签锚点 = 卡片中心中点沿法线上移', () {
+      final ordersTable = table('orders', <ErColumn>[
+        column('id', type: 'INTEGER', primary: true),
+      ]);
+      final productsTable = table('products', <ErColumn>[
+        column('id', type: 'INTEGER', primary: true),
+      ]);
+      final layout = ErCanvasLayout(
+        tables: <ErTable>[ordersTable, productsTable],
+        positions: <String, Offset>{
+          'orders': const Offset(24, 24),
+          'products': const Offset(400, 24),
+        },
+      );
+      final left = layout.positions['orders']!;
+      final right = layout.positions['products']!;
+      final metrics = layout.metrics;
+      final a = Offset(
+        left.dx + metrics.cardWidth / 2,
+        left.dy + metrics.heightOf(ordersTable) / 2,
+      );
+      final b = Offset(
+        right.dx + metrics.cardWidth / 2,
+        right.dy + metrics.heightOf(productsTable) / 2,
+      );
+      final anchor = m2mLabelAnchorFor(start: a, end: b);
+      // 两卡片同高时，连线中点 y 与卡片中心一致；标签上移 18px 后离开连线。
+      expect(anchor.dy, closeTo(a.dy - 18, 0.0001));
+      expect(anchor.dx, closeTo((a.dx + b.dx) / 2, 0.0001));
+    });
+  });
+
   group('自动带入关联表', () {
     test('BFS 沿父/子两个方向扩展，循环不重复', () {
       final expanded = expandRelatedTableNames(
@@ -846,6 +946,91 @@ void main() {
         maxTables: 5,
       );
       expect(expanded, isEmpty);
+    });
+  });
+
+  group('自动带入的说明文案（P2-8）', () {
+    test('达到画布上限：说明已加入几张 / 上限几张 / 其余未加入', () {
+      final notice = autoIncludeNotice(
+        addedCount: 4,
+        hasAnyForeignKey: true,
+        reachedLimit: true,
+        maxTables: 5,
+      );
+      expect(notice, isNotNull);
+      expect(notice, contains('已自动加入 4 张'));
+      expect(notice, contains('已达画布上限 5 张'));
+      expect(notice, contains('其余关联表未加入'));
+      expect(notice, contains('手动添加或先移除部分表'));
+    });
+
+    test('数据库没有外键：说明自动带入只沿已有外键，并指向建议外键', () {
+      final notice = autoIncludeNotice(
+        addedCount: 0,
+        hasAnyForeignKey: false,
+        reachedLimit: false,
+        maxTables: 10,
+      );
+      expect(notice, isNotNull);
+      expect(notice, contains('还没有外键'));
+      expect(notice, contains('只能沿已有外键'));
+      expect(notice, contains('建议外键'));
+      expect(notice, contains('按列名'));
+      expect(notice, contains('手动添加表'));
+    });
+
+    test('正常加入 / 有外键但没候选 / 未达上限时不打扰', () {
+      expect(
+        autoIncludeNotice(
+          addedCount: 2,
+          hasAnyForeignKey: true,
+          reachedLimit: false,
+          maxTables: 10,
+        ),
+        isNull,
+      );
+      expect(
+        autoIncludeNotice(
+          addedCount: 0,
+          hasAnyForeignKey: true,
+          reachedLimit: false,
+          maxTables: 10,
+        ),
+        isNull,
+      );
+      // 库里有外键、只是没有候选（都已加入 / 被用户移除）→ 不显示。
+      expect(
+        autoIncludeNotice(
+          addedCount: 0,
+          hasAnyForeignKey: true,
+          reachedLimit: true,
+          maxTables: 10,
+        ),
+        isNull,
+      );
+    });
+
+    test('英文模式：说明也是英文（没有中文残留）', () {
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final limit = autoIncludeNotice(
+        addedCount: 3,
+        hasAnyForeignKey: true,
+        reachedLimit: true,
+        maxTables: 5,
+      )!;
+      expect(limit, contains('Added 3 tables automatically'));
+      expect(limit, contains('limit of 5 tables'));
+      expect(RegExp(r'[\u4e00-\u9fff]').hasMatch(limit), isFalse);
+      final noForeignKey = autoIncludeNotice(
+        addedCount: 0,
+        hasAnyForeignKey: false,
+        reachedLimit: false,
+        maxTables: 10,
+      )!;
+      expect(noForeignKey, contains('no foreign keys yet'));
+      expect(noForeignKey, contains('Create suggested FKs'));
+      expect(RegExp(r'[\u4e00-\u9fff]').hasMatch(noForeignKey), isFalse);
     });
   });
 
@@ -1376,6 +1561,41 @@ void main() {
         ),
         isNull,
       );
+    });
+  });
+
+  group('危险操作确认 / 批量进度文案（P2-9 / P3）', () {
+    test('删除外键确认：点名约束、说明不删数据且可重建', () {
+      final message = erDeleteForeignKeyConfirmMessage('fk_orders_user');
+      expect(message, contains('fk_orders_user'));
+      expect(message, contains('引用约束会解除'));
+      expect(message, contains('数据不会删除'));
+      expect(message, contains('关系图重建'));
+    });
+
+    test('批量建议确认：条数 + 立即写库 + 不能一键全部撤销', () {
+      final message = erBatchSuggestionConfirmMessage(3);
+      expect(message, contains('3 条建议外键'));
+      expect(message, contains('立即写入数据库'));
+      expect(message, contains('不能一键全部撤销'));
+    });
+
+    test('批量进度文案 X/N', () {
+      expect(erSuggestionProgressText(2, 5), '正在建立 2/5 条…');
+    });
+
+    test('英文模式：确认 / 进度文案也是英文', () {
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final deleteMessage = erDeleteForeignKeyConfirmMessage('fk_orders_user');
+      expect(deleteMessage, contains('Deleting foreign key fk_orders_user'));
+      expect(deleteMessage, contains('data is not deleted'));
+      expect(RegExp(r'[\u4e00-\u9fff]').hasMatch(deleteMessage), isFalse);
+      final batch = erBatchSuggestionConfirmMessage(3);
+      expect(batch, contains('3 suggested foreign keys'));
+      expect(batch, contains('cannot all be undone at once'));
+      expect(RegExp(r'[\u4e00-\u9fff]').hasMatch(batch), isFalse);
+      expect(erSuggestionProgressText(2, 5), 'Creating 2/5…');
     });
   });
 }

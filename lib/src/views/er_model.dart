@@ -9,6 +9,8 @@
 import 'dart:math' as math;
 import 'dart:ui' show Offset, Rect, Size;
 
+import '../i18n_literals.dart';
+
 /// 数据库驱动，字符串与 Rust `DriverKind` / `AppState.driver` 一致。
 enum ErDriver {
   mysql,
@@ -1489,6 +1491,32 @@ ErRelationCurve? manyToManyCurve(ErCanvasLayout layout, ErManyToManyLink link) {
   );
 }
 
+/// 多对多标签的锚点：两端卡片中心连线的中点，沿连线的垂直方向偏移 [offset]。
+///
+/// 第 53 轮 P2-6：标签原来正好压在橙色「多对多」连线的中段上，把线挡得看不出
+/// 走向。这里把锚点沿法线挪开，并固定选 y 更小的一侧（屏幕上偏上），让标签落在
+/// 连线上方的空白处，连线中段保持可见；[offset] 大于标签半高（约 8px）即可，
+/// 默认 18px。
+///
+/// [start] / [end] 是两张卡片中心（与 [manyToManyCurve] 的曲线中点重合）。
+/// 两点重合或 [offset] 为 0 时退回中点。
+Offset m2mLabelAnchorFor({
+  required Offset start,
+  required Offset end,
+  double offset = 18,
+}) {
+  final midpoint = Offset((start.dx + end.dx) / 2, (start.dy + end.dy) / 2);
+  final delta = end - start;
+  final length = delta.distance;
+  if (length <= 0.0001 || offset == 0) return midpoint;
+  var normal = Offset(-delta.dy / length, delta.dx / length);
+  // 两个法线方向里选 y 更小的那个（y 相同则偏左），标签因此尽量在线段上方。
+  if (normal.dy > 0 || (normal.dy == 0 && normal.dx > 0)) {
+    normal = Offset(-normal.dx, -normal.dy);
+  }
+  return midpoint + normal * offset;
+}
+
 // -------------------------------------------------- 自动带入关联表
 
 /// 从已加入的表出发，沿已有外键（父表 + 子表两个方向）做 BFS，返回候选表名。
@@ -1516,6 +1544,44 @@ List<String> expandRelatedTableNames({
     }
   }
   return out;
+}
+
+/// 自动带入后给用户的说明（第 53 轮 P2-8）；没有需要说明的情况返回 null。
+///
+/// 画布上的「自动带入」只沿数据库里**已有外键**扩展，和按列名推导的「建议
+/// 关系」是两套机制：前者不会凭列名猜关系，所以库里一条外键都没有时，一张表
+/// 也带不进来；候选表超过画布上限时，剩下的关联表也会被静默截断。这两种「点了
+/// 没反应」原来都没有提示，用户会以为功能坏了。
+///
+/// * [addedCount] 本次真正自动加入的表数；
+/// * [hasAnyForeignKey] 当前数据库里是否存在任何外键；
+/// * [reachedLimit] 是否因为画布上限截断了候选表；
+/// * [maxTables] 画布上限（含已加入的表）。
+String? autoIncludeNotice({
+  required int addedCount,
+  required bool hasAnyForeignKey,
+  required bool reachedLimit,
+  required int maxTables,
+}) {
+  if (addedCount > 0 && reachedLimit) {
+    return pickText(
+      '已自动加入 $addedCount 张；已达画布上限 $maxTables 张，其余关联表未加入，'
+          '可手动添加或先移除部分表。',
+      'Added $addedCount tables automatically; the canvas limit of $maxTables tables '
+          'has been reached, so the remaining related tables were not added. Add them '
+          'manually or remove some tables first.',
+    );
+  }
+  if (addedCount == 0 && !hasAnyForeignKey) {
+    return pickText(
+      '当前数据库还没有外键，自动带入只能沿已有外键；'
+          '可先用「建立建议外键」按列名建立关系，或手动添加表。',
+      'This database has no foreign keys yet, and auto-add can only follow existing '
+          'foreign keys. Use "Create suggested FKs" to derive relations from column '
+          'names, or add tables manually.',
+    );
+  }
+  return null;
 }
 
 // -------------------------------------------------- 建议关系（列名推导）
@@ -1959,3 +2025,28 @@ String erColumnTypeOf(Map<String, dynamic> row) {
   }
   return '';
 }
+
+// -------------------------------------------------- 危险操作确认 / 进度文案
+//
+// 这些文案由 relation_designer 的危险操作共用（第 53 轮 P2-9 / P3）；抽成纯
+// 函数，widget 测试不必真的删外键就能断言「说的是什么」。
+
+/// 删除外键前的二次确认：说明解除的是引用约束，不会删数据，之后能重建。
+String erDeleteForeignKeyConfirmMessage(String constraintName) => pickText(
+  '删除外键 $constraintName 后，两张表之间的引用约束会解除（数据不会删除）；'
+      '之后可以从关系图重建。',
+  'Deleting foreign key $constraintName removes the reference constraint between '
+      'the two tables (data is not deleted); it can be rebuilt from the relation '
+      'diagram.',
+);
+
+/// 批量建立建议外键前的确认：DDL 立即写库，且没有「一键撤销」。
+String erBatchSuggestionConfirmMessage(int count) => pickText(
+  '将建立 $count 条建议外键，会立即写入数据库；建立后不能一键全部撤销。',
+  'This will create $count suggested foreign keys and write them to the database '
+      'immediately; they cannot all be undone at once.',
+);
+
+/// 批量建立建议外键的执行进度（当前第几条 / 共几条）。
+String erSuggestionProgressText(int current, int total) =>
+    pickText('正在建立 $current/$total 条…', 'Creating $current/$total…');

@@ -1482,7 +1482,36 @@ mod spreadsheetml {
         format!("Sheet{}", index + 1)
     }
 
+    /// SpreadsheetML 的 ss:Visibility 是否表示隐藏（大小写不敏感）。
+    fn visibility_is_hidden(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "hidden" | "veryhidden" | "very_hidden"
+        )
+    }
+
+    /// 从原始字节标签里读 ss:Visibility（sheet_names 的逐块字节扫描用）。
+    fn raw_tag_hidden(tag: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(tag);
+        let lower = text.to_ascii_lowercase();
+        let Some(start) = lower.find("visibility=") else {
+            return false;
+        };
+        let rest = text[start + "visibility=".len()..].trim_start_matches(['"', '\'']);
+        let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+        visibility_is_hidden(&rest[..end])
+    }
+
+    /// Worksheet 的 ss:Visibility="Hidden"/"VeryHidden"：与 xlsx/xls/xlsb 的
+    /// 隐藏表语义一致，都要从 sheets 列表里排除并计数。
+    fn worksheet_hidden(tag: &BytesStart<'_>) -> bool {
+        attr(tag, "Visibility")
+            .map(|value| visibility_is_hidden(&value))
+            .unwrap_or(false)
+    }
+
     /// 只扫 Worksheet 开始标签拿表名（逐块读文件，不解析行数据、不整文件载入）。
+    /// 隐藏表不放进返回列表。
     pub fn sheet_names(path: &str) -> AppResult<Vec<String>> {
         let mut file =
             File::open(path).map_err(|error| AppError::bad(format!("无法打开文件: {error}")))?;
@@ -1503,7 +1532,10 @@ mod spreadsheetml {
                 let Some(len) = pending[start..].iter().position(|&byte| byte == b'>') else {
                     break; // 标签跨块，留给下一轮
                 };
-                names.push(name_from_tag(&pending[start..start + len + 1], names.len()));
+                let tag = &pending[start..start + len + 1];
+                if !raw_tag_hidden(tag) {
+                    names.push(name_from_tag(tag, names.len()));
+                }
                 cursor = start + len + 1;
             }
             if cursor > 0 {
@@ -1568,6 +1600,7 @@ mod spreadsheetml {
         let mut row_counts: Vec<u64> = Vec::new();
         let mut col_counts: Vec<u64> = Vec::new();
         let mut header_rows: Vec<Vec<Value>> = Vec::new();
+        let mut hidden_sheets = 0usize;
         let mut current: Option<usize> = None;
         let mut row: Vec<Value> = Vec::new();
         let mut in_row = false;
@@ -1582,13 +1615,19 @@ mod spreadsheetml {
             match &event {
                 Event::Start(tag) => {
                     if tag_is(tag, "Worksheet") {
-                        let index = names.len();
-                        let name =
-                            attr(tag, "Name").unwrap_or_else(|| format!("Sheet{}", index + 1));
-                        names.push(name);
-                        row_counts.push(0);
-                        col_counts.push(0);
-                        current = Some(index);
+                        if worksheet_hidden(tag) {
+                            // 隐藏表：不登记、不统计，行数据也不会被计入上一张表。
+                            hidden_sheets += 1;
+                            current = None;
+                        } else {
+                            let index = names.len();
+                            let name =
+                                attr(tag, "Name").unwrap_or_else(|| format!("Sheet{}", index + 1));
+                            names.push(name);
+                            row_counts.push(0);
+                            col_counts.push(0);
+                            current = Some(index);
+                        }
                     } else if tag_is(tag, "Row") {
                         row.clear();
                         in_row = true;
@@ -1672,7 +1711,11 @@ mod spreadsheetml {
             }
         }
         if names.is_empty() {
-            return Err(AppError::bad("SpreadsheetML 文件里没有 <Worksheet> 工作表"));
+            return Err(AppError::bad(if hidden_sheets > 0 {
+                "SpreadsheetML 文件里没有可见的 <Worksheet> 工作表（工作表全部被隐藏）"
+            } else {
+                "SpreadsheetML 文件里没有 <Worksheet> 工作表"
+            }));
         }
         let sheets: Vec<SheetMeta> = names
             .iter()
@@ -1688,7 +1731,7 @@ mod spreadsheetml {
             sheet: names[0].clone(),
             sheets,
             header_rows,
-            hidden_sheets: 0,
+            hidden_sheets,
             streaming: true,
             warnings: Vec::new(),
         })
@@ -1754,6 +1797,10 @@ mod spreadsheetml {
                     if tag_is(tag, "Worksheet") {
                         if self.in_target {
                             self.finished = true;
+                            return None;
+                        }
+                        // 隐藏表不占可见序号（sheet_names 已排除），直接跳过它的行。
+                        if worksheet_hidden(tag) {
                             return None;
                         }
                         if self.sheet_cursor == self.target {
@@ -1937,8 +1984,71 @@ mod spreadsheetml {
 
 mod ods {
     use super::*;
+    use std::collections::HashSet;
+
+    /// 隐藏表的判定（与 xlsx/xls/xlsb 的 hidden_sheets 对齐）。
+    ///
+    /// ODS 有两条路径：
+    /// 1. 直接写在表上：`table:display="false"` / `table:visibility="collapse"`；
+    /// 2. 通过 `table:style-name` 引用 `office:automatic-styles` 里的表样式，
+    ///    样式的 `<style:table-properties table:display="false"/>` 才是权威值。
+    ///
+    /// 样式定义在 `<office:automatic-styles>` 里、比 `<office:body>` 先出现，
+    /// 因此单次顺序扫描就能先收集样式、再判定每张表。
+    #[derive(Default)]
+    struct TableVisibility {
+        hidden_styles: HashSet<String>,
+        current: Option<(String, bool)>,
+    }
+
+    impl TableVisibility {
+        /// 属性层面的隐藏（表、或样式里的 table-properties 共用）。
+        fn attrs_hidden(tag: &BytesStart<'_>) -> bool {
+            matches!(
+                attr(tag, "display").as_deref(),
+                Some("false") | Some("0")
+            ) || matches!(
+                attr(tag, "visibility").as_deref(),
+                Some("collapse") | Some("hide") | Some("hidden")
+            )
+        }
+
+        fn on_start(&mut self, tag: &BytesStart<'_>) {
+            if tag_is(tag, "style") {
+                let name = attr(tag, "name").unwrap_or_default();
+                let family = attr(tag, "family").unwrap_or_default();
+                if !name.is_empty() && family == "table" {
+                    self.current = Some((name, false));
+                }
+            } else if let Some((_, hidden)) = self.current.as_mut() {
+                if tag_is(tag, "table-properties") && Self::attrs_hidden(tag) {
+                    *hidden = true;
+                }
+            }
+        }
+
+        fn on_end(&mut self, tag: &quick_xml::events::BytesEnd<'_>) {
+            if tag_end_is(tag, "style") {
+                if let Some((name, hidden)) = self.current.take() {
+                    if hidden {
+                        self.hidden_styles.insert(name);
+                    }
+                }
+            }
+        }
+
+        /// 某张 `<table:table>` 是否隐藏。
+        fn table_hidden(&self, tag: &BytesStart<'_>) -> bool {
+            Self::attrs_hidden(tag)
+                || attr(tag, "style-name")
+                    .map(|style| self.hidden_styles.contains(&style))
+                    .unwrap_or(false)
+        }
+    }
 
     /// ODS 的工作表名（content.xml 里的 table:table；只解析标签，不解析单元格）。
+    ///
+    /// 隐藏表不放进返回列表：open_sheet 按可见表序号选表，与 xlsx/xls/xlsb 一致。
     fn table_names(path: &str) -> AppResult<Vec<String>> {
         let mut archive = open_zip(path)?;
         let entry = archive
@@ -1946,6 +2056,7 @@ mod ods {
             .map_err(|_| AppError::bad("不是有效的 ODS 文件: 缺少 content.xml"))?;
         let mut reader = xml_reader(BufReader::new(entry));
         let mut names: Vec<String> = Vec::new();
+        let mut visibility = TableVisibility::default();
         let mut in_spreadsheet = false;
         let mut inside_table = false;
         let mut buf = Vec::new();
@@ -1955,17 +2066,24 @@ mod ods {
                 .map_err(|error| AppError::bad(format!("解析 ODS content.xml 失败: {error}")))?;
             match &event {
                 Event::Start(tag) | Event::Empty(tag) => {
+                    visibility.on_start(tag);
                     if tag_is(tag, "spreadsheet") {
                         in_spreadsheet = true;
                     } else if in_spreadsheet && !inside_table && tag_is(tag, "table") {
-                        names.push(
-                            attr(tag, "name")
-                                .unwrap_or_else(|| format!("Sheet{}", names.len() + 1)),
-                        );
-                        inside_table = true;
+                        if !visibility.table_hidden(tag) {
+                            names.push(
+                                attr(tag, "name")
+                                    .unwrap_or_else(|| format!("Sheet{}", names.len() + 1)),
+                            );
+                        }
+                        // 自闭合的空表没有 End 事件，不能置 inside_table。
+                        if matches!(&event, Event::Start(_)) {
+                            inside_table = true;
+                        }
                     }
                 }
                 Event::End(tag) => {
+                    visibility.on_end(tag);
                     if tag_end_is(tag, "table") {
                         inside_table = false;
                     } else if tag_end_is(tag, "spreadsheet") {
@@ -2107,21 +2225,26 @@ mod ods {
     }
 
     struct OdsParser {
-        /// 目标表序号；None = 只做 inspect（统计所有表）。
+        /// 目标表序号（可见表，0-based）；None = 只做 inspect（统计所有表）。
         target: Option<usize>,
+        /// 已遇到的可见表数量 = 下一张可见表的序号（隐藏表不占序号）。
         table_cursor: usize,
         in_target: bool,
         inside_table: bool,
+        /// 当前表是隐藏表：inspect 不统计它的行，open_sheet 也永远不选它。
+        current_hidden: bool,
         in_spreadsheet: bool,
+        visibility: TableVisibility,
         row: Vec<Value>,
         row_repeat: usize,
         in_row: bool,
         cell: Option<CellState>,
-        /// inspect 用：所有表的名字与行数/列数。
+        /// inspect 用：可见表的名字与行数/列数。
         names: Vec<String>,
         row_counts: Vec<u64>,
         col_counts: Vec<u64>,
         header_rows: Vec<Vec<Value>>,
+        hidden_sheets: usize,
         finished: bool,
     }
 
@@ -2132,7 +2255,9 @@ mod ods {
                 table_cursor: 0,
                 in_target: false,
                 inside_table: false,
+                current_hidden: false,
                 in_spreadsheet: false,
+                visibility: TableVisibility::default(),
                 row: Vec::new(),
                 row_repeat: 1,
                 in_row: false,
@@ -2141,8 +2266,30 @@ mod ods {
                 row_counts: Vec::new(),
                 col_counts: Vec::new(),
                 header_rows: Vec::new(),
+                hidden_sheets: 0,
                 finished: false,
             }
+        }
+
+        /// 登记一张表（Start 或自闭合的 Empty table）。
+        fn begin_table(&mut self, tag: &BytesStart<'_>) {
+            self.current_hidden = self.visibility.table_hidden(tag);
+            if self.current_hidden {
+                self.hidden_sheets += 1;
+                self.inside_table = true;
+                return;
+            }
+            let name = attr(tag, "name").unwrap_or_else(|| format!("Sheet{}", self.names.len() + 1));
+            if let Some(target) = self.target {
+                if self.table_cursor == target {
+                    self.in_target = true;
+                }
+            }
+            self.names.push(name);
+            self.row_counts.push(0);
+            self.col_counts.push(0);
+            self.table_cursor += 1;
+            self.inside_table = true;
         }
 
         fn emit_row(&mut self) -> Vec<Vec<Value>> {
@@ -2155,6 +2302,10 @@ mod ods {
                 }
                 let repeat = self.row_repeat.clamp(1, 1000);
                 return vec![row; repeat];
+            }
+            // inspect：隐藏表不参与行数/列数/表头统计。
+            if self.current_hidden {
+                return Vec::new();
             }
             // inspect：行数/列数按「非空行」统计；重复行按 repeat 计。
             if let Some(table) = self.names.len().checked_sub(1) {
@@ -2175,21 +2326,11 @@ mod ods {
         fn on_event(&mut self, event: &Event<'_>) -> Vec<Vec<Value>> {
             match event {
                 Event::Start(tag) => {
+                    self.visibility.on_start(tag);
                     if tag_is(tag, "spreadsheet") {
                         self.in_spreadsheet = true;
                     } else if self.in_spreadsheet && !self.inside_table && tag_is(tag, "table") {
-                        let name = attr(tag, "name")
-                            .unwrap_or_else(|| format!("Sheet{}", self.names.len() + 1));
-                        if let Some(target) = self.target {
-                            if self.table_cursor == target {
-                                self.in_target = true;
-                            }
-                        }
-                        self.names.push(name);
-                        self.row_counts.push(0);
-                        self.col_counts.push(0);
-                        self.inside_table = true;
-                        self.table_cursor += 1;
+                        self.begin_table(tag);
                     } else if self.inside_table
                         && self.in_target_or_inspect()
                         && tag_is(tag, "table-row")
@@ -2211,7 +2352,19 @@ mod ods {
                     }
                 }
                 Event::Empty(tag) => {
-                    if self.inside_table && self.in_target_or_inspect() {
+                    self.visibility.on_start(tag);
+                    if self.in_spreadsheet && !self.inside_table && tag_is(tag, "table") {
+                        // 自闭合的空表：没有行、也没有 End 事件，只登记名字与隐藏计数。
+                        self.begin_table(tag);
+                        let was_target = self.in_target;
+                        self.inside_table = false;
+                        self.current_hidden = false;
+                        self.in_target = false;
+                        if was_target {
+                            // 选中的就是这张空表：没有行可读，直接结束扫描。
+                            self.finished = true;
+                        }
+                    } else if self.inside_table && self.in_target_or_inspect() {
                         if tag_is(tag, "table-cell") {
                             // 自闭合单元格也要读属性：数值/布尔/日期通常是
                             // <table:table-cell office:value-type="float" .../>。
@@ -2253,6 +2406,7 @@ mod ods {
                     }
                 }
                 Event::End(tag) => {
+                    self.visibility.on_end(tag);
                     if tag_end_is(tag, "p") {
                         if let Some(cell) = self.cell.as_mut() {
                             cell.in_text = false;
@@ -2268,8 +2422,12 @@ mod ods {
                         return self.emit_row();
                     } else if tag_end_is(tag, "table") && self.inside_table {
                         self.inside_table = false;
+                        // 只有「刚结束的是目标可见表」才算读完；隐藏表不占序号。
+                        let was_target = self.in_target && !self.current_hidden;
+                        self.current_hidden = false;
+                        self.in_target = false;
                         if let Some(target) = self.target {
-                            if self.table_cursor - 1 == target {
+                            if was_target && self.table_cursor.checked_sub(1) == Some(target) {
                                 self.finished = true;
                             }
                         }
@@ -2307,7 +2465,11 @@ mod ods {
             }
         }
         if parser.names.is_empty() {
-            return Err(AppError::bad("ODS 文件里没有工作表"));
+            return Err(AppError::bad(if parser.hidden_sheets > 0 {
+                "ODS 文件里没有可见的工作表（工作表全部被隐藏）"
+            } else {
+                "ODS 文件里没有工作表"
+            }));
         }
         let sheets: Vec<SheetMeta> = parser
             .names
@@ -2324,7 +2486,7 @@ mod ods {
             sheet: parser.names[0].clone(),
             sheets,
             header_rows: parser.header_rows,
-            hidden_sheets: 0,
+            hidden_sheets: parser.hidden_sheets,
             streaming: true,
             warnings: Vec::new(),
         })

@@ -158,10 +158,16 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 | `xlsb` | 流式（workbook.bin + 每表 BrtWsDim + 默认表前两行） | **流式（Row 级）**：zip 的 ZipFile(Read) 边解压边解析 BRT（varint id + varsize、BrtRowHdr/BrtCell*/公式缓存值、sharedStrings/styles） | 工作表 entry 级流式，无 read_to_end；SST/styles 一次性加载；加密 xlsb 报错 |
 
 - CSV/JSON/XML/HTML/Markdown 等文本格式本来就走流式字节读取，本轮不变。
-- 大文件护栏（第 51 轮）：单文件超过 **5 GB** 时，能流式读取的格式只在 warnings 里提醒
-  （「文件约 X GB（超过 5 GB）：会逐行流式读取，耗时与磁盘 IO 会明显增加」）；
-  如果有读取路径需要整表载入内存，则超过 5 GB 直接拒绝并在错误里说明格式与拆分建议。
-  当前 xlsx/xls/xlsb/ODS/SpreadsheetML/CSV/JSON 等全部流式，所以实际行为是「提醒不拒绝」。
+- 大文件护栏（第 51 轮引入，第 53 轮重构）：阈值 **5 GiB = 5×1024³ 字节**，文案统一 GiB 口径
+  （「文件约 X GiB（超过 5 GiB，即 5×1024³ 字节）：会逐行流式读取，耗时与磁盘 IO 会明显增加；
+  共享字符串表较大时内存峰值可能明显上升」）。判定只用 file_info + 轻量格式识别
+  （ExcelKind::is_streaming() 常量），**不会为了判断而 inspect/preview 工作簿**；
+  若将来出现必须整表载入内存的读取路径，超过 5 GiB 直接拒绝并在错误里说明格式与拆分建议。
+  当前 xlsx/xls/xlsb/ODS/SpreadsheetML/CSV/JSON 等全部流式，所以实际行为仍是「提醒不拒绝」。
+- 加密/伪装与路径错误（第 53 轮）：Office 加密的 xlsx/xlsb（OLE2/CFB 包装）给中文「文件已加密…请另存为未加密」；
+  CFB 里没有 Workbook/Book 流（加密 xls / 非 Excel）给中文提示并保留原始细节；
+  扩展名是 Excel 但内容是 HTML/非 SpreadsheetML XML 时给中文「可能是 HTML/文本文件改了扩展名」；
+  路径不存在 / 无权限读取时给中文主文案（保留 OS 原文）。
 - 内存边界：xlsx / xls / xlsb 的峰值 ≈ 共享字符串表（sharedStrings/SST，字符串总长度）
   + 读缓冲 + 首个 128 行宽度探测缓冲；SpreadsheetML/ODS 只占固定读缓冲。
   行数据本身都是逐行产出，不随文件行数增长（每个解析器都有 5 万行流式单测）。
@@ -171,10 +177,12 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 ## 8. 已知边界
 
 - 只读：不支持写回 xlsx/xls/xlsb/ods；导出 Excel 仍是 SpreadsheetML 2003（.xls）。
-- 单文件 > 5 GB：流式格式会给 warning；若将来出现必须整表载入的读取路径，会直接拒绝（见 §7 大文件护栏）。
+- 单文件 > 5 GiB：流式格式会给 warning；若将来出现必须整表载入的读取路径，会直接拒绝（见 §7 大文件护栏）。
 - 加密/损坏的工作簿在 inspect/preview 阶段返回中文错误（「无法读取 ... 文件可能已损坏、被密码保护」）。
 - 公式单元格读取 Excel 缓存的计算结果；没有缓存时为 NULL。
-- 隐藏工作表不参与选择；默认选第一张可见表。
+- 隐藏工作表不参与选择；默认选第一张可见表。第 53 轮起 xlsx / xls / xlsb / ODS / SpreadsheetML 全部排除隐藏表，
+  并在 inspect warnings 里给「已忽略 N 个隐藏工作表」；ODS 的 table:display / table:visibility / style 继承与
+  SpreadsheetML 的 ss:Visibility=Hidden/VeryHidden 都覆盖。
 - SpreadsheetML 仅支持 UTF-8 文本（Excel 2003 XML 的常见编码）。
 - 一次常规导入只导入一张工作表；需要一次建多张表请用「从文件建表」向导。
 - Excel 的时间单元格是「一天内的比例」，calamine 会落在 1899-12-31，读取层据此输出

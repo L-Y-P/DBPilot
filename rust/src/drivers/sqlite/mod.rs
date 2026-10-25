@@ -1595,17 +1595,23 @@ mod batch_stream_tests {
     use super::*;
     use serde_json::json;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 进程内单调递增的临时库序号。
+    ///
+    /// 之前用 SystemTime::now().as_nanos() 做唯一后缀，但并行启动的测试线程
+    /// 完全可能取到同一纳秒（实测 4 线程同时取 68.7% 会重复）→ 两个测试打开
+    /// 同一个临时库，第二个 CREATE TABLE 报 "table t already exists"。
+    /// 计数器在进程内由原子操作分配，天然唯一（配合 pid 跨进程也唯一）。
+    static TEST_DB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
     async fn temp_pool(tag: &str) -> (SqlitePool, std::path::PathBuf) {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        let seq = TEST_DB_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "rma-sqlite-stream-{}-{}-{}.sqlite",
             tag,
             std::process::id(),
-            nanos
+            seq
         ));
         let _ = std::fs::remove_file(&path);
         let opts = SqliteConnectOptions::new()

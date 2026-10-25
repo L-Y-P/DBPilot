@@ -2452,14 +2452,14 @@ pub struct FileInfo {
     pub name: String,
 }
 
-/// 无法流式读取的格式的大小上限：5 GB。
+/// 无法流式读取的格式的大小上限：5 GiB（5×1024³ 字节）。
 ///
 /// 能流式读的格式（CSV/JSON/Excel 全格式）只按行处理，大小不受这个限制；
-/// 只有「必须整表载入内存」的读取路径才受它约束——超过 5 GB 直接拒绝，
+/// 只有「必须整表载入内存」的读取路径才受它约束——超过 5 GiB 直接拒绝，
 /// 避免把一台机器的内存吃光。提醒文案同时会出现在 inspect 的 warnings 里。
 pub const MAX_NON_STREAMING_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
-/// 字节数 → 给用户看的容量（1 位小数）。
+/// 字节数 → 普通文件大小显示（1 位小数，1024 进制）。
 pub fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let value = bytes as f64;
@@ -2474,30 +2474,40 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// 单文件过大时的提醒（可流式读取也要提醒耗时）。
+/// 字节数 → GiB（1 位小数）。5 GiB 护栏的文案统一用这个单位，
+/// 避免同一句话里「5.0 GB」与「超过 5 GB」互相矛盾。
+pub fn format_gib(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    format!("{:.1} GiB", bytes as f64 / GIB)
+}
+
+/// 单文件过大时的提醒（可流式读取也要提醒耗时与内存）。
 fn large_file_warning(size: u64) -> Option<String> {
     if size <= MAX_NON_STREAMING_BYTES {
         return None;
     }
     Some(format!(
-        "文件约 {}（超过 5 GB）：会逐行流式读取，耗时与磁盘 IO 会明显增加；建议分批导入或先压缩无关列。",
-        format_size(size)
+        "文件约 {}（超过 5 GiB，即 5×1024³ 字节）：会逐行流式读取，耗时与磁盘 IO 会明显增加；建议分批导入或先压缩无关列。超大工作簿的共享字符串表（SST）本身可能很大，内存峰值会明显上升；若是 .xls，建议先另存为 .xlsx 或拆分文件后再导入。",
+        format_gib(size)
     ))
 }
 
-/// 超过 5 GB 且该格式无法流式读取时的拒绝文案。
+/// 超过 5 GiB 且该格式无法流式读取时的拒绝文案。
 pub fn non_streaming_size_error(size: u64, format: &str) -> String {
     format!(
-        "文件约 {}，超过 5 GB；{} 目前无法流式读取（需要整表载入内存），已拒绝导入。请拆分文件，或转换为 xlsx / CSV 后再试。",
-        format_size(size),
+        "文件约 {}，超过 5 GiB（5×1024³ 字节）；{} 目前无法流式读取（需要整表载入内存），已拒绝导入。请拆分文件，或转换为 xlsx / CSV 后再试。",
+        format_gib(size),
         format
     )
 }
 
-/// 大文件护栏：只对「超过 5 GB 且必须整表载入」的文件报错。
+/// 大文件护栏：只对「超过 5 GiB 且必须整表载入」的文件报错。
 ///
-/// 正常文件（≤ 5 GB）零开销直接返回；超过 5 GB 时才做一次格式识别 +
-/// 轻量 inspect，判断该格式是否流式。
+/// 正常文件（≤ 5 GiB）零开销直接返回；超过 5 GiB 时也只用 file_info +
+/// 格式识别这种轻量判定：格式是否流式是 ExcelKind 的**常量属性**，绝不能
+/// 为了判断而解析工作簿（xls 会解析整个 SST、xlsx/xlsb 会整读
+/// sharedStrings、ODS/SpreadsheetML 会全量扫描；preview/validate/execute
+/// 各调用一次就等于把超大文件多读好几遍）。
 pub fn ensure_large_file_streamable(path: &str) -> AppResult<()> {
     ensure_streamable_with_limit(path, MAX_NON_STREAMING_BYTES)
 }
@@ -2508,8 +2518,9 @@ fn ensure_streamable_with_limit(path: &str, limit: u64) -> AppResult<()> {
         return Ok(());
     }
     if let Some(kind) = crate::excel_import::detect(path)? {
-        let inspected = crate::excel_stream::inspect_workbook(path, kind)?;
-        if !inspected.streaming {
+        // 当前所有 Excel 格式都返回 true，因此这条拒绝分支实际不可达；
+        // 保留它是给将来的非流式格式留口，判断依据仍然是常量而非内容解析。
+        if !kind.is_streaming() {
             return Err(AppError::bad(non_streaming_size_error(
                 info.size,
                 kind.format(),
@@ -2524,7 +2535,20 @@ pub fn file_info(path: &str) -> AppResult<FileInfo> {
     if path.is_empty() {
         return Err(AppError::bad("请选择文件"));
     }
-    let meta = std::fs::metadata(path).map_err(|e| AppError::bad(format!("无法读取文件: {e}")))?;
+    // 路径错误（不存在 / 没权限）是最常见的失败之一：主文案用中文说清下一步，
+    // 括号里保留 OS 原文（英文）方便排查，而不是把 std::io 的错误直接抛给用户。
+    let meta = std::fs::metadata(path).map_err(|error| {
+        let detail = error.to_string();
+        match error.kind() {
+            std::io::ErrorKind::NotFound => AppError::bad(format!(
+                "文件不存在或无法访问：{path}（{detail}）"
+            )),
+            std::io::ErrorKind::PermissionDenied => AppError::bad(format!(
+                "没有权限读取文件：{path}（{detail}）"
+            )),
+            _ => AppError::bad(format!("无法读取文件：{path}（{detail}）")),
+        }
+    })?;
     if !meta.is_file() {
         return Err(AppError::bad("选择的路径不是文件"));
     }
@@ -4751,22 +4775,39 @@ mod excel_tests {
     }
 
     #[test]
-    fn non_streaming_size_error_names_format_and_limit() {
-        let message = non_streaming_size_error(
-            MAX_NON_STREAMING_BYTES + 1,
-            "xls",
-        );
-        assert!(message.contains("5.0 GB"), "{message}");
+    fn format_gib_uses_1024_based_units() {
+        assert_eq!(format_gib(0), "0.0 GiB");
+        assert_eq!(format_gib(MAX_NON_STREAMING_BYTES), "5.0 GiB");
+        assert_eq!(format_gib(MAX_NON_STREAMING_BYTES + 1), "5.0 GiB");
+        assert_eq!(format_gib(MAX_NON_STREAMING_BYTES * 2), "10.0 GiB");
+    }
+
+    #[test]
+    fn non_streaming_size_error_names_format_and_limit_in_gib() {
+        let message = non_streaming_size_error(MAX_NON_STREAMING_BYTES + 1, "xls");
+        assert!(message.contains("5.0 GiB"), "{message}");
+        assert!(message.contains("5×1024³ 字节"), "{message}");
+        // 不再出现「5.0 GB（超过 5 GB）」这种自相矛盾的说法。
+        assert!(!message.contains("5.0 GB"), "{message}");
         assert!(message.contains("xls"), "{message}");
         assert!(message.contains("无法流式读取"), "{message}");
     }
 
     #[test]
-    fn large_file_warning_starts_above_five_gigabytes() {
+    fn large_file_warning_starts_above_five_gibibytes() {
         assert!(large_file_warning(MAX_NON_STREAMING_BYTES).is_none());
+        // 5.2e9 字节 = 4.84 GiB：不到 5 GiB，不提示（十进制 GB 不是这里的阈值）。
+        assert!(large_file_warning(5_200_000_000).is_none());
+
         let warning = large_file_warning(MAX_NON_STREAMING_BYTES + 1).expect("warning");
-        assert!(warning.contains("超过 5 GB"), "{warning}");
-        assert!(warning.contains("流式读取"), "{warning}");
+        assert!(warning.contains("5.0 GiB"), "{warning}");
+        assert!(warning.contains("超过 5 GiB"), "{warning}");
+        assert!(warning.contains("5×1024³ 字节"), "{warning}");
+        assert!(!warning.contains("5.0 GB（超过 5 GB）"), "{warning}");
+        // 超 5 GiB 的流式文件也要提示共享字符串表的内存风险（xls 建议另存/拆分）。
+        assert!(warning.contains("SST"), "{warning}");
+        assert!(warning.contains("内存峰值"), "{warning}");
+        assert!(warning.contains(".xls"), "{warning}");
     }
 
     #[test]
@@ -4775,6 +4816,31 @@ mod excel_tests {
         for fixture_name in [XLSX, XLS] {
             let path = fixture(fixture_name);
             ensure_streamable_with_limit(&path, 1).expect(fixture_name);
+        }
+    }
+
+    #[test]
+    fn large_file_guard_never_parses_the_workbook_to_decide() {
+        // 「看起来像 xlsx」但 ZIP 结构损坏的小文件：detect 只读文件头就能认成
+        // xlsx；旧实现随后 inspect_workbook 会因不是有效 ZIP 而失败，新实现用
+        // ExcelKind::is_streaming() 常量判断，直接 Ok。limit=0 让所有非空文件
+        // 都越过阈值，正好覆盖「要判定」的分支。
+        let path = temp_path("broken.xlsx");
+        let mut body = vec![0x50, 0x4B, 0x03, 0x04];
+        body.extend_from_slice(b"xl/workbook.xml but this is not a real zip archive");
+        std::fs::write(&path, &body).unwrap();
+        ensure_streamable_with_limit(&path, 0)
+            .expect("格式是流式的：判定不能为了格式而解析工作簿内容");
+
+        // 所有当前格式的流式属性都是常量 true（拒绝分支只为将来的非流式格式保留）。
+        for kind in [
+            crate::excel_import::ExcelKind::Xlsx,
+            crate::excel_import::ExcelKind::Xls,
+            crate::excel_import::ExcelKind::Xlsb,
+            crate::excel_import::ExcelKind::Ods,
+            crate::excel_import::ExcelKind::SpreadsheetMl,
+        ] {
+            assert!(kind.is_streaming(), "{kind:?}");
         }
     }
 
@@ -6030,5 +6096,305 @@ mod excel_tests {
             "{last:?}"
         );
         assert!(!last.message.contains('/'), "{last:?}");
+    }
+
+    // ------------------------------------------------ P2-11 隐藏工作表（第 53 轮）
+
+    /// 用 zip writer 在测试内合成 ODS；content.xml 由调用方提供。
+    fn synthetic_ods(path: &str, content: &str) {
+        let file = File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file(
+                "mimetype",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer
+            .write_all(b"application/vnd.oasis.opendocument.spreadsheet")
+            .unwrap();
+        writer
+            .start_file(
+                "content.xml",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// 2 张可见表 + 3 张隐藏表（display / visibility / style 继承各一种）。
+    const ODS_WITH_HIDDEN_SHEETS: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<office:document-content ",
+        "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" ",
+        "xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" ",
+        "xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" ",
+        "xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\">",
+        "<office:automatic-styles>",
+        "<style:style style:name=\"ta_hidden\" style:family=\"table\">",
+        "<style:table-properties table:display=\"false\"/>",
+        "</style:style>",
+        "</office:automatic-styles>",
+        "<office:body><office:spreadsheet>",
+        "<table:table table:name=\"员工\">",
+        "<table:table-row>",
+        "<table:table-cell office:value-type=\"string\"><text:p>id</text:p></table:table-cell>",
+        "<table:table-cell office:value-type=\"string\"><text:p>姓名</text:p></table:table-cell>",
+        "</table:table-row>",
+        "<table:table-row>",
+        "<table:table-cell office:value-type=\"float\" office:value=\"1\"/>",
+        "<table:table-cell office:value-type=\"string\"><text:p>张伟</text:p></table:table-cell>",
+        "</table:table-row>",
+        "<table:table-row>",
+        "<table:table-cell office:value-type=\"float\" office:value=\"2\"/>",
+        "<table:table-cell office:value-type=\"string\"><text:p>李娜</text:p></table:table-cell>",
+        "</table:table-row>",
+        "</table:table>",
+        "<table:table table:name=\"隐藏A\" table:display=\"false\">",
+        "<table:table-row><table:table-cell office:value-type=\"string\"><text:p>secret-a</text:p></table:table-cell></table:table-row>",
+        "</table:table>",
+        "<table:table table:name=\"隐藏B\" table:visibility=\"collapse\">",
+        "<table:table-row><table:table-cell office:value-type=\"string\"><text:p>secret-b</text:p></table:table-cell></table:table-row>",
+        "</table:table>",
+        "<table:table table:name=\"隐藏C\" table:style-name=\"ta_hidden\">",
+        "<table:table-row><table:table-cell office:value-type=\"string\"><text:p>secret-c</text:p></table:table-cell></table:table-row>",
+        "</table:table>",
+        "<table:table table:name=\"第二表\">",
+        "<table:table-row>",
+        "<table:table-cell office:value-type=\"string\"><text:p>code</text:p></table:table-cell>",
+        "</table:table-row>",
+        "<table:table-row>",
+        "<table:table-cell office:value-type=\"string\"><text:p>A</text:p></table:table-cell>",
+        "</table:table-row>",
+        "</table:table>",
+        "</office:spreadsheet></office:body></office:document-content>",
+    );
+
+    #[test]
+    fn ods_hidden_sheets_are_excluded_counted_and_unselectable() {
+        let path = temp_path("hidden.ods");
+        synthetic_ods(&path, ODS_WITH_HIDDEN_SHEETS);
+        let (info, mut spec) = spec_from_inspect(&path);
+        assert_eq!(info["format"], json!("ods"), "{info}");
+        assert_eq!(info["sheet"], json!("员工"), "{info}");
+        let sheets = info["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 2, "隐藏表必须从 sheets 里排除: {info}");
+        assert_eq!(sheets[0]["name"], json!("员工"));
+        assert_eq!(sheets[1]["name"], json!("第二表"));
+        // 隐藏表的行不计入任何可见表。
+        assert_eq!(sheets[0]["rows"], json!(3), "{info}");
+        assert!(
+            info["warnings"]
+                .to_string()
+                .contains("已忽略 3 个隐藏工作表"),
+            "{info}"
+        );
+        // InspectInfo.hidden_sheets 是 warning 的来源，直接断言它。
+        let inspected = crate::excel_stream::inspect_workbook(
+            &path,
+            crate::excel_import::ExcelKind::Ods,
+        )
+        .unwrap();
+        assert_eq!(inspected.hidden_sheets, 3, "ODS 三种隐藏写法都要计入");
+
+        // 隐藏表名选不到；可选列表里也不能出现隐藏表。
+        spec.read.sheet = Some("隐藏A".to_string());
+        let error = preview(&spec, 5).unwrap_err().to_string();
+        assert!(error.contains("找不到工作表 '隐藏A'"), "{error}");
+        assert!(!error.contains("隐藏C"), "隐藏表不该出现在可选列表: {error}");
+        spec.read.sheet = Some("隐藏C".to_string());
+        assert!(preview(&spec, 5).is_err(), "样式继承隐藏的表也要选不到");
+
+        // 可见表序号不含隐藏表：1 = 第二表。
+        spec.read.sheet = Some("1".to_string());
+        let second = preview(&spec, 5).unwrap();
+        assert_eq!(second["sheet_used"], json!("第二表"), "{second}");
+        assert_eq!(second["header"], json!(["code"]), "{second}");
+
+        spec.read.sheet = Some("员工".to_string());
+        let first = preview(&spec, 5).unwrap();
+        assert_eq!(first["header"], json!(["id", "姓名"]), "{first}");
+        assert_eq!(first["records"][1]["values"], json!([1, "张伟"]));
+    }
+
+    /// 2 张可见表 + 1 张 ss:Visibility="Hidden" 的 SpreadsheetML。
+    const SML_WITH_HIDDEN_SHEETS: &str = concat!(
+        "<?xml version=\"1.0\"?>",
+        "<?mso-application progid=\"Excel.Sheet\"?>",
+        "<Workbook xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">",
+        "<Worksheet ss:Name=\"员工\"><Table>",
+        "<Row><Cell><Data ss:Type=\"String\">id</Data></Cell><Cell><Data ss:Type=\"String\">姓名</Data></Cell></Row>",
+        "<Row><Cell><Data ss:Type=\"Number\">1</Data></Cell><Cell><Data ss:Type=\"String\">张伟</Data></Cell></Row>",
+        "<Row><Cell><Data ss:Type=\"Number\">2</Data></Cell><Cell><Data ss:Type=\"String\">李娜</Data></Cell></Row>",
+        "</Table></Worksheet>",
+        "<Worksheet ss:Name=\"隐藏页\" ss:Visibility=\"Hidden\"><Table>",
+        "<Row><Cell><Data ss:Type=\"String\">secret</Data></Cell></Row>",
+        "</Table></Worksheet>",
+        "<Worksheet ss:Name=\"第二表\"><Table>",
+        "<Row><Cell><Data ss:Type=\"String\">code</Data></Cell></Row>",
+        "<Row><Cell><Data ss:Type=\"String\">A</Data></Cell></Row>",
+        "</Table></Worksheet>",
+        "</Workbook>",
+    );
+
+    #[test]
+    fn spreadsheetml_hidden_sheets_are_excluded_counted_and_unselectable() {
+        let path = temp_file("hidden_sml.xls", SML_WITH_HIDDEN_SHEETS);
+        let (info, mut spec) = spec_from_inspect(&path);
+        assert_eq!(info["format"], json!("excel"), "{info}");
+        let sheets = info["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 2, "隐藏表必须从 sheets 里排除: {info}");
+        assert_eq!(sheets[0]["name"], json!("员工"));
+        assert_eq!(sheets[1]["name"], json!("第二表"));
+        assert!(
+            info["warnings"]
+                .to_string()
+                .contains("已忽略 1 个隐藏工作表"),
+            "{info}"
+        );
+        let inspected = crate::excel_stream::inspect_workbook(
+            &path,
+            crate::excel_import::ExcelKind::SpreadsheetMl,
+        )
+        .unwrap();
+        assert_eq!(inspected.hidden_sheets, 1);
+
+        spec.read.sheet = Some("隐藏页".to_string());
+        let error = preview(&spec, 5).unwrap_err().to_string();
+        assert!(error.contains("找不到工作表 '隐藏页'"), "{error}");
+
+        // 可见表序号不含隐藏表：1 = 第二表（行源也要跳过隐藏表）。
+        spec.read.sheet = Some("1".to_string());
+        let second = preview(&spec, 5).unwrap();
+        assert_eq!(second["sheet_used"], json!("第二表"), "{second}");
+        assert_eq!(second["header"], json!(["code"]), "{second}");
+        assert_eq!(second["records"][1]["values"], json!(["A"]), "{second}");
+
+        spec.read.sheet = Some("员工".to_string());
+        let first = preview(&spec, 5).unwrap();
+        assert_eq!(first["header"], json!(["id", "姓名"]), "{first}");
+        assert_eq!(first["records"][1]["values"], json!([1, "张伟"]), "{first}");
+    }
+
+    // ------------------------------------------------ P3 错误文案（第 53 轮）
+
+    /// 造一个只含指定流名的 OLE2/CFB（模拟加密的 xlsx/xlsb 或被包装的 Office 文件）。
+    fn synthetic_cfb(path: &str, streams: &[&str]) {
+        let mut cfb = cfb::create(path).expect("create cfb");
+        for name in streams {
+            let mut stream = cfb.create_stream(*name).expect("create stream");
+            std::io::Write::write_all(&mut stream, b"not a real stream payload").expect("write");
+        }
+        cfb.flush().expect("flush cfb");
+    }
+
+    #[test]
+    fn encrypted_ooxml_in_a_cfb_container_reports_a_chinese_password_hint() {
+        // Office 的「密码保护」会把整个 xlsx/xlsb 包塞进 CFB（EncryptionInfo /
+        // EncryptedPackage）。以前会被当成 xls，报
+        // 「xls 里没有 Workbook/Book 数据流: No such stream」。
+        let path = temp_path("encrypted.xlsx");
+        synthetic_cfb(&path, &["EncryptionInfo", "EncryptedPackage"]);
+        assert_eq!(
+            crate::excel_import::detect(&path).unwrap(),
+            Some(crate::excel_import::ExcelKind::Xls),
+            "OLE2 内容仍然先按 xls 分派，由 xls_stream 识别加密容器"
+        );
+        let error = inspect(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("文件已加密或是被 OLE2 容器包装的 Office 文件"),
+            "{error}"
+        );
+        assert!(error.contains("密码"), "{error}");
+        assert!(error.contains(".xlsx/.xlsb"), "{error}");
+        assert!(!error.contains("No such stream"), "{error}");
+    }
+
+    #[test]
+    fn cfb_without_a_workbook_stream_reports_chinese_with_raw_detail() {
+        // 加密的 .xls（或其它 Office 文档）同样没有 Workbook/Book 流：主文案中文，
+        // 原始 cfb 细节保留在末尾便于排查。
+        let path = temp_path("no_workbook.xls");
+        synthetic_cfb(&path, &["SomethingElse"]);
+        let error = inspect(&path).unwrap_err().to_string();
+        assert!(error.contains("没有 Workbook/Book 数据流"), "{error}");
+        assert!(error.contains("密码"), "{error}");
+        assert!(error.contains("原始细节"), "{error}");
+        assert!(
+            error.contains("No such stream") || error.contains("not found"),
+            "原始细节要保留: {error}"
+        );
+        assert!(
+            !error.starts_with("xls 里没有 Workbook/Book 数据流:"),
+            "英文主文案不该再出现在开头: {error}"
+        );
+    }
+
+    #[test]
+    fn html_disguised_as_an_excel_file_reports_a_chinese_hint() {
+        let html = b"<!doctype html><html><head><meta charset=\"utf-8\"></head><body><table><tr><td>1</td></tr></table></body></html>";
+        for ext in ["xls", "xlsx", "xlsb"] {
+            let path = temp_path(&format!("fake.{ext}"));
+            std::fs::write(&path, html).unwrap();
+            let error = inspect(&path).unwrap_err().to_string();
+            assert!(error.contains("扩展名是 Excel"), "{ext}: {error}");
+            assert!(error.contains("不是 Excel 二进制格式"), "{ext}: {error}");
+            assert!(
+                error.contains("另存为 .xlsx/.xls 或用 CSV 导入"),
+                "{ext}: {error}"
+            );
+            assert!(!error.contains("Expecting"), "不该泄漏 XML 解析器英文: {ext}: {error}");
+        }
+
+        // 普通 XML（不是 SpreadsheetML）同样给提示，而不是去解析它。
+        let path = temp_path("fake_xml.xls");
+        std::fs::write(&path, b"<?xml version=\"1.0\"?><root><item>1</item></root>").unwrap();
+        let error = inspect(&path).unwrap_err().to_string();
+        assert!(error.contains("扩展名是 Excel"), "{error}");
+    }
+
+    #[test]
+    fn legitimate_spreadsheetml_xls_is_not_reported_as_a_fake_excel_file() {
+        // 合法的 SpreadsheetML .xls 同样以 <?xml 开头：有 mso-application PI 的
+        // 导出文件不能被误伤。
+        let path = temp_file("legit.xls", &multi_sheet_spreadsheetml());
+        let info = inspect(&path).expect("合法的 SpreadsheetML 必须照常识别");
+        assert_eq!(info["format"], json!("excel"), "{info}");
+
+        // 没有 PI、但根元素是 Workbook/Worksheet 的文件同样合法。
+        let no_pi = concat!(
+            "<?xml version=\"1.0\"?>",
+            "<Workbook xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">",
+            "<Worksheet ss:Name=\"表1\"><Table>",
+            "<Row><Cell><Data ss:Type=\"String\">id</Data></Cell></Row>",
+            "<Row><Cell><Data ss:Type=\"Number\">1</Data></Cell></Row>",
+            "</Table></Worksheet></Workbook>",
+        );
+        let path = temp_file("no_pi.xls", no_pi);
+        let info = inspect(&path).expect("缺 PI 的 SpreadsheetML 也必须照常识别");
+        assert_eq!(info["format"], json!("excel"), "{info}");
+        assert_eq!(info["sheets"][0]["name"], json!("表1"), "{info}");
+    }
+
+    #[test]
+    fn missing_and_unreadable_paths_report_chinese_messages() {
+        let missing = std::env::temp_dir().join(format!(
+            "rma-missing-{}.csv",
+            uuid::Uuid::new_v4()
+        ));
+        let shown = missing.to_string_lossy().to_string();
+        let error = file_info(&shown).unwrap_err().to_string();
+        assert!(error.contains("文件不存在或无法访问："), "{error}");
+        assert!(error.contains(&shown), "路径要保留: {error}");
+        // OS 原文放在括号里，主文案保持中文。
+        assert!(error.contains('（') && error.contains('）'), "{error}");
+
+        // 目录不是文件：沿用既有中文提示。
+        let directory = std::env::temp_dir();
+        let error = file_info(&directory.to_string_lossy()).unwrap_err().to_string();
+        assert!(error.contains("选择的路径不是文件"), "{error}");
     }
 }

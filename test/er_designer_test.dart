@@ -270,6 +270,188 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-c6')), findsNothing);
     expect(find.text('已加入 5/5'), findsOneWidget);
     expect(find.text('已自动加入关联表：c2、c3、c4、c5'), findsOneWidget);
+    // P2-8：被画布上限截断时，工具栏下方必须给出可关闭的说明（原来静默截断）。
+    final notice = tester.widget<AlertBox>(
+      find.byKey(const ValueKey('er-auto-include-notice')),
+    );
+    expect(notice.tone, AlertTone.warn);
+    expect(notice.message, contains('已自动加入 4 张'));
+    expect(notice.message, contains('已达画布上限 5 张'));
+    expect(notice.message, contains('其余关联表未加入'));
+    // 可关闭：关掉后提示不再出现。
+    await tester.tap(
+      find.descendant(
+        of: find.byKey(const ValueKey('er-auto-include-notice')),
+        matching: find.byType(IconBtn),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-auto-include-notice')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('撤销自动加入后清空「已达上限」说明（P2-8）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['c1'],
+          maxTables: 5,
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-auto-include-notice')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-undo-auto')));
+    await settle(tester);
+    // 撤销后自动加入的表与「已达上限」说明都必须一起消失。
+    expect(find.byKey(const ValueKey('er-auto-added-hint')), findsNothing);
+    expect(find.byKey(const ValueKey('er-auto-include-notice')), findsNothing);
+    expect(find.text('已加入 1/5'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('数据库没有外键：自动带入给出说明而不是静默（P2-8）', (tester) async {
+    await setSurface(tester);
+    // 共享 fixture 库里到处是外键，这里临时切换到只有普通表的 SQLite 库。
+    // 文件 IO 也要放进 runAsync：testWidgets 的 FakeAsync 不会推进真实 IO。
+    Directory? directory;
+    final noFkId = await tester.runAsync(() async {
+      directory = await Directory.systemTemp.createTemp('rma-er-nofk-');
+      final dbFile = File('${directory!.path}/nofk.sqlite');
+      await dbFile.create(recursive: true);
+      final created = await Api.instance.createConnection(<String, dynamic>{
+        'name': 'ER NoFK',
+        'driver': 'sqlite',
+        'database': dbFile.path,
+      });
+      final id = ((created['connection'] as Map)['id']).toString();
+      await AppState.instance.connect(id);
+      await Api.instance.query(
+        'CREATE TABLE standalone (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE plain (id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      );
+      return id;
+    });
+    expect(noFkId, isNotNull);
+    addTearDown(() {
+      try {
+        directory?.deleteSync(recursive: true);
+      } catch (_) {}
+    });
+    // 恢复共享 fixture 的主连接（后注册的 tearDown 先执行）。
+    addTearDown(() async {
+      try {
+        await AppState.instance.connect(connectionId);
+      } catch (_) {}
+    });
+
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['standalone'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-standalone')), findsOneWidget);
+    // 没有外键 → 不会凭列名乱加表。
+    expect(find.byKey(const ValueKey('er-node-plain')), findsNothing);
+    expect(find.byKey(const ValueKey('er-auto-added-hint')), findsNothing);
+    final notice = tester.widget<AlertBox>(
+      find.byKey(const ValueKey('er-auto-include-notice')),
+    );
+    expect(notice.tone, AlertTone.info);
+    expect(notice.message, contains('当前数据库还没有外键'));
+    expect(notice.message, contains('只能沿已有外键'));
+    expect(notice.message, contains('建议外键'));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('删除外键前二次确认：取消不删、确认才继续（P2-9）', (tester) async {
+    await setSurface(tester);
+    bool? result;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(),
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => Btn(
+              'open delete confirm',
+              key: const ValueKey('er-open-delete-confirm'),
+              onPressed: () async {
+                result = await confirmDeleteForeignKeyDialog(
+                  context,
+                  constraintName: 'fk_books_author',
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+
+    Finder confirmMessage() => find.byWidgetPredicate(
+      (widget) =>
+          widget is SelectableText &&
+          (widget.data ?? '').contains('fk_books_author'),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('er-open-delete-confirm')));
+    await settle(tester, rounds: 8);
+    expect(find.text('请确认'), findsOneWidget);
+    // 必须说清楚「只解除引用约束、不删数据、之后可重建」。
+    expect(confirmMessage(), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is SelectableText && (widget.data ?? '').contains('数据不会删除'),
+      ),
+      findsOneWidget,
+    );
+    // 取消：确认框返回 false，不执行 ALTER。
+    await tester.tap(find.widgetWithText(Btn, '取消'));
+    await settle(tester, rounds: 8);
+    expect(result, isFalse);
+    expect(find.text('请确认'), findsNothing);
+
+    // 再来一次并确认：返回 true（调用方才继续 ALTER）。
+    await tester.tap(find.byKey(const ValueKey('er-open-delete-confirm')));
+    await settle(tester, rounds: 8);
+    await tester.tap(find.widgetWithText(Btn, '删除'));
+    await settle(tester, rounds: 8);
+    expect(result, isTrue);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('工具栏术语说明按钮打开术语表（P3）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-glossary')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-glossary')));
+    await settle(tester, rounds: 8);
+    expect(find.text('术语说明（说人话版）'), findsOneWidget);
+    expect(find.text('主键'), findsWidgets);
+    expect(find.text('FOREIGN KEY'), findsWidgets);
+    await tester.tap(find.byKey(const ValueKey('glossary-close')));
+    await settle(tester, rounds: 8);
+    expect(find.text('术语说明（说人话版）'), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('中间表徽标、多对多连线与折叠 / 展开', (tester) async {
@@ -298,6 +480,35 @@ void main() {
     await settle(tester);
     expect(find.byKey(const ValueKey('er-node-order_items')), findsNothing);
     expect(find.text('多对多 · order_items'), findsOneWidget);
+
+    // P2-6：标签不能压住橙色多对多连线的中段。渲染出的标签中心必须离开
+    // 「两张卡片中心连线的中点」，且偏移方向与连线垂直、优先向上。
+    final ordersRect = tester.getRect(
+      find.byKey(const ValueKey('er-node-orders')),
+    );
+    final productsRect = tester.getRect(
+      find.byKey(const ValueKey('er-node-products')),
+    );
+    final midpoint = Offset(
+      (ordersRect.center.dx + productsRect.center.dx) / 2,
+      (ordersRect.center.dy + productsRect.center.dy) / 2,
+    );
+    final labelCenter = tester.getCenter(
+      find.byKey(const ValueKey('er-m2m-order_items')),
+    );
+    final delta = labelCenter - midpoint;
+    final direction = productsRect.center - ordersRect.center;
+    expect(
+      delta.distance,
+      greaterThan(8),
+      reason: '标签盒半高约 8px，锚点必须离开连线中点才能露出线',
+    );
+    expect(
+      (delta.dx * direction.dx + delta.dy * direction.dy).abs(),
+      lessThan(1.5),
+      reason: '偏移必须沿连线法线方向（点积为 0）',
+    );
+    expect(delta.dy, lessThan(0), reason: '优先偏向上方空白侧');
 
     // 点多对多标签展开。
     await tester.tap(find.byKey(const ValueKey('er-m2m-order_items')));
@@ -898,6 +1109,27 @@ void main() {
     expect(find.text('Constraining (referenced key / parent)'), findsOneWidget);
     expect(find.textContaining('dashed = suggested FK'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
+    // P3：术语说明按钮的 tooltip 不是 Text，全树文本扫描覆盖不到，单独断言。
+    final glossaryTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .descendant(
+            of: find.byKey(const ValueKey('er-glossary')),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(glossaryTooltip.message, 'Glossary');
+    // P2-8：自动带入提示的 tooltip 说明「已有外键 / 建议关系」两套机制，
+    // 英文模式下也必须是英文。
+    final autoAddedTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .ancestor(
+            of: find.byKey(const ValueKey('er-auto-added-hint')),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(autoAddedTooltip.message, contains('suggested relations'));
     // 表名 / 列名 / 箭头标签是数据，其它可见文案必须是英文。
     final offenders = <String>{};
     for (final widget in tester.allWidgets) {

@@ -282,7 +282,9 @@ void main() {
         'score',
         'created_at',
       ]);
-      expect(columns[0].sqlType, 'INT');
+      // 第 53 轮：整数主键在计划层就统一成驱动的主键类型（MySQL 为 BIGINT），
+      // 字段页显示与建表 DDL 不再出现「显示整数、实际 BIGINT」的割裂。
+      expect(columns[0].sqlType, 'BIGINT');
       expect(columns[0].primary, isTrue);
       expect(columns[0].nullable, isFalse);
       expect(columns[0].sourceLabel, 'id');
@@ -1066,6 +1068,94 @@ void main() {
       expect(generated.autoIncrement, isTrue);
       expect(plan.columns[1].name, 'student_id');
       expect(plan.columns[1].sqlType, 'BIGINT');
+    });
+  });
+
+  group('主键整数类型统一（第 53 轮）', () {
+    test('columnsFromPreview：整数主键按驱动统一成主键类型', () {
+      final preview = <String, dynamic>{
+        'schema': <String, dynamic>{
+          'columns': <dynamic>[
+            <String, dynamic>{
+              'name': 'id',
+              'source': 0,
+              'type': 'integer',
+              'nullable': false,
+              'primary_candidate': true,
+            },
+            <String, dynamic>{
+              'name': 'qty',
+              'source': 1,
+              'type': 'integer',
+              'nullable': true,
+            },
+          ],
+        },
+      };
+      for (final driver in <String>['mysql', 'postgres', 'sqlite']) {
+        final columns = columnsFromPreview(preview, driver: driver);
+        expect(
+          columns[0].sqlType,
+          pkColumnTypeFor(driver),
+          reason: '$driver：主键整数列应该用主键类型',
+        );
+        expect(columns[0].primary, isTrue);
+        // 非主键整数列仍用推断类型（MySQL 保持 INT），不跟着主键变。
+        expect(columns[1].sqlType, sqlTypeFor('integer', driver));
+        expect(columns[1].primary, isFalse);
+      }
+      expect(
+        columnsFromPreview(preview, driver: 'mysql').first.sqlType,
+        'BIGINT',
+      );
+    });
+
+    test('normalizePrimaryColumnTypes：只改整数主键、幂等', () {
+      final textPk = quickColumn('student_no', 'VARCHAR(20)', primary: true);
+      expect(
+        normalizePrimaryColumnTypes(<QuickColumn>[textPk], 'mysql'),
+        isFalse,
+        reason: '文本主键不是整数族，不能改成 BIGINT',
+      );
+      expect(textPk.sqlType, 'VARCHAR(20)');
+
+      final id = quickColumn('id', 'INT', primary: true);
+      expect(normalizePrimaryColumnTypes(<QuickColumn>[id], 'mysql'), isTrue);
+      expect(id.sqlType, 'BIGINT');
+      expect(
+        normalizePrimaryColumnTypes(<QuickColumn>[id], 'mysql'),
+        isFalse,
+        reason: '已经是对的类型，幂等',
+      );
+
+      final sqliteId = quickColumn('id', 'INT', primary: true);
+      expect(
+        normalizePrimaryColumnTypes(<QuickColumn>[sqliteId], 'sqlite'),
+        isTrue,
+      );
+      expect(sqliteId.sqlType, 'INTEGER');
+
+      final normal = quickColumn('qty', 'INT');
+      expect(
+        normalizePrimaryColumnTypes(<QuickColumn>[normal], 'mysql'),
+        isFalse,
+      );
+      expect(normal.sqlType, 'INT');
+    });
+
+    test('补自增 id 主键后表里不会残留 INT 主键', () {
+      final plan = planFor(
+        columns: <QuickColumn>[
+          quickColumn('id', 'INT', primary: true),
+          quickColumn('name', 'TEXT', sourceIndex: 1),
+        ],
+      );
+      addGeneratedPrimaryKey(plan, 'mysql');
+      final primary = plan.columns.where((column) => column.primary).single;
+      expect(primary.generated, isTrue);
+      expect(primary.sqlType, 'BIGINT');
+      // 原业务 id 降级为普通列，类型不再被主键逻辑强制。
+      expect(plan.columns[1].primary, isFalse);
     });
   });
 
@@ -2268,8 +2358,12 @@ void main() {
       'NoPkSheet',
     ]);
 
-    // 关闭（只建了空表）→ 明确提示未导入数据。
+    // 关闭（只建了空表）→ 第 53 轮 P2-9：先三选一确认，保留已建表并关闭，
+    // 再明确提示未导入数据。
     await tester.tap(find.text('关闭'));
+    await settle(tester, rounds: 6);
+    expect(find.text('关闭向导'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey<String>('quick-close-keep')));
     await settle(tester, rounds: 6);
     expect(notice.message, contains('未导入数据'));
     await tester.pump(const Duration(seconds: 4));
@@ -2333,8 +2427,11 @@ void main() {
     expect(await tableNames(tester), contains('backfields'));
     expect(state.createdTablesWithoutPrimaryForTest, isEmpty);
 
-    // 关闭（只建了空表 → 提示未导入）。
+    // 关闭（只建了空表 → 三选一确认 → 保留已建表并关闭，提示未导入）。
     await tester.tap(find.text('关闭'));
+    await settle(tester, rounds: 6);
+    expect(find.text('关闭向导'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey<String>('quick-close-keep')));
     await settle(tester, rounds: 6);
     expect(notice.message, contains('未导入数据'));
     await tester.pump(const Duration(seconds: 4));
@@ -3038,6 +3135,396 @@ void main() {
       findsWidgets,
     );
     expect(find.text('收起技术细节'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  // =====================================================================
+  // 第 53 轮：主键显示/DDL 一致、重试不重复预检、删外键检查、关闭确认、术语表
+  // =====================================================================
+
+  testWidgets('主键整数列：字段页计划层就是主键类型（显示与 DDL 一致）', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(
+      () => writeFile('pktype.csv', 'id,name\n1,Ada\n2,Bob\n'),
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    final state = stateKey.currentState!;
+    final plan = state.plansForTest.single;
+    final id = plan.columns.first;
+    expect(id.name, 'id');
+    expect(id.primary, isTrue);
+    // SQLite 的主键整数类型是 INTEGER（MySQL/PostgreSQL 为 BIGINT）；关键是
+    // 计划层与 primarySqlTypeFor 的输出一致，字段页不再显示另一个类型。
+    expect(id.sqlType, pkColumnTypeFor(AppState.instance.driver));
+    expect(id.sqlType, primarySqlTypeFor(id, AppState.instance.driver));
+
+    // 真实建表后的类型与计划层一致（不再出现 INT 显示 / BIGINT DDL 的割裂）。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    final types = await columnTypes(tester, 'pktype');
+    expect(types.first.toUpperCase(), contains('INT'));
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('外键预检确认后导入失败：点重试不再重复弹预检框', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    // 父表没有 id 列（要补自增主键）→ 预检按高风险提示，确认弹框一定会出现。
+    final fixture = _spreadsheetMl(<String, List<List<Object?>>>{
+      'GenParR': <List<Object?>>[
+        <Object?>['name'],
+        // 两行同名 → Rust 不会把 name 当主键候选，父表真的没有主键。
+        <Object?>['Ada'],
+        <Object?>['Ada'],
+      ],
+      'GenChiR': <List<Object?>>[
+        <Object?>['rid', 'note'],
+        <Object?>[9, 'c'],
+        <Object?>[8, 'c'],
+      ],
+    });
+    final path = (await tester.runAsync(
+      () => writeFile('fkretry.xls', fixture),
+    ))!;
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, path, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 30);
+    final state = stateKey.currentState!;
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    state.setForeignKeysForTest(<QuickForeignKey>[
+      QuickForeignKey(
+        name: 'fk_retry',
+        childTable: 'GenChiR',
+        columns: <String>['rid'],
+        refTable: 'GenParR',
+        refColumns: <String>['id'],
+      ),
+    ]);
+    await tester.tap(primaryButton()); // 建空表 → 建立关联
+    await settle(tester, rounds: 40);
+    expect(state.stepForTest, 2);
+
+    await tester.tap(primaryButton()); // 下一步：导入数据（触发预检）
+    await settle(tester, rounds: 24);
+    expect(find.textContaining('外键数据可能不匹配'), findsOneWidget);
+    expect(find.textContaining('高风险'), findsWidgets);
+    await tester.tap(find.byKey(const ValueKey<String>('precheck-continue')));
+    await settle(tester, rounds: 12);
+    expect(state.stepForTest, 3);
+    expect(find.textContaining('外键数据可能不匹配'), findsNothing);
+
+    // 模拟真实导入时子表被外键拒绝 → 主按钮变成「重试失败的表」。
+    state.setFkFailureForTest(
+      'a foreign key constraint fails (web.GenChiR, CONSTRAINT fk_retry '
+      'FOREIGN KEY (rid) REFERENCES GenParR (id)) (错误码 23000)',
+      table: 'GenChiR',
+    );
+    await settle(tester, rounds: 4);
+    expect(state.primaryLabelForTest, '重试失败的表');
+
+    // 第 53 轮修复：外键集合没变，失败后点重试不应再弹预检确认框。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 10);
+    expect(
+      find.textContaining('外键数据可能不匹配'),
+      findsNothing,
+      reason: '同一组外键已经确认过，重试不应重复弹预检框',
+    );
+    final failure = await runUntilImported(tester);
+    expect(failure, isNull, reason: 'retry after failure failed: $failure');
+    expect(state.importsDoneForTest, isTrue);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('删除外键失败：中文前缀错误并保留外键失败面板', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final path = await writeFkFixture(
+      tester,
+      name: 'fkdropfail.xls',
+      parentName: 'ParDf',
+      childName: 'ChiDf',
+      childValues: const <Object?>[1, 2],
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await reachImportStep(
+      tester,
+      path,
+      notice,
+      fkName: 'fk_df',
+      parentTable: 'ParDf',
+      childTable: 'ChiDf',
+    );
+    final state = stateKey.currentState!;
+    state.setFkFailureForTest(
+      'a foreign key constraint fails (web.ChiDf, CONSTRAINT fk_df '
+      'FOREIGN KEY (pid) REFERENCES ParDf (id)) (错误码 23000)',
+      table: 'ChiDf',
+    );
+    await settle(tester, rounds: 4);
+    state.setAlterTableOverrideForTest((table, body) async {
+      throw StateError('drop fk blocked by test');
+    });
+    await tester.tap(find.byKey(const ValueKey<String>('fk-drop-and-retry')));
+    await settle(tester, rounds: 4);
+    await tester.tap(find.text('删除并重试'));
+    await settle(tester, rounds: 8);
+
+    // 第 53 轮起底层走 alterTableChecked：失败会抛错并进入 catch，文案是中文
+    // 前缀 + 数据库原始错误；失败面板保留，用户可以继续返回关系步骤。
+    expect(state.errorForTest, contains('删除外键'));
+    expect(state.errorForTest, contains('drop fk blocked by test'));
+    expect(state.fkFailureForTest, isNotNull, reason: '删除失败要保留外键失败面板');
+    expect(state.importsDoneForTest, isFalse);
+    expect(
+      find.byKey(const ValueKey<String>('fk-back-relations')),
+      findsOneWidget,
+    );
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('术语说明：header 按钮打开术语表并包含主键解释', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(
+      () => writeFile('glossary.csv', 'id,name\n1,Ada\n'),
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    await pumpWizard(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+
+    await tester.tap(find.byKey(const ValueKey<String>('quick-glossary')));
+    await settle(tester, rounds: 6);
+    expect(find.text('术语说明（说人话版）'), findsOneWidget);
+    expect(find.text('主键'), findsWidgets);
+    expect(find.text('PRIMARY KEY'), findsWidgets);
+    expect(find.textContaining('唯一区分'), findsWidgets);
+
+    await tester.tap(find.byKey(const ValueKey<String>('glossary-close')));
+    await settle(tester, rounds: 4);
+    expect(find.text('术语说明（说人话版）'), findsNothing);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('关闭确认：取消留在向导；保留已建表并关闭不删表', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(
+      () => writeFile('closekeep.csv', 'id,name\n1,Ada\n2,Bob\n'),
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton()); // 工作表与字段
+    await settle(tester, rounds: 24);
+    await tester.tap(primaryButton()); // 建空表 → 建立关联
+    await settle(tester, rounds: 40);
+    final state = stateKey.currentState!;
+    expect(state.stepForTest, 2);
+
+    // 只建了空表就关闭：不再直接关掉，先弹三选一。
+    await tester.tap(find.text('关闭'));
+    await settle(tester, rounds: 6);
+    expect(find.text('关闭向导'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey<String>('quick-close-keep')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey<String>('quick-close-drop')),
+      findsOneWidget,
+    );
+
+    // 取消：留在向导、表还在。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-close-cancel')));
+    await settle(tester, rounds: 4);
+    expect(find.byType(QuickCreateTableWizard), findsOneWidget);
+    expect(state.stepForTest, 2);
+    expect(await tableNames(tester), contains('closekeep'));
+
+    // 保留已建表并关闭：表保留，notice 明确说明没有导入数据。
+    await tester.tap(find.text('关闭'));
+    await settle(tester, rounds: 4);
+    await tester.tap(find.byKey(const ValueKey<String>('quick-close-keep')));
+    await settle(tester, rounds: 8);
+    expect(find.byType(QuickCreateTableWizard), findsNothing);
+    expect(notice.message, contains('未导入数据'));
+    expect(await tableNames(tester), contains('closekeep'));
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('关闭确认：header X 也能删除本次已建表并关闭（反序删表）', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final path = await writeFkFixture(
+      tester,
+      name: 'fkclose.xls',
+      parentName: 'ParCl',
+      childName: 'ChiCl',
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, path, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    final state = stateKey.currentState!;
+    state.setForeignKeysForTest(<QuickForeignKey>[
+      QuickForeignKey(
+        name: 'fk_cl',
+        childTable: 'ChiCl',
+        columns: <String>['pid'],
+        refTable: 'ParCl',
+        refColumns: <String>['id'],
+      ),
+    ]);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(state.stepForTest, 2);
+
+    final dropped = <String>[];
+    state.setDropTableOverrideForTest((table) async {
+      dropped.add(table);
+      return <String, dynamic>{'ok': true};
+    });
+    // header 的 X 与页脚「关闭」走同一个 _close。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-wizard-close')));
+    await settle(tester, rounds: 6);
+    expect(find.text('关闭向导'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey<String>('quick-close-drop')));
+    await settle(tester, rounds: 10);
+
+    expect(dropped, <String>['ChiCl', 'ParCl'], reason: '先删子表再删父表');
+    expect(find.byType(QuickCreateTableWizard), findsNothing);
+    expect(notice.message, contains('已删除本次创建的 2 张表'));
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('关闭确认：删除已建表失败时留在向导并显示残留表', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(
+      () => writeFile('closedropfail.csv', 'id,name\n1,Ada\n'),
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    final state = stateKey.currentState!;
+    expect(state.stepForTest, 2);
+
+    var attempts = 0;
+    state.setDropTableOverrideForTest((table) async {
+      attempts++;
+      if (attempts == 1) throw StateError('drop blocked by test');
+      return <String, dynamic>{'ok': true};
+    });
+    await tester.tap(find.text('关闭'));
+    await settle(tester, rounds: 6);
+    await tester.tap(find.byKey(const ValueKey<String>('quick-close-drop')));
+    await settle(tester, rounds: 10);
+
+    // 删表失败：向导不能关掉，显示残留表与「清理并重试」。
+    expect(find.byType(QuickCreateTableWizard), findsOneWidget);
+    expect(state.errorForTest, contains('未能删除'));
+    expect(state.pendingDropTablesForTest, <String>['closedropfail']);
+    expect(
+      find.byKey(const ValueKey<String>('quick-drop-retry')),
+      findsOneWidget,
+    );
+
+    // 再点「清理并重试」成功后残留列表清空，向导仍可继续操作。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-drop-retry')));
+    await settle(tester, rounds: 10);
+    expect(state.pendingDropTablesForTest, isEmpty);
+    expect(state.createdTablesForTest, isEmpty);
+    expect(find.byType(QuickCreateTableWizard), findsOneWidget);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('同名表预检：表名已存在时拦截进入建立关联', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    // 先真实建一张表；向导按文件名默认表名会自动避开重名（加 _2），所以把
+    // 字段页的表名手改成一个已存在的名字，验证校验真的会拦截。
+    await tester.runAsync(
+      () => Api.instance.query(
+        'CREATE TABLE taken_name (id INTEGER PRIMARY KEY);',
+      ),
+    );
+    final csvPath = await tester.runAsync(
+      () => writeFile('sameconflict.csv', 'id,name\n1,Ada\n'),
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    final state = stateKey.currentState!;
+    expect(state.stepForTest, 1);
+    await setFieldText(tester, 'quick-table-name-0', 'taken_name');
+    await settle(tester, rounds: 2);
+    expect(find.text('表名已存在'), findsOneWidget);
+    expect(state.validationErrorForTest, contains('已存在'));
+    expect(
+      tester.widget<Btn>(primaryButton()).onPressed,
+      isNull,
+      reason: '表名已存在时不能进入建立关联',
+    );
+
+    // 改名后拦截解除，可以正常建表并进入关系步骤。
+    await setFieldText(tester, 'quick-table-name-0', 'sameconflict_ok');
+    await settle(tester, rounds: 2);
+    expect(find.text('表名已存在'), findsNothing);
+    expect(tester.widget<Btn>(primaryButton()).onPressed, isNotNull);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(state.stepForTest, 2);
+    expect(await tableNames(tester), contains('sameconflict_ok'));
     await tester.pump(const Duration(seconds: 4));
   });
 }

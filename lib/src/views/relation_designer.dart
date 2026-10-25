@@ -16,6 +16,7 @@ import 'package:flutter/material.dart' hide Text, Tooltip;
 
 import '../api.dart';
 import '../app_state.dart';
+import '../glossary.dart';
 import '../i18n_literals.dart';
 import '../notice.dart';
 import '../text.dart';
@@ -186,6 +187,23 @@ Future<void> showForeignKeyBlockedDialog(
   );
 }
 
+/// 删除外键前的二次确认（第 53 轮 P2-9）。
+///
+/// 说明解除的是「引用约束」而不是数据，且之后还能从关系图重建；返回 true 才
+/// 真正执行 ALTER TABLE ... DROP FOREIGN KEY。公开成顶层函数是为了能直接做
+/// widget 测试的取消 / 确认两条路径。
+Future<bool> confirmDeleteForeignKeyDialog(
+  BuildContext context, {
+  required String constraintName,
+}) {
+  return confirmDialog(
+    context,
+    message: erDeleteForeignKeyConfirmMessage(constraintName),
+    confirmLabel: pickText('删除', 'Delete'),
+    danger: true,
+  );
+}
+
 /// E-R 关系设计器。
 ///
 /// 公开接口由 §5.1 固定（导入向导第 5 步与快速建表向导第 4 步都依赖它）：
@@ -265,6 +283,13 @@ class _RelationDesignerState extends State<RelationDesigner> {
   /// 最近一次自动带入的关联表（顶部提示 + 撤销）。
   List<String> _autoAdded = <String>[];
 
+  /// 自动带入的说明（第 53 轮 P2-8）：没有外键 / 达到画布上限时在工具栏
+  /// 下方显示，可关闭；撤销自动加入后清空。
+  String? _autoIncludeNotice;
+
+  /// [_autoIncludeNotice] 是否用 warn 色调（上限截断）而不是 info（无外键）。
+  bool _autoIncludeNoticeWarn = false;
+
   /// 用户手动移除 / 撤销自动加入过的表，不再自动带回。
   final Set<String> _userRemoved = <String>{};
 
@@ -281,6 +306,10 @@ class _RelationDesignerState extends State<RelationDesigner> {
   String? _actionError;
   String? _actionNotice;
   bool _applyingSuggestions = false;
+
+  /// 批量建立建议外键的进度：当前处理到第几条 / 共几条（工具栏旁显示）。
+  int _suggestionProgress = 0;
+  int _suggestionTotal = 0;
   bool _expanding = false;
 
   /// 中间表识别 / 建议关系的缓存版本号：表或外键变化时 +1，避免画布每帧或
@@ -387,6 +416,8 @@ class _RelationDesignerState extends State<RelationDesigner> {
       _loading = true;
       _loadError = null;
       _autoAdded = <String>[];
+      _autoIncludeNotice = null;
+      _autoIncludeNoticeWarn = false;
       _collapsedJunctions.clear();
       _selectedRelationKey = null;
       _actionError = null;
@@ -662,17 +693,53 @@ class _RelationDesignerState extends State<RelationDesigner> {
   }
 
   /// 沿已有外键自动带入关联表（最多到画布上限），并在顶部显示提示。
+  ///
+  /// 第 53 轮 P2-8：自动带入只沿**已有外键**扩展（和按列名推导的「建议关系」
+  /// 是两套机制）。库里没有任何外键、或候选表被画布上限截断时，原来既没有加入
+  /// 表也没有任何说明；现在通过 [autoIncludeNotice] 在工具栏下方给出提示。
   Future<void> _expandRelated() async {
     if (_expanding || _loading || _loadError != null) return;
     final added = _addedNames;
-    if (added.length >= widget.maxTables) return;
+    final related = _buildRelatedMap();
+    final hasAnyForeignKey = related.isNotEmpty;
+    if (added.length >= widget.maxTables) {
+      // 画布已满：不再加表；库里有外键时无需说明，没有外键时仍然提示。
+      _applyAutoIncludeNotice(
+        autoIncludeNotice(
+          addedCount: 0,
+          hasAnyForeignKey: hasAnyForeignKey,
+          reachedLimit: false,
+          maxTables: widget.maxTables,
+        ),
+      );
+      return;
+    }
+    // 再跑一次「不设上限」的展开，用来区分「候选表正好填满上限」和「还有表被
+    // 上限截断」：只有真的被截断时才需要提示用户。
+    final allCandidates = expandRelatedTableNames(
+      added: added,
+      related: related,
+      excluded: _userRemoved,
+      maxTables: _schemaRows.length + added.length + 1,
+    );
     final candidates = expandRelatedTableNames(
       added: added,
-      related: _buildRelatedMap(),
+      related: related,
       excluded: _userRemoved,
       maxTables: widget.maxTables,
     );
-    if (candidates.isEmpty) return;
+    final reachedLimit = allCandidates.length > candidates.length;
+    if (candidates.isEmpty) {
+      _applyAutoIncludeNotice(
+        autoIncludeNotice(
+          addedCount: 0,
+          hasAnyForeignKey: hasAnyForeignKey,
+          reachedLimit: false,
+          maxTables: widget.maxTables,
+        ),
+      );
+      return;
+    }
     _expanding = true;
     try {
       final loadedTables = <ErTable>[];
@@ -689,16 +756,34 @@ class _RelationDesignerState extends State<RelationDesigner> {
         accepted.add(name);
       }
       if (!mounted || accepted.isEmpty) return;
+      final notice = autoIncludeNotice(
+        addedCount: accepted.length,
+        hasAnyForeignKey: hasAnyForeignKey,
+        reachedLimit: reachedLimit,
+        maxTables: widget.maxTables,
+      );
       setState(() {
         _tables = <ErTable>[..._tables, ...loadedTables];
         _localRelations.addAll(loadedRelations);
         _uniqueColumns.addAll(loadedUnique);
         _autoAdded = accepted;
+        _autoIncludeNotice = notice;
+        _autoIncludeNoticeWarn = notice != null && reachedLimit;
         _bumpGraph();
       });
     } finally {
       _expanding = false;
     }
+  }
+
+  /// 更新「自动带入」说明（只在内容变化时 setState，避免无谓重建）。
+  void _applyAutoIncludeNotice(String? notice, {bool warn = false}) {
+    if (!mounted) return;
+    if (_autoIncludeNotice == notice && _autoIncludeNoticeWarn == warn) return;
+    setState(() {
+      _autoIncludeNotice = notice;
+      _autoIncludeNoticeWarn = warn;
+    });
   }
 
   /// 撤销最近一次自动加入：移除这些表，并记住不再自动带回。
@@ -719,6 +804,10 @@ class _RelationDesignerState extends State<RelationDesigner> {
       }
       _userRemoved.addAll(remove);
       _autoAdded = <String>[];
+      // P2-8：撤销后「已达上限 / 无外键」的说明就不成立了，必须一起清掉，
+      // 否则用户会看到一条指向已撤销操作的空提示。
+      _autoIncludeNotice = null;
+      _autoIncludeNoticeWarn = false;
       _selectedRelationKey = null;
       _bumpGraph();
     });
@@ -759,8 +848,20 @@ class _RelationDesignerState extends State<RelationDesigner> {
         return;
       }
     }
+    // 第 53 轮 P3：批量按钮会立即写库、且没有「一键全部撤销」，先确认；单条
+    // 点击（虚线 / 胶囊）保持原来的「点一下就建这一条」，不弹确认。
+    if (only == null && targets.length > 1) {
+      final confirmed = await confirmDialog(
+        context,
+        message: erBatchSuggestionConfirmMessage(targets.length),
+        confirmLabel: pickText('建立', 'Create'),
+      );
+      if (!confirmed || !mounted) return;
+    }
     setState(() {
       _applyingSuggestions = true;
+      _suggestionProgress = 0;
+      _suggestionTotal = targets.length;
       _actionError = null;
       _actionNotice = null;
     });
@@ -768,7 +869,10 @@ class _RelationDesignerState extends State<RelationDesigner> {
     final appliedTables = <String>{};
     final failures = <_SuggestionFailure>[];
     try {
-      for (final suggestion in targets) {
+      for (var i = 0; i < targets.length; i++) {
+        final suggestion = targets[i];
+        // P3：进度计数在每次真正发请求前 +1，工具栏旁显示「正在建立 X/N 条…」。
+        if (mounted) setState(() => _suggestionProgress = i + 1);
         final issue = _validateSuggestion(suggestion);
         if (issue != null) {
           failures.add(
@@ -816,6 +920,8 @@ class _RelationDesignerState extends State<RelationDesigner> {
       if (mounted) {
         setState(() {
           _applyingSuggestions = false;
+          _suggestionProgress = 0;
+          _suggestionTotal = 0;
           _actionError = failures.isEmpty
               ? null
               : _suggestionFailureText(targets.length, applied.length, failures);
@@ -1115,7 +1221,16 @@ class _RelationDesignerState extends State<RelationDesigner> {
     await _reloadTable(localTable);
   }
 
-  Future<void> _deleteForeignKey(String localTable, String name) async {
+  /// 删除外键：先二次确认（P2-9），确认后才真正 ALTER；返回是否真的删除。
+  ///
+  /// 取消时不抛错也不弹提示，调用方（关系详情对话框）保持打开，用户可以继续
+  /// 查看或重新点删除。
+  Future<bool> _deleteForeignKey(String localTable, String name) async {
+    final confirmed = await confirmDeleteForeignKeyDialog(
+      context,
+      constraintName: name,
+    );
+    if (!confirmed || !mounted) return false;
     await Api.instance.alterTableChecked(
       widget.database,
       localTable,
@@ -1124,6 +1239,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
       },
     );
     await _reloadTable(localTable);
+    return true;
   }
 
   /// 两表已有关系 / 双方列都不唯一时的中间表提示；返回用户的选择。
@@ -1438,6 +1554,20 @@ class _RelationDesignerState extends State<RelationDesigner> {
             _toolbar(),
             const SizedBox(height: 3),
             _legend(),
+            // 第 53 轮 P2-8：自动带入「什么也没发生」时也要有说明（没有外键 /
+            // 被画布上限截断），可关闭。
+            if (_autoIncludeNotice != null) ...<Widget>[
+              const SizedBox(height: 6),
+              AlertBox(
+                _autoIncludeNotice!,
+                key: const ValueKey('er-auto-include-notice'),
+                tone: _autoIncludeNoticeWarn ? AlertTone.warn : AlertTone.info,
+                onClose: () => setState(() {
+                  _autoIncludeNotice = null;
+                  _autoIncludeNoticeWarn = false;
+                }),
+              ),
+            ],
             if (_autoAdded.isNotEmpty) ...<Widget>[
               const SizedBox(height: 6),
               _autoAddedHint(),
@@ -1584,6 +1714,16 @@ class _RelationDesignerState extends State<RelationDesigner> {
             tooltip: '按列名推导的建议关系批量建立外键',
             onPressed: _applyingSuggestions ? null : _applySuggestions,
           ),
+          if (_applyingSuggestions) ...<Widget>[
+            const SizedBox(width: 6),
+            Text(
+              erSuggestionProgressText(_suggestionProgress, _suggestionTotal),
+              key: const ValueKey('er-apply-progress'),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: kSmallMuted,
+            ),
+          ],
           const SizedBox(width: 8),
         ],
         Btn(
@@ -1604,6 +1744,17 @@ class _RelationDesignerState extends State<RelationDesigner> {
           dimension: 24,
           glyphSize: 14,
           onPressed: _showSuggestionHelp,
+        ),
+        const SizedBox(width: 6),
+        // 第 53 轮 P3：界面满是「主键 / 外键 / 中间表」等行话，给一个随时能查的
+        // 术语说明入口（说人话版）。
+        IconBtn(
+          Icons.menu_book_outlined,
+          key: const ValueKey('er-glossary'),
+          tooltip: pickText('术语说明', 'Glossary'),
+          dimension: 24,
+          glyphSize: 14,
+          onPressed: () => showGlossaryDialog(context),
         ),
         const SizedBox(width: 10),
         Pill(
@@ -1632,29 +1783,42 @@ class _RelationDesignerState extends State<RelationDesigner> {
   }
 
   /// 顶部提示：本次自动带入了哪些关联表，并提供撤销。
+  ///
+  /// tooltip 说明「自动带入 = 已有外键」与「建议关系 = 按列名推导」是两套机制
+  /// （第 53 轮 P2-8），避免用户以为自动带入也会凭列名猜关系。
   Widget _autoAddedHint() {
     final names = _autoAdded.join(pickText('、', ', '));
-    return Row(
-      children: <Widget>[
-        Icon(Icons.link, size: 13, color: AppColors.infoText),
-        const SizedBox(width: 5),
-        Expanded(
-          child: Text(
-            pickText(
-              '已自动加入关联表：$names',
-              'Related tables added automatically: $names',
+    return Tooltip(
+      message: pickText(
+        '自动带入只沿数据库里已有的外键扩展；按列名推导出来的是「建议关系」'
+            '（虚线），两套机制互不影响。',
+        'Auto-add only follows foreign keys that already exist in the database; '
+            'relations derived from column names are "suggested relations" '
+            '(dashed lines). The two mechanisms are independent.',
+      ),
+      waitDuration: const Duration(milliseconds: 300),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.link, size: 13, color: AppColors.infoText),
+          const SizedBox(width: 5),
+          Expanded(
+            child: Text(
+              pickText(
+                '已自动加入关联表：$names',
+                'Related tables added automatically: $names',
+              ),
+              key: const ValueKey('er-auto-added-hint'),
+              style: TextStyle(fontSize: 11.5, color: AppColors.infoText),
             ),
-            key: const ValueKey('er-auto-added-hint'),
-            style: TextStyle(fontSize: 11.5, color: AppColors.infoText),
           ),
-        ),
-        Btn(
-          '撤销自动加入',
-          key: const ValueKey('er-undo-auto'),
-          small: true,
-          onPressed: _undoAutoAdded,
-        ),
-      ],
+          Btn(
+            '撤销自动加入',
+            key: const ValueKey('er-undo-auto'),
+            small: true,
+            onPressed: _undoAutoAdded,
+          ),
+        ],
+      ),
     );
   }
 
@@ -1705,6 +1869,23 @@ class _RelationDesignerState extends State<RelationDesigner> {
                     '添加表后，从字段两端的圆点拖到另一张表的字段即可创建外键',
                     'After adding tables, drag from either dot on a column onto a column of another table to create a foreign key',
                   ),
+                  style: kSmallMuted,
+                  textAlign: TextAlign.center,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Text(
+                  pickText(
+                    '加入表后会自动沿已有外键带出关联表；没有外键时不会自动带入'
+                        '（可按列名用「建议关系」）。',
+                    'After a table is added, tables linked by existing foreign keys '
+                        'are added automatically; without foreign keys nothing is '
+                        'auto-added (use suggested relations derived from column '
+                        'names instead).',
+                  ),
+                  key: const ValueKey('er-empty-auto-include-hint'),
                   style: kSmallMuted,
                   textAlign: TextAlign.center,
                 ),
@@ -2243,7 +2424,11 @@ class _RelationDesignerState extends State<RelationDesigner> {
     );
   }
 
-  /// 多对多标签锚点：两端实体表卡片中心连线的中点。
+  /// 多对多标签锚点：两端实体表卡片中心连线的中点沿法线向上偏移 18px。
+  ///
+  /// 第 53 轮 P2-6：原来的锚点就是中点，标签正好压住橙色多对多连线的中段，
+  /// 折叠后完全看不出线从哪连到哪。偏移量取 18px（大于标签半高约 8px），并把
+  /// 结果夹在画布内容范围内，避免偏移后被 Stack 裁掉。
   Offset _m2mLabelAnchor(ErManyToManyLink link) {
     final layout = _layout;
     final tableA = layout.tableNamed(link.tableA);
@@ -2265,7 +2450,15 @@ class _RelationDesignerState extends State<RelationDesigner> {
       positionB.dx + metrics.cardWidth / 2,
       positionB.dy + metrics.heightOf(tableB) / 2,
     );
-    return Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
+    final anchor = m2mLabelAnchorFor(start: a, end: b);
+    final content = layout.contentSize(margin: 40);
+    // 标签以锚点为中心（FractionalTranslation -0.5），四周留 8px 防贴边裁切。
+    final maxX = math.max(8.0, content.width - 8.0);
+    final maxY = math.max(8.0, content.height - 8.0);
+    return Offset(
+      anchor.dx.clamp(8.0, maxX).toDouble(),
+      anchor.dy.clamp(8.0, maxY).toDouble(),
+    );
   }
 }
 
@@ -3162,7 +3355,9 @@ class _RelationDialog extends StatefulWidget {
   final ErRelation relation;
   final bool canDelete;
   final bool isSqlite;
-  final Future<void> Function() onDelete;
+
+  /// 返回是否真的删除了（用户在二次确认里取消时返回 false）。
+  final Future<bool> Function() onDelete;
 
   @override
   State<_RelationDialog> createState() => _RelationDialogState();
@@ -3179,8 +3374,13 @@ class _RelationDialogState extends State<_RelationDialog> {
       _error = null;
     });
     try {
-      await widget.onDelete();
+      final deleted = await widget.onDelete();
       if (!mounted) return;
+      if (!deleted) {
+        // 二次确认里点了取消：留在关系详情里，不关窗、不刷新画布。
+        setState(() => _busy = false);
+        return;
+      }
       Navigator.of(context).pop(true);
     } catch (error) {
       if (!mounted) return;

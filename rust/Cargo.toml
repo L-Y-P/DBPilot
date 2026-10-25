@@ -44,15 +44,12 @@ russh-keys = "0.45"
 async-trait = "0.1"
 # Stream row-by-row for the SQL console row cap (see drivers/mysql/exec.rs).
 futures = "0.3"
-# Excel 数据文件读取（xlsx/xls/xlsb/ods）。
-# calamine 只作为 xls/xlsb 的兜底读取器（这两个格式暂未流式解析）；xlsx/ODS 的
-# 逐行流式解析直接用 zip + quick-xml 实现（见 src/excel_stream.rs），SpreadsheetML
-# 用 quick-xml 流式扫描。dates 特性用于兜底路径的日期转换。
-calamine = { version = "0.26", features = ["dates"] }
 # ZIP 容器（xlsx/xlsm/ODS 的流式工作表读取）。与 calamine 共用同一个 zip 版本。
 zip = { version = "2.5", default-features = false, features = ["deflate"] }
 # 流式 XML 解析（worksheet XML / SpreadsheetML / ODS content.xml）。
 quick-xml = "0.31"
+# OLE2 复合文档（xls/BIFF8 的 Workbook 流）；只读，流式访问不整表载入。
+cfb = "0.15"
 
 [profile.release]
 lto = true
@@ -71,3 +68,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 # match arm in src/net/tls/tls_rustls.rs. Re-sync it when bumping sqlx.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core" }
+
+[dev-dependencies]
+# 仅测试用：xlsb fixture 用 calamine（独立实现）反向交叉验证单元格布局。
+calamine = { version = "0.26", features = ["dates"] }

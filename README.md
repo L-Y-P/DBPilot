@@ -87,7 +87,7 @@ keyset 游标分页；自动列宽开关与大字段延迟加载（设置 → �
 支持分隔文本 / JSON 数组 / JSON Lines / XML / HTML / **Excel 工作簿（.xlsx / .xls / .xlsb / .ods / SpreadsheetML）** / Markdown / SQL 脚本；
 自动识别格式（内容优先、扩展名兜底）；多工作表文件在读取规则里选择要导入的工作表，可设置表头行与跳过开头 N 行；
 整文件校验报「第 N 行（第 X 条，字节 Y）：原因」；试插入（事务内 INSERT + 回读 + ROLLBACK）；
-**全链路流式读取与校验**：xlsx/xlsm、SpreadsheetML、ODS 逐行解析（不整表载入内存），xls(BIFF8)/xlsb 暂为整表兜底并在界面明确提示；
+**全链路流式读取与校验**：xlsx/xlsm、SpreadsheetML、ODS、xls(BIFF8)、xlsb 全部逐行流式解析（行数据不整表载入内存，只有共享字符串表按字符串总量加载）；
 分批写入（默认 500 行/批、可取消）；NULL 与空串在所有格式里可区分。
 
 ![数据导入向导](docs/images/import-wizard.png)
@@ -138,8 +138,8 @@ keyset 游标分页；自动列宽开关与大字段延迟加载（设置 → �
 - **keyset 游标分页**替代 OFFSET（单列主键升序时走索引范围扫描），配合延迟关联；游标页不发 `COUNT(*)`。
 - **大字段延迟加载**：超过 200 字符只渲染前 120 字符 + 徽标，双击看全文。
 - **自动列宽可关闭**：关掉后所有列固定 160 px，完全不跑 `TextPainter` 测量。
-- **导入流式**：文本格式 64 KiB 分块；Excel（xlsx/xlsm/SpreadsheetML/ODS）按行流式解析与校验，批量 INSERT 默认 500 行、可取消；单记录 8 MiB / 单语句 16 MiB 上限。
-  `xls(BIFF8)`/`xlsb` 仍是整表兜底（界面会提示）；xlsx 的 sharedStrings 为一次性加载（格式决定的字符串表）。
+- **导入流式**：文本格式 64 KiB 分块；Excel 全格式按行流式解析与校验（xlsx/xlsm 用 zip+XML、xls 用 OLE2+BIFF record、xlsb 用 ZIP entry+BRT record），批量 INSERT 默认 500 行、可取消；单记录 8 MiB / 单语句 16 MiB 上限。
+  共享字符串表（xlsx sharedStrings / xls SST / xlsb sharedStrings）为该格式决定的字符串索引表，一次性加载。
 - **导出流式**：逐行写出，不把整表拼成一个大字符串。
 
 ## 使用

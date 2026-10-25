@@ -1025,7 +1025,7 @@ impl TextScanner {
 ///
 /// Text formats keep the streaming byte reader (never loads the file). Excel
 /// formats use the streaming row layer (excel_stream): xlsx/ODS/SpreadsheetML
-/// parse XML incrementally, xls/xlsb fall back to calamine. Rows are handed to
+/// parse incrementally (xlsx/xlsb/xls/ODS/SpreadsheetML). Rows are handed to
 /// the shared header/mapping/INSERT pipeline as JSON-array record text.
 enum RecordScanner {
     Text(TextScanner),
@@ -2628,7 +2628,7 @@ pub fn inspect(path: &str) -> AppResult<Value> {
 ///
 /// 不再整表载入：xlsx 只读 workbook.xml + rels + 每表 dimension + 默认表前两行；
 /// SpreadsheetML / ODS 单次顺序扫描统计表名/行数/列数（不保存单元格）；
-/// xls / xlsb 走 calamine 兜底（只加载默认表，其余表只给名字，warnings 说明）。
+/// xls（BIFF8）走 Record 级流式、xlsb 走 Row 级流式（见 excel_stream::inspect_workbook）。
 fn inspect_excel(
     path: &str,
     info: &FileInfo,
@@ -4773,10 +4773,10 @@ mod excel_tests {
         let sheets = info["sheets"].as_array().expect("sheets");
         assert_eq!(sheets.len(), 3, "{info}");
         assert_eq!(info["fields"]["mode"], json!("excel"));
-        // BIFF8 暂由 calamine 整表兜底：明确标注非流式，其余格式已流式。
-        assert_eq!(info["streaming"], json!(false), "{info}");
+        // BIFF8 走 Record 级流式：streaming=true，且不再有「暂未流式」提示。
+        assert_eq!(info["streaming"], json!(true), "{info}");
         assert!(
-            info["warnings"].to_string().contains("暂未流式"),
+            !info["warnings"].to_string().contains("暂未流式"),
             "{info}"
         );
     }
@@ -4790,7 +4790,7 @@ mod excel_tests {
             assert_eq!(preview["sheet_used"], json!("员工"), "{fixture_name}");
             assert_eq!(
                 preview["streaming"],
-                json!(fixture_name == XLSX),
+                json!(true),
                 "{fixture_name}: {}",
                 preview["streaming"]
             );
@@ -5603,18 +5603,18 @@ mod excel_tests {
     }
 
     #[test]
-    fn xls_fallback_reports_non_streaming_warning() {
+    fn xls_streaming_report_has_no_fallback_warning() {
         let path = fixture(XLS);
         let (info, spec) = spec_from_inspect(&path);
-        assert_eq!(info["streaming"], json!(false), "{info}");
+        assert_eq!(info["streaming"], json!(true), "{info}");
         assert!(
-            info["warnings"].to_string().contains("暂未流式"),
+            !info["warnings"].to_string().contains("暂未流式"),
             "{info}"
         );
         let preview = preview(&spec, 5).unwrap();
-        assert_eq!(preview["streaming"], json!(false), "{preview}");
+        assert_eq!(preview["streaming"], json!(true), "{preview}");
         assert!(
-            preview["warnings"].to_string().contains("暂未流式"),
+            !preview["warnings"].to_string().contains("暂未流式"),
             "{preview}"
         );
     }

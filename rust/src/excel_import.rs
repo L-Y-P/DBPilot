@@ -1,28 +1,21 @@
-//! Excel 数据文件读取（xlsx / xls / xlsb / ods / SpreadsheetML 2003）。
+//! Excel 格式识别 + 建表类型推断（xlsx / xls / xlsb / ods / SpreadsheetML 2003）。
 //!
-//! 设计契约见 desktop/docs/IMPORT_EXCEL_ER_DESIGN.md §2。这一层只做两件事：
+//! 设计契约见 desktop/docs/IMPORT_EXCEL_ER_DESIGN.md §2。读取本身已经全部搬到
+//! excel_stream（逐行流式）：xlsx/xlsm、SpreadsheetML、ODS、xls(BIFF8)、xlsb
+//! 分别由 excel_stream 内的模块与 xls_stream / xlsb_stream 实现。这一层只留：
 //!
-//! 1. 把一个工作簿读成行值（Vec<Vec<serde_json::Value>>），并保留工作表列表，
-//!    供 importer::inspect 展示、RecordScanner 逐行扫描；
-//! 2. 按列的数据形状推断类型（infer_schema），供「从文件建表」向导直接建表。
+//! 1. 内容优先、扩展名兜底的格式识别（inspect 用）；
+//! 2. preview 的列类型推断（infer_schema），供「从文件建表」向导直接建表。
 //!
 //! 记录切分、表头/映射/INSERT 全在 importer.rs 里复用既有管线：Excel 的一行
 //! 在扫描器里就序列化成一段 JSON 数组文本（fields.mode = "excel"），因此
 //! preview / validate / execute / probe 四条路径不需要各写一套 Excel 逻辑。
-//!
-//! 已知边界：calamine 的 worksheet_range 会把整张表载入内存，超大的工作簿会
-//! 占用较多内存（inspect 会在 warnings 里提示）。CSV 那套「保证不整文件读入」
-//! 的流式约束不适用于 Excel 二进制格式。
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use calamine::{
-    open_workbook, Data, ExcelDateTime, Ods, Reader, SheetType, SheetVisible, Sheets, Xls, Xlsb,
-    Xlsx,
-};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use serde_json::{json, Number, Value};
 
 use crate::error::{AppError, AppResult};
@@ -58,17 +51,6 @@ impl ExcelKind {
             ExcelKind::Xlsb => "xlsb",
             ExcelKind::Ods => "ods",
             ExcelKind::SpreadsheetMl => "excel",
-        }
-    }
-
-    /// 面向错误/警告的中文格式名。
-    pub fn label(self) -> &'static str {
-        match self {
-            ExcelKind::Xlsx => "Excel 工作簿（.xlsx）",
-            ExcelKind::Xls => "Excel 97-2003 工作簿（.xls）",
-            ExcelKind::Xlsb => "Excel 二进制工作簿（.xlsb）",
-            ExcelKind::Ods => "OpenDocument 电子表格（.ods）",
-            ExcelKind::SpreadsheetMl => "SpreadsheetML 2003 表格（Excel XML）",
         }
     }
 
@@ -150,7 +132,7 @@ pub fn sniff(head: &[u8], tail: &[u8], ext: &str) -> Option<ExcelKind> {
         return zip_kind(head, tail, ext);
     }
     if head.starts_with(&OLE2_MAGIC) {
-        // OLE2 是复合文档容器；真正的解析交给 calamine，打不开时由读取层报错。
+        // OLE2 是复合文档容器；真正的解析交给 xls_stream（BIFF8 record 级流式）。
         return Some(ExcelKind::Xls);
     }
     let text = String::from_utf8_lossy(head);
@@ -175,170 +157,6 @@ pub fn detect(path: &str) -> AppResult<Option<ExcelKind>> {
         Vec::new()
     };
     Ok(sniff(&head, &tail, &ext))
-}
-
-// ---------------------------------------------------------------- 行数据模型
-
-/// 一个工作表：行已裁掉末尾全空列、过滤全空行。
-#[derive(Clone, Debug)]
-pub struct ExcelSheet {
-    pub name: String,
-    /// 单元格值：空单元格是 Value::Null，日期/时间是格式化后的字符串。
-    pub rows: Vec<Vec<Value>>,
-    /// 有效列数（所有行已补齐到这个宽度）。
-    pub cols: usize,
-}
-
-/// 工作表目录（不含数据），用于「选表」与错误提示。
-#[derive(Clone, Debug)]
-pub struct SheetBrief {
-    pub index: usize,
-    pub name: String,
-}
-
-/// 扫描器需要的「单张表 + 表目录」。
-pub struct SelectedSheet {
-    pub sheet: ExcelSheet,
-    pub sheets: Vec<SheetBrief>,
-    /// 被忽略的隐藏/图表工作表数量（inspect 警告用）。
-    pub hidden_sheets: usize,
-}
-
-// ---------------------------------------------------------------- 读取工作簿
-
-fn open_error(kind: ExcelKind, error: impl std::fmt::Display) -> AppError {
-    AppError::bad(format!(
-        "无法读取{}: {error}（文件可能已损坏、被密码保护或不是真正的 Excel 文件）",
-        kind.label()
-    ))
-}
-
-type Book = Sheets<BufReader<File>>;
-
-fn open_book(path: &str, kind: ExcelKind) -> AppResult<Book> {
-    let opened: Result<Book, String> = match kind {
-        ExcelKind::Xlsx => open_workbook::<Xlsx<BufReader<File>>, _>(path)
-            .map(Sheets::Xlsx)
-            .map_err(|e| e.to_string()),
-        ExcelKind::Xls => open_workbook::<Xls<BufReader<File>>, _>(path)
-            .map(Sheets::Xls)
-            .map_err(|e| e.to_string()),
-        ExcelKind::Xlsb => open_workbook::<Xlsb<BufReader<File>>, _>(path)
-            .map(Sheets::Xlsb)
-            .map_err(|e| e.to_string()),
-        ExcelKind::Ods => open_workbook::<Ods<BufReader<File>>, _>(path)
-            .map(Sheets::Ods)
-            .map_err(|e| e.to_string()),
-        ExcelKind::SpreadsheetMl => unreachable!("SpreadsheetML 不是二进制工作簿"),
-    };
-    opened.map_err(|error| open_error(kind, error))
-}
-
-/// 工作簿里所有普通工作表的元数据（隐藏表也占 workbook 序号）。
-struct SheetMeta {
-    raw_index: usize,
-    name: String,
-    visible: bool,
-}
-
-fn sheet_metadata(book: &Book) -> Vec<SheetMeta> {
-    book.sheets_metadata()
-        .iter()
-        .enumerate()
-        .filter(|(_, sheet)| matches!(sheet.typ, SheetType::WorkSheet))
-        .map(|(raw_index, sheet)| SheetMeta {
-            raw_index,
-            name: sheet.name.clone(),
-            visible: matches!(sheet.visible, SheetVisible::Visible),
-        })
-        .collect()
-}
-
-/// 可见工作表列表（inspect.sheets 的数据源，也是「第 N 张表」的序号来源）。
-fn visible_meta(meta: &[SheetMeta]) -> Vec<&SheetMeta> {
-    meta.iter().filter(|sheet| sheet.visible).collect()
-}
-
-/// 选表：默认第一张可见表；支持「工作表名」或 0-based 序号字符串。
-fn select_sheet(sheets: &[SheetBrief], selector: Option<&str>) -> AppResult<usize> {
-    if sheets.is_empty() {
-        return Err(AppError::bad("工作簿里没有可见的工作表"));
-    }
-    let Some(raw) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(0);
-    };
-    if let Some(position) = sheets.iter().position(|sheet| sheet.name == raw) {
-        return Ok(position);
-    }
-    if let Ok(index) = raw.parse::<usize>() {
-        if index < sheets.len() {
-            return Ok(index);
-        }
-        return Err(AppError::bad(format!(
-            "工作表序号 {index} 超出范围（共 {} 个工作表，从 0 开始）",
-            sheets.len()
-        )));
-    }
-    let names = sheets
-        .iter()
-        .map(|sheet| sheet.name.as_str())
-        .collect::<Vec<_>>()
-        .join("、");
-    Err(AppError::bad(format!(
-        "找不到工作表 '{raw}'；可选工作表：{names}"
-    )))
-}
-
-fn sheets_from_meta(meta: &[&SheetMeta]) -> Vec<SheetBrief> {
-    meta.iter()
-        .enumerate()
-        .map(|(index, sheet)| SheetBrief {
-            index,
-            name: sheet.name.clone(),
-        })
-        .collect()
-}
-
-/// 读取指定工作表（缺省第一张可见表）；前 skip_rows 行会被跳过。
-pub fn read_selected(
-    path: &str,
-    kind: ExcelKind,
-    selector: Option<&str>,
-    skip_rows: usize,
-) -> AppResult<SelectedSheet> {
-    if kind == ExcelKind::SpreadsheetMl {
-        // SpreadsheetML 已由 excel_stream 流式读取；这里只服务 xls/xlsb 兜底。
-        return Err(AppError::bad(
-            "SpreadsheetML 请使用流式读取路径（excel_stream）",
-        ));
-    }
-    let mut book = open_book(path, kind)?;
-    let meta = sheet_metadata(&book);
-    let visible = visible_meta(&meta);
-    let briefs = sheets_from_meta(&visible);
-    let selected = select_sheet(&briefs, selector)?;
-    let target = visible[selected];
-    let range = book
-        .worksheet_range_at(target.raw_index)
-        .ok_or_else(|| AppError::bad(format!("无法定位工作表「{}」", target.name)))?
-        .map_err(|error| open_error(kind, error))?;
-    let mut rows = trim_rows(range_to_rows(range));
-    if skip_rows > 0 && skip_rows < rows.len() {
-        rows.drain(..skip_rows);
-    } else if skip_rows >= rows.len() {
-        rows.clear();
-    }
-    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let sheet = ExcelSheet {
-        name: target.name.clone(),
-        rows,
-        cols,
-    };
-    Ok(SelectedSheet {
-        sheet,
-        sheets: briefs,
-        hidden_sheets: meta.len().saturating_sub(visible.len()),
-    })
 }
 
 // ---------------------------------------------------------------- 单元格转换
@@ -393,96 +211,13 @@ fn integral_sample(number: &Number) -> Option<Value> {
     }
 }
 
-fn pad2(value: u32) -> String {
-    format!("{value:02}")
-}
-
-/// Excel 日期/时间单元格 → 导入用的字符串。
-///
-/// * 纯日期（00:00:00）输出 YYYY-MM-DD，这样类型推断能认成 date；
-/// * 纯时间（一天内的比例，calamine 会落在 1899-12-31）输出 HH:MM:SS；
-/// * 其余输出 YYYY-MM-DD HH:MM:SS；时长（[h]:mm:ss）也输出 HH:MM:SS。
-fn excel_datetime_value(value: &ExcelDateTime) -> Value {
-    if value.is_duration() {
-        if let Some(duration) = value.as_duration() {
-            let seconds = duration.num_seconds();
-            let sign = if seconds < 0 { "-" } else { "" };
-            let seconds = seconds.abs();
-            return Value::String(format!(
-                "{sign}{}:{}:{}",
-                seconds / 3600,
-                pad2((seconds % 3600 / 60) as u32),
-                pad2((seconds % 60) as u32)
-            ));
-        }
-    }
-    match value.as_datetime() {
-        Some(datetime) => {
-            let time_only_date = NaiveDate::from_ymd_opt(1899, 12, 31).expect("valid date");
-            if datetime.date() == time_only_date {
-                Value::String(format!(
-                    "{}:{}:{}",
-                    pad2(datetime.hour()),
-                    pad2(datetime.minute()),
-                    pad2(datetime.second())
-                ))
-            } else if datetime.time() == NaiveTime::MIN {
-                Value::String(datetime.date().to_string())
-            } else {
-                Value::String(datetime.format("%Y-%m-%d %H:%M:%S").to_string())
-            }
-        }
-        // 年份超出 chrono 范围等极端情况：保留 calamine 的原始数值文本。
-        None => Value::String(value.to_string()),
-    }
-}
-
-fn data_to_value(cell: &Data) -> Value {
-    match cell {
-        Data::Int(value) => json!(value),
-        Data::Float(value) => normalize_number(*value),
-        Data::String(value) => Value::String(value.clone()),
-        Data::Bool(value) => Value::Bool(*value),
-        Data::DateTime(value) => excel_datetime_value(value),
-        // ISO 日期/时长本身就适合当字符串导入；类型推断会按字符串模式识别。
-        Data::DateTimeIso(value) | Data::DurationIso(value) => Value::String(value.clone()),
-        // 公式错误（#DIV/0! 等）与空单元格都按 NULL 导入。
-        Data::Error(_) | Data::Empty => Value::Null,
-    }
-}
-
-fn range_to_rows(range: calamine::Range<Data>) -> Vec<Vec<Value>> {
-    range
-        .rows()
-        .map(|row| row.iter().map(data_to_value).collect())
-        .collect()
-}
-
-/// 空单元格判定：NULL 或空字符串。
+/// 空单元格判定：NULL 或空字符串（类型推断要把「空」和「0 / 空串」分开）。
 fn blank_cell(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::String(text) => text.is_empty(),
         _ => false,
     }
-}
-
-/// 裁掉全空行与末尾全空列，并把每行补齐到同一宽度。
-pub fn trim_rows(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
-    let mut width = 0usize;
-    for row in &rows {
-        if let Some(last) = row.iter().rposition(|value| !blank_cell(value)) {
-            width = width.max(last + 1);
-        }
-    }
-    if width == 0 {
-        return Vec::new();
-    }
-    rows.retain(|row| row.iter().any(|value| !blank_cell(value)));
-    for row in &mut rows {
-        row.resize(width, Value::Null);
-    }
-    rows
 }
 
 // ---------------------------------------------------------------- 类型推断

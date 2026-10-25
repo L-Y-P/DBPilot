@@ -10,8 +10,8 @@
 //! * SpreadsheetML（Excel 2003 XML）：quick-xml 流式扫描多 Worksheet；
 //!   保留 ss:Name / ss:Index / ss:Type 语义。
 //! * ODS：zip 读 content.xml，流式解析 table:table / table:table-row。
-//! * xls（BIFF8）/ xlsb：暂时仍由 calamine 整表兜底（warning 里说明）；
-//!   这两个格式的流式解析风险高，留作后续，正确性不受影响。
+//! * xls（BIFF8）：Record 级流式（OLE2/CFB 流 + BIFF record 遍历，见 xls_stream）；
+//! * xlsb：Row 级流式（ZIP entry 流 + BRT record 解析，见 xlsb_stream）。
 //!
 //! 记录仍然是「一行 = 一个 JSON 数组 Value」：importer 的 ExcelScanner 只负责把
 //! 值序列化成文本再交给既有表头/映射/INSERT 管线，这里不重复实现映射逻辑。
@@ -77,7 +77,7 @@ pub struct InspectInfo {
     /// 默认表的前两行（表头启发式与样例用；最多 2 行）。
     pub header_rows: Vec<Vec<Value>>,
     pub hidden_sheets: usize,
-    /// true = 本次 inspect 走流式读取；false = 走了 calamine 整表兜底。
+    /// 本次 inspect 是否走流式读取（当前所有 Excel 格式均为 true）。
     pub streaming: bool,
     pub warnings: Vec<String>,
 }
@@ -113,8 +113,8 @@ pub fn inspect_workbook(path: &str, kind: ExcelKind) -> AppResult<InspectInfo> {
         ExcelKind::Xlsx => xlsx::inspect(path),
         ExcelKind::SpreadsheetMl => spreadsheetml::inspect(path),
         ExcelKind::Ods => ods::inspect(path),
-        // xls / xlsb：暂由 calamine 整表兜底（warning 里说明）。
-        ExcelKind::Xls | ExcelKind::Xlsb => fallback::inspect(path, kind),
+        ExcelKind::Xls => crate::xls_stream::inspect(path).map(xls_inspect_info),
+        ExcelKind::Xlsb => crate::xlsb_stream::inspect_compat(path),
     }
 }
 
@@ -129,7 +129,62 @@ pub fn open_sheet(
         ExcelKind::Xlsx => xlsx::open_sheet(path, selector, skip_rows),
         ExcelKind::SpreadsheetMl => spreadsheetml::open_sheet(path, selector, skip_rows),
         ExcelKind::Ods => ods::open_sheet(path, selector, skip_rows),
-        ExcelKind::Xls | ExcelKind::Xlsb => fallback::open_sheet(path, kind, selector, skip_rows),
+        ExcelKind::Xls => {
+            let opened = crate::xls_stream::open_sheet(path, selector, skip_rows)?;
+            Ok(OpenedSheet {
+                sheet: opened.sheet,
+                sheets: opened
+                    .sheets
+                    .iter()
+                    .map(|(index, name)| json!({ "index": index, "name": name }))
+                    .collect(),
+                total_rows: opened.total_rows,
+                streaming: true,
+                warnings: Vec::new(),
+                source: Box::new(XlsStreamSource {
+                    inner: opened.source,
+                }),
+            })
+        }
+        ExcelKind::Xlsb => crate::xlsb_stream::open_sheet_compat(path, selector, skip_rows),
+    }
+}
+
+// ---------------------------------------------------------------- 接线适配
+
+/// 把 xls_stream 的轻量 inspect 结果转成 excel_stream 的统一结构。
+fn xls_inspect_info(result: crate::xls_stream::InspectResult) -> InspectInfo {
+    InspectInfo {
+        sheets: result
+            .sheets
+            .into_iter()
+            .map(|sheet| SheetMeta {
+                index: sheet.index,
+                name: sheet.name,
+                rows: sheet.rows,
+                cols: sheet.cols,
+            })
+            .collect(),
+        sheet: result.sheet,
+        header_rows: result.header_rows,
+        hidden_sheets: result.hidden_sheets,
+        streaming: true,
+        warnings: Vec::new(),
+    }
+}
+
+/// 把 xls_stream 的 RowSource 适配成 excel_stream::RowSource。
+struct XlsStreamSource {
+    inner: Box<dyn crate::xls_stream::RowSource>,
+}
+
+impl RowSource for XlsStreamSource {
+    fn next_row(&mut self) -> AppResult<Option<Vec<Value>>> {
+        self.inner.next_row()
+    }
+
+    fn bytes_progress(&self) -> Option<(u64, u64)> {
+        self.inner.bytes_progress()
     }
 }
 
@@ -479,17 +534,6 @@ impl Drop for ChannelSource {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-    }
-}
-
-/// 把内存里的行源包装成 RowSource（calamine 兜底 / 小批量路径共用）。
-struct VecSource {
-    rows: std::vec::IntoIter<Vec<Value>>,
-}
-
-impl RowSource for VecSource {
-    fn next_row(&mut self) -> AppResult<Option<Vec<Value>>> {
-        Ok(self.rows.next())
     }
 }
 
@@ -2331,74 +2375,3 @@ mod ods {
     }
 }
 
-mod fallback {
-    use super::*;
-
-    fn fallback_warning(kind: ExcelKind) -> String {
-        format!(
-            "{} 暂未流式读取：已整表载入所选工作表（正确性不受影响；xlsx/ODS/SpreadsheetML 已流式）",
-            kind.label()
-        )
-    }
-
-    /// calamine 兜底 inspect：只加载默认工作表拿表头，其余工作表只给名字，
-    /// 避免为了行数/列数把所有工作表整表读进内存。
-    pub fn inspect(path: &str, kind: ExcelKind) -> AppResult<InspectInfo> {
-        let selected = crate::excel_import::read_selected(path, kind, None, 0)?;
-        let header_rows: Vec<Vec<Value>> = selected
-            .sheet
-            .rows
-            .iter()
-            .take(INSPECT_HEADER_ROWS)
-            .cloned()
-            .collect();
-        let mut sheets: Vec<SheetMeta> = selected
-            .sheets
-            .iter()
-            .map(|brief| SheetMeta {
-                index: brief.index,
-                name: brief.name.clone(),
-                rows: None,
-                cols: None,
-            })
-            .collect();
-        if let Some(first) = sheets.first_mut() {
-            first.rows = Some(selected.sheet.rows.len() as u64);
-            first.cols = Some(selected.sheet.cols as u64);
-        }
-        Ok(InspectInfo {
-            sheet: selected.sheet.name.clone(),
-            sheets,
-            header_rows,
-            hidden_sheets: selected.hidden_sheets,
-            streaming: false,
-            warnings: vec![fallback_warning(kind)],
-        })
-    }
-
-    pub fn open_sheet(
-        path: &str,
-        kind: ExcelKind,
-        selector: Option<&str>,
-        skip_rows: usize,
-    ) -> AppResult<OpenedSheet> {
-        let selected = crate::excel_import::read_selected(path, kind, selector, skip_rows)?;
-        let sheets_json: Vec<Value> = selected
-            .sheets
-            .iter()
-            .map(|brief| json!({ "index": brief.index, "name": brief.name }))
-            .collect();
-        let total_rows = selected.sheet.rows.len() as u64;
-        let sheet_name = selected.sheet.name.clone();
-        Ok(OpenedSheet {
-            sheet: sheet_name,
-            sheets: sheets_json,
-            total_rows: Some(total_rows),
-            streaming: false,
-            warnings: vec![fallback_warning(kind)],
-            source: Box::new(VecSource {
-                rows: selected.sheet.rows.into_iter(),
-            }),
-        })
-    }
-}

@@ -57,7 +57,7 @@ SpreadsheetML 仍是 UTF-8 文本，`head` 返回 XML 片段。
   "sheet": "员工",                      // 默认选中：第一张可见工作表
   "read":  { "mode": "line", "sheet": "员工", "skip_rows": 0, "...": "..." },
   "fields": { "mode": "excel", "header": true, "...": "..." },
-  "streaming": true,                   // 本次识别是否走流式读取（xls/xlsb 兜底为 false）
+  "streaming": true,                   // 本次识别是否走流式读取（当前所有 Excel 格式均为 true）
   "warnings": ["检测到 2 个工作表：当前导入所选工作表；一次导入多个工作表请用「从文件建表」"]
 }
 ```
@@ -69,8 +69,10 @@ SpreadsheetML 仍是 UTF-8 文本，`head` 返回 XML 片段。
     （xlsx 的字符串都引用它，这是唯一按字符串总量占内存的部分）。
   - `SpreadsheetML / ODS`：单次顺序扫描 XML，只统计表名 / 行数 / 列数 + 默认表前两行，
     不保存单元格；文件再大也只会占一个固定大小的读缓冲。
-  - `xls(BIFF8) / xlsb`：仍是 calamine 兜底——只加载**默认表**拿表头，其余表只给名字，
-    返回 `streaming:false` 且 warning 里明确写「暂未流式读取」。
+  - `xls(BIFF8)`：OLE2(CFB) 的 Workbook 流 + BIFF record 顺序遍历，只读 BOUNDSHEET 与
+    每张表的 DIMENSIONS + 默认表前两行（不读单元格）；SST（共享字符串表）一次性加载。
+  - `xlsb`：ZIP 里只读 workbook.bin / rels / 每表 BrtWsDim + 默认表前两行；sharedStrings.bin
+    与 styles.bin 一次性加载。
 - `sheets[].rows/cols` 是「已知才给」：xlsx 来自 dimension，SpreadsheetML/ODS 来自扫描；
   xls/xlsb 的非默认表、以及没有 dimension 的 xlsx 会省略这两个字段，
   UI 按「无 rows 只显示名字」处理即可。
@@ -142,12 +144,13 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 | `xlsx` / `xlsm` | 流式（workbook+rels+dimension+前两行） | **流式**（zip + quick-xml 逐 `<row>`） | sharedStrings 一次性加载；styles.xml 判日期格式；支持 inlineStr/s/b/e/n/d/公式缓存值；XML 在工作线程解析、有界 channel 送行，preview 只看几条时线程立即停止 |
 | `SpreadsheetML`（.xls XML） | 流式（单次扫描统计） | **流式**（quick-xml 逐 Worksheet/Row/Cell） | 多 Worksheet、ss:Index、ss:Type 语义不变 |
 | `ods` | 流式（content.xml 单次扫描） | **流式**（zip + quick-xml 逐 table-row/table-cell） | P1；支持 float/percentage/currency/boolean/date/time/string 与重复行列 |
-| `xls`（BIFF8） | calamine 兜底（只加载默认表） | calamine 兜底（整表载入所选工作表） | `streaming:false` + warning；正确性不变 |
-| `xlsb` | 同上 | 同上 | 同上 |
+| `xls`（BIFF8） | 流式（BOUNDSHEET + 每表 DIMENSIONS + 默认表前两行） | **流式（Record 级）**：cfb 的 Workbook 流 + BIFF record 顺序遍历（SST/CONTINUE、LABELSST/LABEL/NUMBER/RK/MULRK/BOOLERR/FORMULA 缓存值、XF+FORMAT 判日期、DATEMODE 1904） | 不整表载入 Workbook 流；SST 一次性加载（与 xlsx 的 sharedStrings 同理）；BIFF5/7 与加密工作簿报错 |
+| `xlsb` | 流式（workbook.bin + 每表 BrtWsDim + 默认表前两行） | **流式（Row 级）**：zip 的 ZipFile(Read) 边解压边解析 BRT（varint id + varsize、BrtRowHdr/BrtCell*/公式缓存值、sharedStrings/styles） | 工作表 entry 级流式，无 read_to_end；SST/styles 一次性加载；加密 xlsb 报错 |
 
 - CSV/JSON/XML/HTML/Markdown 等文本格式本来就走流式字节读取，本轮不变。
-- 内存边界：xlsx 的峰值 ≈ sharedStrings（字符串总长度）+ 读缓冲 + 首个 128 行宽度探测
-  缓冲；SpreadsheetML/ODS 只占固定读缓冲；xls/xlsb 仍为「所选工作表整表」。
+- 内存边界：xlsx / xls / xlsb 的峰值 ≈ 共享字符串表（sharedStrings/SST，字符串总长度）
+  + 读缓冲 + 首个 128 行宽度探测缓冲；SpreadsheetML/ODS 只占固定读缓冲。
+  行数据本身都是逐行产出，不随文件行数增长（每个解析器都有 5 万行流式单测）。
 - 流式读取会先缓冲最多 128 行确定有效列宽（等价于旧实现「裁掉末尾全空列」的语义）；
   之后更宽的行按原样输出（保留数据，由列映射报字段数错误）。
 

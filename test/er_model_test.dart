@@ -1122,6 +1122,140 @@ void main() {
       );
     });
   });
+
+  group('外键前置校验', () {
+    ErTable tableWith(String name, List<ErColumn> columns) =>
+        table(name, columns);
+    ErTable localTable() => tableWith('orders', <ErColumn>[
+      column('id', type: 'INTEGER', primary: true),
+      column('user_id', type: 'INTEGER'),
+      column('note', type: 'TEXT'),
+    ]);
+    ErTable refTable() => tableWith('users', <ErColumn>[
+      column('id', type: 'INTEGER', primary: true),
+      column('email', type: 'VARCHAR(255)'),
+      column('age', type: 'INTEGER'),
+    ]);
+
+    test('目标列是主键 → 通过', () {
+      expect(
+        validateForeignKeyCandidate(
+          localTable: localTable(),
+          localColumn: 'user_id',
+          refTable: refTable(),
+          refColumn: 'id',
+        ),
+        isNull,
+      );
+    });
+
+    test('目标列非主键但在单列唯一索引里 → 通过', () {
+      expect(
+        validateForeignKeyCandidate(
+          localTable: localTable(),
+          localColumn: 'note',
+          refTable: refTable(),
+          refColumn: 'email',
+          refUniqueColumns: <String>{'email'},
+        ),
+        isNull,
+      );
+    });
+
+    test('目标列不是主键 / 唯一列 → refColumnNotUnique', () {
+      final issue = validateForeignKeyCandidate(
+        localTable: localTable(),
+        localColumn: 'user_id',
+        refTable: refTable(),
+        refColumn: 'age',
+      );
+      expect(issue, isNotNull);
+      expect(issue!.kind, ErFkIssueKind.refColumnNotUnique);
+      expect(issue.refTable, 'users');
+      expect(issue.refColumn, 'age');
+    });
+
+    test('本地表没有主键 → localTableNoPrimary', () {
+      final issue = validateForeignKeyCandidate(
+        localTable: tableWith('logs', <ErColumn>[
+          column('message', type: 'TEXT'),
+        ]),
+        localColumn: 'message',
+        refTable: refTable(),
+        refColumn: 'id',
+      );
+      expect(issue!.kind, ErFkIssueKind.localTableNoPrimary);
+      expect(issue.localTable, 'logs');
+    });
+
+    test('被引用表没有主键 → refTableNoPrimary', () {
+      final issue = validateForeignKeyCandidate(
+        localTable: localTable(),
+        localColumn: 'user_id',
+        refTable: tableWith('logs', <ErColumn>[column('code', type: 'TEXT')]),
+        refColumn: 'code',
+      );
+      expect(issue!.kind, ErFkIssueKind.refTableNoPrimary);
+      expect(issue.refTable, 'logs');
+    });
+
+    test('类型明显不兼容（INTEGER vs VARCHAR）→ typeIncompatible', () {
+      final issue = validateForeignKeyCandidate(
+        localTable: localTable(),
+        localColumn: 'user_id',
+        refTable: refTable(),
+        refColumn: 'email',
+        refUniqueColumns: <String>{'email'},
+      );
+      expect(issue!.kind, ErFkIssueKind.typeIncompatible);
+      expect(issue.localType, 'INTEGER');
+      expect(issue.refType, 'VARCHAR(255)');
+    });
+
+    test('类型粗粒度兼容：整数/小数/布尔、文本/字符、日期时间互不误拦', () {
+      expect(erTypesCompatible('INTEGER', 'BIGINT'), isTrue);
+      expect(erTypesCompatible('int unsigned', 'decimal(18,2)'), isTrue);
+      expect(erTypesCompatible('TINYINT(1)', 'BOOLEAN'), isTrue);
+      expect(erTypesCompatible('VARCHAR(255)', 'TEXT'), isTrue);
+      expect(erTypesCompatible('DATE', 'DATETIME'), isTrue);
+      expect(erTypesCompatible('', 'TEXT'), isTrue);
+      expect(erTypesCompatible('weird_type', 'INTEGER'), isTrue);
+      expect(erTypesCompatible('INTEGER', 'TEXT'), isFalse);
+      expect(erTypesCompatible('TIMESTAMP', 'VARCHAR(32)'), isFalse);
+      expect(erTypesCompatible('BLOB', 'VARCHAR(255)'), isFalse);
+      expect(erTypesCompatible('POINT', 'INTEGER'), isTrue);
+    });
+
+    test('按列名推导的建议关系全部能通过前置校验', () {
+      final tables = <ErTable>[
+        tableWith('users', <ErColumn>[
+          column('id', type: 'INTEGER', primary: true),
+        ]),
+        tableWith('products', <ErColumn>[
+          column('id', type: 'INTEGER', primary: true),
+          column('user_id', type: 'INTEGER'),
+        ]),
+      ];
+      final byName = <String, ErTable>{
+        for (final item in tables) item.name: item,
+      };
+      final suggestions = suggestRelations(
+        tables: tables,
+        relationsByTable: <String, List<ErRelation>>{},
+      );
+      expect(suggestions.length, 1);
+      final suggestion = suggestions.single;
+      expect(
+        validateForeignKeyCandidate(
+          localTable: byName[suggestion.localTable]!,
+          localColumn: suggestion.localColumn,
+          refTable: byName[suggestion.refTable]!,
+          refColumn: suggestion.refColumn,
+        ),
+        isNull,
+      );
+    });
+  });
 }
 
 /// 测试辅助：关系的人读标签（模型没有 label 方法，用两端拼）。

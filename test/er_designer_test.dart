@@ -690,6 +690,136 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('画布上方图例说明外键方向与线型', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-legend')), findsOneWidget);
+    expect(find.text('外键关系：'), findsOneWidget);
+    // 与画布箭头方向一致：被约束（子表外键列）→ 约束（父表被引用主键）。
+    expect(find.text('被约束（外键列 / 子表）'), findsOneWidget);
+    expect(find.text('约束（被引用主键 / 父表）'), findsOneWidget);
+    expect(find.textContaining('虚线=建议外键'), findsOneWidget);
+    expect(find.byIcon(Icons.arrow_forward), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('前置校验失败时错误对话框可返回字段修改', (tester) async {
+    await setSurface(tester);
+    var backCalled = false;
+    final local = ErTable(
+      name: 'books',
+      columns: const <ErColumn>[
+        ErColumn(name: 'id', typeName: 'INTEGER', primary: true),
+        ErColumn(name: 'category_id', typeName: 'INTEGER'),
+      ],
+    );
+    final ref = ErTable(
+      name: 'categories',
+      columns: const <ErColumn>[
+        ErColumn(name: 'id', typeName: 'INTEGER', primary: true),
+        ErColumn(name: 'name', typeName: 'TEXT'),
+      ],
+    );
+    final issue = validateForeignKeyCandidate(
+      localTable: local,
+      localColumn: 'category_id',
+      refTable: ref,
+      refColumn: 'name',
+    );
+    expect(issue, isNotNull);
+    expect(issue!.kind, ErFkIssueKind.refColumnNotUnique);
+    final message = erFkIssueMessage(issue);
+    expect(message, contains('categories.name'));
+    expect(message, contains('不是主键或单列唯一列'));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(),
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => Btn(
+              'open',
+              onPressed: () => showForeignKeyBlockedDialog(
+                context,
+                message: message,
+                onRequestEditFields: () => backCalled = true,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await settle(tester, rounds: 6);
+    expect(find.text('无法创建外键'), findsWidgets);
+    expect(find.text(message), findsOneWidget);
+    expect(find.byKey(const ValueKey('er-back-to-fields')), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('er-back-to-fields')));
+    await settle(tester, rounds: 10);
+    expect(backCalled, isTrue);
+    expect(find.text('无法创建外键'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('未传 onRequestEditFields 时不显示返回字段按钮', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(),
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => Btn(
+              'open',
+              onPressed: () => showForeignKeyBlockedDialog(
+                context,
+                message: '表 logs 没有主键，无法创建外键。',
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await settle(tester, rounds: 6);
+    expect(find.text('无法创建外键'), findsWidgets);
+    expect(find.byKey(const ValueKey('er-back-to-fields')), findsNothing);
+    expect(find.widgetWithText(Btn, '关闭'), findsOneWidget);
+  });
+
+  testWidgets('SQLite 建议外键提示里可返回字段修改', (tester) async {
+    await setSurface(tester);
+    var backCalled = false;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['members', 'shops'],
+          height: 520,
+          onRequestEditFields: () => backCalled = true,
+        ),
+      ),
+    );
+    await settle(tester);
+    await tester.tap(find.byKey(const ValueKey('er-apply-suggestions')));
+    await settle(tester, rounds: 6);
+    expect(find.text('SQLite 不支持用 ALTER 新增外键'), findsWidgets);
+    expect(find.byKey(const ValueKey('er-back-to-fields')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-back-to-fields')));
+    await settle(tester, rounds: 10);
+    expect(backCalled, isTrue);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('showRelationDesigner 作为对话框入口可用', (tester) async {
     await setSurface(tester);
     await tester.pumpWidget(
@@ -740,6 +870,10 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('Undo auto-add'), findsOneWidget);
+    // 画布上方图例（英文）。
+    expect(find.text('Constrained (FK column / child)'), findsOneWidget);
+    expect(find.text('Constraining (referenced key / parent)'), findsOneWidget);
+    expect(find.textContaining('dashed = suggested FK'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
     // 表名 / 列名 / 箭头标签是数据，其它可见文案必须是英文。
     final offenders = <String>{};

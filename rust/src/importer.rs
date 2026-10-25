@@ -2452,6 +2452,73 @@ pub struct FileInfo {
     pub name: String,
 }
 
+/// 无法流式读取的格式的大小上限：5 GB。
+///
+/// 能流式读的格式（CSV/JSON/Excel 全格式）只按行处理，大小不受这个限制；
+/// 只有「必须整表载入内存」的读取路径才受它约束——超过 5 GB 直接拒绝，
+/// 避免把一台机器的内存吃光。提醒文案同时会出现在 inspect 的 warnings 里。
+pub const MAX_NON_STREAMING_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// 字节数 → 给用户看的容量（1 位小数）。
+pub fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let value = bytes as f64;
+    if value >= KB * KB * KB {
+        format!("{:.1} GB", value / (KB * KB * KB))
+    } else if value >= KB * KB {
+        format!("{:.1} MB", value / (KB * KB))
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// 单文件过大时的提醒（可流式读取也要提醒耗时）。
+fn large_file_warning(size: u64) -> Option<String> {
+    if size <= MAX_NON_STREAMING_BYTES {
+        return None;
+    }
+    Some(format!(
+        "文件约 {}（超过 5 GB）：会逐行流式读取，耗时与磁盘 IO 会明显增加；建议分批导入或先压缩无关列。",
+        format_size(size)
+    ))
+}
+
+/// 超过 5 GB 且该格式无法流式读取时的拒绝文案。
+pub fn non_streaming_size_error(size: u64, format: &str) -> String {
+    format!(
+        "文件约 {}，超过 5 GB；{} 目前无法流式读取（需要整表载入内存），已拒绝导入。请拆分文件，或转换为 xlsx / CSV 后再试。",
+        format_size(size),
+        format
+    )
+}
+
+/// 大文件护栏：只对「超过 5 GB 且必须整表载入」的文件报错。
+///
+/// 正常文件（≤ 5 GB）零开销直接返回；超过 5 GB 时才做一次格式识别 +
+/// 轻量 inspect，判断该格式是否流式。
+pub fn ensure_large_file_streamable(path: &str) -> AppResult<()> {
+    ensure_streamable_with_limit(path, MAX_NON_STREAMING_BYTES)
+}
+
+fn ensure_streamable_with_limit(path: &str, limit: u64) -> AppResult<()> {
+    let info = file_info(path)?;
+    if info.size <= limit {
+        return Ok(());
+    }
+    if let Some(kind) = crate::excel_import::detect(path)? {
+        let inspected = crate::excel_stream::inspect_workbook(path, kind)?;
+        if !inspected.streaming {
+            return Err(AppError::bad(non_streaming_size_error(
+                info.size,
+                kind.format(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn file_info(path: &str) -> AppResult<FileInfo> {
     let path = path.trim();
     if path.is_empty() {
@@ -2508,6 +2575,9 @@ pub fn inspect(path: &str) -> AppResult<Value> {
     let tail = read_suffix(path, 8 * 1024)?;
     let (bom, encoding) = detect_bom(&head);
     let mut warnings: Vec<String> = Vec::new();
+    if let Some(warning) = large_file_warning(info.size) {
+        warnings.push(warning);
+    }
 
     // 内容优先：xlsx/xls/xlsb/ods/SpreadsheetML 都是工作簿，走上表分支。
     if let Some(kind) = crate::excel_import::detect(path)? {
@@ -2640,6 +2710,12 @@ fn inspect_excel(
     mut warnings: Vec<String>,
 ) -> AppResult<Value> {
     let mut inspected = crate::excel_stream::inspect_workbook(path, kind)?;
+    if !inspected.streaming && info.size > MAX_NON_STREAMING_BYTES {
+        return Err(AppError::bad(non_streaming_size_error(
+            info.size,
+            kind.format(),
+        )));
+    }
     warnings.append(&mut inspected.warnings);
     if inspected.sheets.len() > 1 {
         warnings.push(format!(
@@ -2791,6 +2867,7 @@ fn push_schema_row(
 /// (header excluded) and returns the inferred schema used by the "create tables
 /// from file" wizard. The echo itself is still capped by the limit argument.
 pub fn preview(spec: &ParseSpec, limit: usize) -> AppResult<Value> {
+    ensure_large_file_streamable(&spec.path)?;
     let info = file_info(&spec.path)?;
     let limit = limit.clamp(1, MAX_PREVIEW_RECORDS);
     let mut scanner = RecordScanner::open(spec)?;
@@ -2977,6 +3054,7 @@ fn issue_json(index: u64, line: u64, offset: u64, message: &str, text: &str) -> 
 /// Used by the "试插入" step: the returned values are inserted inside a rolled
 /// back transaction so the UI can show the exact effect without modifying data.
 pub fn probe_first_row(spec: &ValidateSpec, table_columns: &[TableColumn]) -> AppResult<Value> {
+    ensure_large_file_streamable(&spec.parse.path)?;
     let mapping = spec
         .mapping
         .as_ref()
@@ -3083,6 +3161,7 @@ pub fn validate(
     cancel: &AtomicBool,
 ) -> AppResult<Value> {
     let started = Instant::now();
+    ensure_large_file_streamable(&spec.parse.path)?;
     let max_issues = max_issues.clamp(1, 1_000);
     let mut resolved = None;
     if let Some(mapping) = &spec.mapping {
@@ -3277,6 +3356,7 @@ pub async fn execute(
     cancel: &AtomicBool,
 ) -> AppResult<Value> {
     let started = Instant::now();
+    ensure_large_file_streamable(&spec.validate.parse.path)?;
     let mapping = spec
         .validate
         .mapping
@@ -4660,6 +4740,44 @@ mod excel_tests {
     fn fixture(name: &str) -> String {
         format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
     }
+
+    #[test]
+    fn format_size_is_human_readable() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(2048), "2.0 KB");
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_size(MAX_NON_STREAMING_BYTES), "5.0 GB");
+        assert_eq!(format_size(MAX_NON_STREAMING_BYTES * 2), "10.0 GB");
+    }
+
+    #[test]
+    fn non_streaming_size_error_names_format_and_limit() {
+        let message = non_streaming_size_error(
+            MAX_NON_STREAMING_BYTES + 1,
+            "xls",
+        );
+        assert!(message.contains("5.0 GB"), "{message}");
+        assert!(message.contains("xls"), "{message}");
+        assert!(message.contains("无法流式读取"), "{message}");
+    }
+
+    #[test]
+    fn large_file_warning_starts_above_five_gigabytes() {
+        assert!(large_file_warning(MAX_NON_STREAMING_BYTES).is_none());
+        let warning = large_file_warning(MAX_NON_STREAMING_BYTES + 1).expect("warning");
+        assert!(warning.contains("超过 5 GB"), "{warning}");
+        assert!(warning.contains("流式读取"), "{warning}");
+    }
+
+    #[test]
+    fn streamable_formats_ignore_the_five_gigabyte_limit() {
+        // 所有 Excel 格式现在都是流式：把阈值压到 1 字节也不该拒绝。
+        for fixture_name in [XLSX, XLS] {
+            let path = fixture(fixture_name);
+            ensure_streamable_with_limit(&path, 1).expect(fixture_name);
+        }
+    }
+
 
     fn temp_file(name: &str, content: &str) -> String {
         let dir = std::env::temp_dir().join(format!("rma-excel-import-{}", uuid::Uuid::new_v4()));

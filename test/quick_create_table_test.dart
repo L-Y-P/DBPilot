@@ -504,6 +504,135 @@ void main() {
     });
   });
 
+  group('主键兜底与生成列', () {
+    test('没有主键时可一键插入自增 id（第一列、generated、唯一主键）', () {
+      final plan = planFor(
+        columns: <QuickColumn>[
+          QuickColumn(
+            name: 'name',
+            sourceLabel: 'name',
+            sourceIndex: 0,
+            inferred: 'text',
+            sqlType: 'TEXT',
+          ),
+        ],
+      );
+      expect(planHasPrimary(plan), isFalse);
+      final id = addGeneratedPrimaryKey(plan, 'sqlite');
+      expect(plan.columns.first, same(id));
+      expect(id.name, 'id');
+      expect(id.sourceIndex, -1);
+      expect(id.sourceLabel, '');
+      expect(id.generated, isTrue);
+      expect(id.primary, isTrue);
+      expect(id.nullable, isFalse);
+      expect(id.inferred, 'integer');
+      expect(id.sqlType, 'INTEGER');
+      expect(plan.columns.where((column) => column.primary).length, 1);
+    });
+
+    test('补 id 会取消原主键；已有 id 字段时生成 id_2', () {
+      final plan = planFor(); // id(primary) + name
+      expect(planHasPrimary(plan), isTrue);
+      final generated = addGeneratedPrimaryKey(plan, 'mysql');
+      expect(generated.name, 'id_2');
+      expect(plan.columns.first, same(generated));
+      // 原 id 不再是主键，整张表只剩生成列一个主键。
+      expect(plan.columns[1].name, 'id');
+      expect(plan.columns[1].primary, isFalse);
+      expect(plan.columns.where((column) => column.primary).length, 1);
+      expect(generated.sqlType, 'BIGINT');
+    });
+
+    test('创建载荷：生成列 auto_increment=true；取消主键后降级为普通可空列', () {
+      final plan = planFor(
+        columns: <QuickColumn>[
+          QuickColumn(
+            name: 'name',
+            sourceLabel: 'name',
+            sourceIndex: 0,
+            inferred: 'text',
+            sqlType: 'TEXT',
+          ),
+        ],
+      );
+      final id = addGeneratedPrimaryKey(plan, 'mysql');
+      final body = createTableBodyFor(plan, 'mysql');
+      final idBody = (body['columns'] as List).first as Map;
+      expect(idBody['name'], 'id');
+      expect(idBody['primary'], isTrue);
+      expect(idBody['auto_increment'], isTrue);
+      expect(idBody['nullable'], isFalse);
+
+      // 用户取消了这个生成列的主键：保留列和名字，但不再自增；没有源数据，
+      // 必须允许为空（否则 INSERT 会因缺值失败）。
+      id.primary = false;
+      id.nullable = true;
+      final downgraded = createTableBodyFor(plan, 'mysql');
+      final idColumn = (downgraded['columns'] as List).first as Map;
+      expect(idColumn['primary'], isFalse);
+      expect(idColumn['auto_increment'], isFalse);
+      expect(idColumn['nullable'], isTrue);
+    });
+
+    test('导入 mapping 排除 generated 列', () {
+      final plan = planFor(
+        columns: <QuickColumn>[
+          QuickColumn(
+            name: 'name',
+            sourceLabel: 'name',
+            sourceIndex: 0,
+            inferred: 'text',
+            sqlType: 'TEXT',
+          ),
+          QuickColumn(
+            name: 'score',
+            sourceLabel: 'score',
+            sourceIndex: 1,
+            inferred: 'decimal',
+            sqlType: 'NUMERIC',
+          ),
+        ],
+      );
+      addGeneratedPrimaryKey(plan, 'sqlite');
+      final mapping = mappingParamsFor(plan);
+      final columns = (mapping['columns'] as List).cast<Map>();
+      expect(columns.length, 2);
+      expect(columns.map((column) => column['column']).toList(),
+          <String>['name', 'score']);
+      expect(columns.any((column) => column['column'] == 'id'), isFalse);
+
+      final params = importParamsFor(
+        path: '/tmp/a.csv',
+        plan: plan,
+        inspect: <String, dynamic>{
+          'read': <String, dynamic>{'mode': 'line'},
+          'fields': <String, dynamic>{'mode': 'delimited', 'header': true},
+        },
+        database: 'main',
+      );
+      final mappings =
+          ((params['mapping'] as Map)['columns'] as List).cast<Map>();
+      expect(mappings.map((column) => column['column']).toList(),
+          <String>['name', 'score']);
+    });
+
+    test('没有主键不阻断校验（只提醒，不报错）', () {
+      final plan = planFor(
+        columns: <QuickColumn>[
+          QuickColumn(
+            name: 'name',
+            sourceLabel: 'name',
+            sourceIndex: 0,
+            inferred: 'text',
+            sqlType: 'TEXT',
+          ),
+        ],
+      );
+      expect(validatePlans(<QuickTablePlan>[plan]), isNull);
+    });
+  });
+
   group('英文模式文案', () {
     test('向导与入口文案都有英文映射', () {
       I18n.setLang(AppLang.en);
@@ -596,6 +725,45 @@ void main() {
     await settle(tester, rounds: 6);
   }
 
+  /// 打开向导并返回 State 句柄（测试要断言内部状态时用）。
+  Future<GlobalKey<QuickCreateTableWizardState>> pumpWizardWithKey(
+    WidgetTester tester,
+    String path,
+    Notice notice,
+  ) async {
+    final stateKey = GlobalKey<QuickCreateTableWizardState>();
+    await tester.pumpWidget(MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: buildAppTheme(),
+      home: Scaffold(
+        body: Builder(
+          builder: (context) => Btn(
+            'open-quick-create-key',
+            onPressed: () => showQuickCreateTableWizard(
+              context,
+              database: 'main',
+              notice: notice,
+              initialPath: path,
+              stateKey: stateKey,
+            ),
+          ),
+        ),
+      ),
+    ));
+    await tester.tap(find.text('open-quick-create-key'));
+    await settle(tester, rounds: 6);
+    return stateKey;
+  }
+
+  Future<void> setFieldText(
+      WidgetTester tester, String key, String text) async {
+    final field = find.byKey(ValueKey<String>(key));
+    expect(field, findsOneWidget, reason: 'field $key is missing');
+    final textField = find.descendant(of: field, matching: find.byType(TextField));
+    await tester.enterText(textField, text);
+    await tester.pump();
+  }
+
   String fieldText(WidgetTester tester, String key) {
     final field = find.byKey(ValueKey<String>(key));
     expect(field, findsOneWidget, reason: 'field $key is missing');
@@ -631,14 +799,24 @@ void main() {
         .toList();
   }
 
-  /// 走到「全部完成」为止；返回 null 表示成功，否则返回页面上的错误文本。
+  Future<List<dynamic>> queryRows(WidgetTester tester, String sql) async {
+    final res = await tester.runAsync(() => Api.instance.query(sql));
+    return ((res!['results'] as List).first as Map)['rows'] as List;
+  }
+
+  Future<String> tableDdl(WidgetTester tester, String table) async {
+    final ddl = await tester.runAsync(() => Api.instance.ddl('main', table));
+    return (ddl?['ddl'] ?? '').toString();
+  }
+
+  /// 走到「全部表的数据都导入完成」为止；返回 null 表示成功，否则返回页面错误。
   Future<String?> runUntilImported(WidgetTester tester) async {
     for (var i = 0; i < 240; i++) {
       await settle(tester, rounds: 1);
-      if (find.textContaining('全部表已创建并导入完成').evaluate().isNotEmpty) {
+      if (find.textContaining('全部表的数据都导入完成').evaluate().isNotEmpty) {
         return null;
       }
-      final failed = find.textContaining('执行失败').evaluate().isNotEmpty ||
+      final failed = find.textContaining('导入失败').evaluate().isNotEmpty ||
           find.textContaining('等待导入任务超时').evaluate().isNotEmpty;
       if (failed) {
         final texts = tester
@@ -679,28 +857,33 @@ void main() {
     expect(find.text('源列名'), findsOneWidget);
     expect(find.text('首行是列名'), findsOneWidget);
 
-    // 下一步 → 创建并导入，启动执行。
+    // 下一步：先建空表 → 进入「建立关联」步骤（表已存在但还没有数据）。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    expect(find.textContaining('先在这张画布上把表之间的关系连好'), findsOneWidget);
+    final designer =
+        tester.widget<RelationDesigner>(find.byType(RelationDesigner));
+    expect(designer.initialTables, <String>['people']);
+    expect(designer.maxTables, kRelationSeedLimit);
+    expect(await tableNames(tester), contains('people'));
+    expect(await countRows(tester, 'people'), 0,
+        reason: '关系步骤时只建空表，不导入数据');
+
+    // 下一步 → 导入数据；第 3 步只做导入，不再 CREATE TABLE。
     await tester.tap(primaryButton());
     await settle(tester, rounds: 4);
     expect(find.text('执行计划'), findsOneWidget);
     await tester.tap(primaryButton());
-
     final failure = await runUntilImported(tester);
     expect(failure, isNull, reason: 'import failed: $failure');
 
     // 真实数据库里：1 张表、3 行、类型按推断创建。
-    expect(await tableNames(tester), contains('people'));
     expect(await countRows(tester, 'people'), 3);
     final types = await columnTypes(tester, 'people');
     expect(types[0], contains('INT'));
     expect(types[1], contains('TEXT'));
     expect(types[2], anyOf(contains('NUM'), contains('REAL')));
-
-    // 下一步 → 建立关联：嵌入真实的关系设计器。
-    await tester.tap(primaryButton());
-    await settle(tester, rounds: 16);
-    expect(find.byType(RelationDesigner), findsOneWidget);
-    expect(find.textContaining('关系修改会立即写入数据库'), findsOneWidget);
 
     // 完成：关闭向导并提示创建数量。
     await tester.tap(primaryButton());
@@ -785,9 +968,18 @@ void main() {
     expect(fieldText(tester, 'quick-table-name-0'), 'Orders');
     expect(fieldText(tester, 'quick-table-name-1'), 'Items');
 
+    // 第 1 步 → 第 2 步：先建 2 张空表，再进入关系步骤。
     await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    expect(await tableNames(tester),
+        containsAll(<String>['Orders', 'Items']));
+    expect(await countRows(tester, 'Orders'), 0);
+    expect(await countRows(tester, 'Items'), 0);
+
+    await tester.tap(primaryButton()); // 下一步：导入数据
     await settle(tester, rounds: 4);
-    await tester.tap(primaryButton());
+    await tester.tap(primaryButton()); // 开始导入
     final failure = await runUntilImported(tester);
     expect(failure, isNull, reason: 'multi-sheet import failed: $failure');
 
@@ -842,9 +1034,16 @@ void main() {
     expect(find.byKey(const ValueKey<String>('quick-table-name-1')),
         findsNothing);
 
+    // 第 1 步 → 第 2 步：建空表并进入关系步骤。
     await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    expect(await tableNames(tester), contains('Beta'));
+    expect(await countRows(tester, 'Beta'), 0);
+
+    await tester.tap(primaryButton()); // 下一步：导入数据
     await settle(tester, rounds: 4);
-    await tester.tap(primaryButton());
+    await tester.tap(primaryButton()); // 开始导入
     final failure = await runUntilImported(tester);
     expect(failure, isNull, reason: 'custom-sheet import failed: $failure');
 
@@ -893,22 +1092,37 @@ void main() {
           reason: '工作表 ${sheets[i]} 的默认表名不对');
     }
 
+    // 第 1 步 → 第 2 步：建 3 张空表并进入关系步骤；种子最多 10 张。
     await tester.tap(primaryButton());
-    await settle(tester, rounds: 4);
-    await tester.tap(primaryButton());
-    final failure = await runUntilImported(tester);
-    expect(failure, isNull, reason: 'xlsx import failed: $failure');
-
-    // 每个可见工作表都建了表并导入了数据（含中文表名）。
+    await settle(tester, rounds: 60);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    final designer =
+        tester.widget<RelationDesigner>(find.byType(RelationDesigner));
+    expect(designer.maxTables, 10);
+    expect(designer.initialTables.length, sheets.length);
     final names = await tableNames(tester);
     for (final sheet in sheets) {
       final table = sanitizeIdentifier(sheet);
       expect(names, contains(table));
+      expect(await countRows(tester, table), 0,
+          reason: '关系步骤时表应为空');
+    }
+
+    await tester.tap(primaryButton()); // 下一步：导入数据
+    await settle(tester, rounds: 4);
+    await tester.tap(primaryButton()); // 开始导入
+    final failure = await runUntilImported(tester);
+    expect(failure, isNull, reason: 'xlsx import failed: $failure');
+
+    // 每个可见工作表都导入了数据（含中文表名）。
+    for (final sheet in sheets) {
+      final table = sanitizeIdentifier(sheet);
       expect(await countRows(tester, table), greaterThan(0));
     }
   });
 
-  testWidgets('State 测试钩子：注入文件 → 工作表与字段 → 创建并导入', (tester) async {
+  testWidgets('State 测试钩子：注入文件 → 工作表与字段 → 建空表 → 导入数据',
+      (tester) async {
     tester.view.physicalSize = const Size(1400, 1000);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -950,7 +1164,7 @@ void main() {
     await settle(tester, rounds: 16);
     expect(find.text('数据文件'), findsOneWidget);
 
-    // 第 1 步 → 第 2 步：分析文件并生成每张表的字段。
+    // 第 1 步 → 第 1 步（分析文件、生成字段）。
     await tester.runAsync(state.advanceForTest);
     await settle(tester, rounds: 24);
     expect(state.stepForTest, 1);
@@ -958,15 +1172,22 @@ void main() {
     expect(find.byKey(const ValueKey<String>('quick-table-name-0')),
         findsOneWidget);
 
-    // 第 2 步 → 第 3 步（创建并导入）。
-    await tester.runAsync(state.advanceForTest);
-    await settle(tester, rounds: 4);
-    expect(state.stepForTest, 2);
-
+    // 字段 → 建空表 + 建立关联（第 2 步）。
     await tester.runAsync(state.advanceForTest);
     await settle(tester, rounds: 24);
-    expect(state.importsDoneForTest, isTrue);
+    expect(state.stepForTest, 2);
+    expect(state.allTablesCreatedForTest, isTrue);
     expect(state.createdTablesForTest, <String>['hook_people']);
+    expect(await countRows(tester, 'hook_people'), 0);
+
+    // 关系 → 导入数据（第 3 步）。
+    await tester.runAsync(state.advanceForTest);
+    await settle(tester, rounds: 4);
+    expect(state.stepForTest, 3);
+
+    await tester.runAsync(state.advanceForTest); // 开始导入
+    await settle(tester, rounds: 24);
+    expect(state.importsDoneForTest, isTrue);
     expect(await countRows(tester, 'hook_people'), 3);
   });
 
@@ -1013,6 +1234,348 @@ void main() {
     await settle(tester, rounds: 6);
     expect(find.text('INTEGER'), findsWidgets);
     expect(find.text('TEXT'), findsWidgets);
+  });
+
+  testWidgets('无主键表：提示 + 一键自增 id 主键 + 导入时数据库生成 id', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(() => writeFile(
+          // 第一列故意重复：Rust 对「首列且值唯一」会给 primary_candidate，
+          // 重复值才能构造出「源文件没有主键」的场景。
+          'nopk.csv',
+          'name,score\nAda,9.5\nAda,8\n',
+        ));
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    await pumpWizard(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    // 第 1 步：醒目提示 + 一键补主键按钮。
+    expect(find.textContaining('所有表都没有主键'), findsOneWidget);
+    expect(find.textContaining('未设置主键'), findsWidgets);
+    expect(find.text('添加自增 id 主键'), findsOneWidget);
+    final state = tester.state<QuickCreateTableWizardState>(
+        find.byType(QuickCreateTableWizard));
+    expect(
+        state.plansForTest.single.columns.any((column) => column.primary),
+        isFalse);
+
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    final plan = state.plansForTest.single;
+    expect(plan.columns.first.name, 'id');
+    expect(plan.columns.first.generated, isTrue);
+    expect(plan.columns.first.primary, isTrue);
+    expect(plan.columns.where((column) => column.primary).length, 1);
+    expect(find.textContaining('所有表都没有主键'), findsNothing);
+
+    // 第 1→2 步：建空表并进入关系步骤（已有主键，画布上方不再提示）。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 30);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    expect(find.textContaining('请返回工作表与字段设置主键'), findsNothing);
+    expect(await tableNames(tester), contains('nopk'));
+    expect(await countRows(tester, 'nopk'), 0);
+
+    // 第 3 步：导入；generated id 不参与 mapping，由数据库生成。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 4);
+    await tester.tap(primaryButton());
+    final failure = await runUntilImported(tester);
+    expect(failure, isNull, reason: 'nopk import failed: $failure');
+    expect(await countRows(tester, 'nopk'), 2);
+    final ddl = await tableDdl(tester, 'nopk');
+    expect(ddl.toUpperCase(), contains('AUTOINCREMENT'));
+    final ids =
+        await queryRows(tester, 'SELECT id FROM "nopk" ORDER BY id;');
+    expect(ids.map((row) => (row as List).first).toList(), <int>[1, 2]);
+
+    await tester.tap(primaryButton()); // 完成
+    await settle(tester, rounds: 6);
+    expect(find.byType(QuickCreateTableWizard), findsNothing);
+    expect(notice.message, contains('已创建 1 张表'));
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('取消原主键后出现提示；一键 id 会取消原主键', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(() => writeFile(
+          'pkreset.csv',
+          'id,name\n1,Ada\n2,Bob\n',
+        ));
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    await pumpWizard(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    // schema 识别出了 id 主键：此时没有提示。
+    expect(find.textContaining('未设置主键'), findsNothing);
+
+    // 用户取消原主键 → 提示立即出现。
+    await tester
+        .tap(find.byKey(const ValueKey<String>('quick-col-pk-0-0')));
+    await settle(tester, rounds: 2);
+    expect(find.textContaining('未设置主键'), findsWidgets);
+    final state = tester.state<QuickCreateTableWizardState>(
+        find.byType(QuickCreateTableWizard));
+    expect(state.plansForTest.single.columns.any((column) => column.primary),
+        isFalse);
+
+    // 一键补 id：原 id 取消主键，生成列成为唯一主键（名字避免重复 → id_2）。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    final plan = state.plansForTest.single;
+    expect(plan.columns.first.name, 'id_2');
+    expect(plan.columns.first.generated, isTrue);
+    expect(plan.columns.first.primary, isTrue);
+    expect(plan.columns[1].name, 'id');
+    expect(plan.columns[1].primary, isFalse);
+    expect(plan.columns.where((column) => column.primary).length, 1);
+    expect(find.textContaining('未设置主键'), findsNothing);
+
+    // 建表 + 导入：原始 id 列来自文件，生成 id_2 由数据库生成。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 30);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 4);
+    await tester.tap(primaryButton());
+    final failure = await runUntilImported(tester);
+    expect(failure, isNull, reason: 'pkreset import failed: $failure');
+    expect(await countRows(tester, 'pkreset'), 2);
+    final ids = await queryRows(tester, 'SELECT id FROM "pkreset" ORDER BY id;');
+    expect(ids.map((row) => (row as List).first).toList(), <int>[1, 2]);
+    final generatedIds =
+        await queryRows(tester, 'SELECT id_2 FROM "pkreset" ORDER BY id_2;');
+    expect(generatedIds.map((row) => (row as List).first).toList(),
+        <int>[1, 2]);
+
+    await tester.tap(primaryButton()); // 完成
+    await settle(tester, rounds: 6);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+
+  testWidgets('取消生成列的主键：降级为普通列且提示重新出现', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(() => writeFile(
+          'pkdowngrade.csv',
+          'name\nAda\nAda\n',
+        ));
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    // 先一键补 id 主键。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    var state = stateKey.currentState!;
+    final generated = state.plansForTest.single.columns.first;
+    expect(generated.generated, isTrue);
+    expect(generated.primary, isTrue);
+    expect(find.textContaining('未设置主键'), findsNothing);
+
+    // 用户又取消了生成列的主键：列保留但降级为普通可空列，提示重新出现。
+    await tester
+        .tap(find.byKey(const ValueKey<String>('quick-col-pk-0-0')));
+    await settle(tester, rounds: 2);
+    state = stateKey.currentState!;
+    final downgraded = state.plansForTest.single.columns.first;
+    expect(downgraded.name, 'id');
+    expect(downgraded.generated, isTrue);
+    expect(downgraded.primary, isFalse);
+    expect(downgraded.nullable, isTrue,
+        reason: '生成列没有源数据，取消主键后必须允许为空');
+    expect(state.plansForTest.single.columns.any((column) => column.primary),
+        isFalse);
+    expect(find.textContaining('所有表都没有主键'), findsOneWidget);
+
+    // 载荷侧行为：保留列但不自增。
+    final body = createTableBodyFor(state.plansForTest.single, 'sqlite');
+    final idColumn = (body['columns'] as List).first as Map;
+    expect(idColumn['primary'], isFalse);
+    expect(idColumn['auto_increment'], isFalse);
+    expect(idColumn['nullable'], isTrue);
+  });
+
+  testWidgets('建表失败：留在工作表与字段步骤并显示错误', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(() => writeFile(
+          'failcreate.csv',
+          'id,name\n1,Ada\n',
+        ));
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    // 把表名改成一个已存在的表，让 CREATE TABLE 真的失败。
+    await setFieldText(tester, 'quick-table-name-0', 'failcreate_conflict');
+    await tester.runAsync(() => Api.instance.query(
+        'CREATE TABLE failcreate_conflict (x INTEGER);',
+        'main'));
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 16);
+
+    final state = stateKey.currentState!;
+    expect(state.stepForTest, 1, reason: '建表失败必须停在工作表与字段步骤');
+    expect(find.byType(RelationDesigner), findsNothing);
+    expect(state.errorForTest, isNotNull);
+    expect(state.errorForTest!, contains('failcreate_conflict'));
+    expect(find.text('源列名'), findsOneWidget);
+    expect(state.createdTablesForTest, isEmpty);
+  });
+
+
+  testWidgets('只有部分表没有主键：全局提示点名具体表，仍可继续', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final fixture = _spreadsheetMl(<String, List<List<Object?>>>{
+      'PkSheet': <List<Object?>>[
+        <Object?>['id', 'label'],
+        <Object?>[1, 'a'],
+        <Object?>[2, 'b'],
+      ],
+      'NoPkSheet': <List<Object?>>[
+        // 第一列重复 → 不会被识别成主键候选。
+        <Object?>['name', 'score'],
+        <Object?>['Ada', 1],
+        <Object?>['Ada', 2],
+      ],
+    });
+    final path = await tester.runAsync(() => writeFile('mixedpk.xls', fixture));
+    final capability =
+        await tester.runAsync(() => Api.instance.importInspect(path!));
+    final sheets = capability?['sheets'];
+    if (sheets is! List || sheets.isEmpty) {
+      markTestSkipped('rust-excel inspect.sheets 契约未就绪');
+      return;
+    }
+
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, path!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+
+    // 部分表缺主键：提示点名 NoPkSheet，且不把有主键的 PkSheet 也算进去。
+    final warnings = tester
+        .widgetList<AlertBox>(find.byType(AlertBox))
+        .where((box) => box.message.contains('以下表没有主键'))
+        .toList();
+    expect(warnings, hasLength(1), reason: '应出现一条部分表缺主键的全局提示');
+    // 提示只点名缺主键的那张表（精确匹配结尾，避免 PkSheet 是 NoPkSheet 的
+    // 子串导致误判）。
+    expect(warnings.single.message, endsWith('：NoPkSheet'));
+    expect(stateKey.currentState!.plansForTest.length, 2);
+    expect(
+        stateKey.currentState!.plansForTest[0].columns
+            .any((column) => column.primary),
+        isTrue);
+    expect(
+        stateKey.currentState!.plansForTest[1].columns
+            .any((column) => column.primary),
+        isFalse);
+
+    // 只提醒不阻断：仍然能建空表并进入关系步骤。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    expect(find.textContaining('没有主键，不能作为外键的被引用表'), findsWidgets);
+    expect(
+        stateKey.currentState!.createdTablesWithoutPrimaryForTest,
+        <String>['NoPkSheet']);
+
+    // 关闭（只建了空表）→ 明确提示未导入数据。
+    await tester.tap(find.text('关闭'));
+    await settle(tester, rounds: 6);
+    expect(notice.message, contains('未导入数据'));
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('无主键表在关系步骤提示；返回字段会删除已建空表', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(() => writeFile(
+          // 重复的姓名：避免首列被识别成唯一主键候选。
+          'backfields.csv',
+          'name\nAda\nAda\n',
+        ));
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    // 建空表 → 关系步骤：没有主键的表在画布上方提示 + 返回按钮。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 30);
+    var state = stateKey.currentState!;
+    expect(state.stepForTest, 2);
+    expect(find.byType(RelationDesigner), findsOneWidget);
+    expect(find.textContaining('没有主键，不能作为外键的被引用表'), findsWidgets);
+    expect(
+        find.byKey(const ValueKey<String>('quick-relations-back')),
+        findsOneWidget);
+    expect(state.createdTablesWithoutPrimaryForTest, <String>['backfields']);
+    expect(await tableNames(tester), contains('backfields'));
+
+    // 返回字段步骤：删除本次创建的空表。
+    await tester
+        .tap(find.byKey(const ValueKey<String>('quick-relations-back')));
+    await settle(tester, rounds: 20);
+    state = stateKey.currentState!;
+    expect(state.stepForTest, 1);
+    expect(find.text('源列名'), findsOneWidget);
+    expect(await tableNames(tester), isNot(contains('backfields')));
+    expect(state.createdTablesForTest, isEmpty);
+
+    // 补上自增 id 后可以重新建表并进入关系步骤。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 30);
+    state = stateKey.currentState!;
+    expect(state.stepForTest, 2);
+    expect(await tableNames(tester), contains('backfields'));
+    expect(state.createdTablesWithoutPrimaryForTest, isEmpty);
+
+    // 关闭（只建了空表 → 提示未导入）。
+    await tester.tap(find.text('关闭'));
+    await settle(tester, rounds: 6);
+    expect(notice.message, contains('未导入数据'));
+    await tester.pump(const Duration(seconds: 4));
   });
 }
 

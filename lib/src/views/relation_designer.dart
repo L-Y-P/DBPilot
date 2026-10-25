@@ -84,12 +84,81 @@ String erSuggestionTooltip(ErRelation relation) {
   return pickText('$label（$reason）', '$label ($reason)');
 }
 
+/// 外键前置校验问题的中英文案（含具体表 / 列名）。
+String erFkIssueMessage(ErFkIssue issue) {
+  final localTable = issue.localTable;
+  final localColumn = issue.localColumn;
+  final refTable = issue.refTable;
+  final refColumn = issue.refColumn;
+  switch (issue.kind) {
+    case ErFkIssueKind.localTableNoPrimary:
+      return pickText(
+        '表 $localTable 没有主键，无法创建外键；请先给该表设置主键。',
+        'Table $localTable has no primary key, so a foreign key cannot be created; set a primary key first.',
+      );
+    case ErFkIssueKind.refTableNoPrimary:
+      return pickText(
+        '被引用表 $refTable 没有主键，无法作为外键目标；请先给该表设置主键。',
+        'Referenced table $refTable has no primary key and cannot be a foreign key target; set a primary key first.',
+      );
+    case ErFkIssueKind.refColumnNotUnique:
+      return pickText(
+        '目标列 $refTable.$refColumn 不是主键或单列唯一列，数据库不允许作为外键引用；'
+            '请先把该列设为 PRIMARY KEY 或 UNIQUE，或改引用它的主键列。',
+        'Target column $refTable.$refColumn is not a primary key or single-column unique key and cannot be referenced; '
+            'make it PRIMARY KEY / UNIQUE, or reference its primary key instead.',
+      );
+    case ErFkIssueKind.typeIncompatible:
+      return pickText(
+        '类型不一致：本地列 $localTable.$localColumn（${issue.localType}）与目标列 '
+            '$refTable.$refColumn（${issue.refType}）类型不兼容。',
+        'Type mismatch: local column $localTable.$localColumn (${issue.localType}) and target column '
+            '$refTable.$refColumn (${issue.refType}) are not compatible.',
+      );
+  }
+}
+
+/// 关系创建被本地前置校验阻止时的对话框；回调非空时提供「返回工作表与字段修改」。
+Future<void> showForeignKeyBlockedDialog(
+  BuildContext context, {
+  required String message,
+  VoidCallback? onRequestEditFields,
+}) {
+  return showAppModal<void>(
+    context: context,
+    title: pickText('无法创建外键', 'Cannot create the foreign key'),
+    builder: (context) => AlertBox(message),
+    actions: <Widget>[
+      Builder(
+        builder: (context) =>
+            Btn('关闭', onPressed: () => Navigator.of(context).pop()),
+      ),
+      if (onRequestEditFields != null)
+        Builder(
+          builder: (context) => Btn(
+            '返回工作表与字段修改',
+            key: const ValueKey('er-back-to-fields'),
+            primary: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              onRequestEditFields();
+            },
+          ),
+        ),
+    ],
+  );
+}
+
 /// E-R 关系设计器。
 ///
 /// 公开接口由 §5.1 固定（导入向导第 5 步与快速建表向导第 4 步都依赖它）：
 /// [database] 是当前数据库 / 模式，[initialTables] 是打开时预置加入的表，
 /// [onChanged] 在关系变化（创建 / 删除 / 建中间表）后回调，[maxTables] 是画布
 /// 上限（默认 10），[height] 决定嵌入高度，[compact] 让向导内嵌更紧凑。
+///
+/// [onRequestEditFields] 非空时（快速建表向导第 4 步会传）：关系创建失败 / 被
+/// 前置校验阻止 / SQLite 不支持 ALTER 的提示里都会多出一个「返回工作表与字段
+/// 修改」按钮，点击后关闭提示并调用它，让宿主回到字段编辑步骤。
 class RelationDesigner extends StatefulWidget {
   const RelationDesigner({
     super.key,
@@ -99,6 +168,7 @@ class RelationDesigner extends StatefulWidget {
     this.maxTables = 10,
     this.height = 460,
     this.compact = false,
+    this.onRequestEditFields,
   });
 
   final String database;
@@ -107,6 +177,7 @@ class RelationDesigner extends StatefulWidget {
   final int maxTables;
   final double height;
   final bool compact;
+  final VoidCallback? onRequestEditFields;
 
   @override
   State<RelationDesigner> createState() => _RelationDesignerState();
@@ -617,12 +688,20 @@ class _RelationDesignerState extends State<RelationDesigner> {
   /// 按钮/建议线在 SQLite 下也保持可点：点击弹明确说明（而不是静默禁用）。
   Future<void> _applySuggestions({ErRelation? only}) async {
     if (_applyingSuggestions) return;
+    final targets = <ErRelation>[if (only != null) only else ..._suggestions];
+    if (targets.isEmpty) return;
+    // 先本地前置校验，不满足就报错（不让数据库先失败）。
+    for (final suggestion in targets) {
+      final issue = _validateSuggestion(suggestion);
+      if (issue != null) {
+        await _showBlocked(issue);
+        return;
+      }
+    }
     if (_isSqlite) {
       await _showSqliteAlterFkNotice();
       return;
     }
-    final targets = <ErRelation>[if (only != null) only else ..._suggestions];
-    if (targets.isEmpty) return;
     setState(() {
       _applyingSuggestions = true;
       _actionError = null;
@@ -673,6 +752,27 @@ class _RelationDesignerState extends State<RelationDesigner> {
     }
   }
 
+  /// 单条建议关系的前置校验（两端表都在画布上才校验）。
+  ErFkIssue? _validateSuggestion(ErRelation suggestion) {
+    final localTable = _tableNamed(suggestion.localTable);
+    final refTable = _tableNamed(suggestion.refTable);
+    if (localTable == null || refTable == null) return null;
+    return validateForeignKeyCandidate(
+      localTable: localTable,
+      localColumn: suggestion.localColumn,
+      refTable: refTable,
+      refColumn: suggestion.refColumn,
+      refUniqueColumns: _uniqueColumns[refTable.name] ?? const <String>{},
+    );
+  }
+
+  /// 关系创建被本地前置校验阻止：弹带「返回工作表与字段修改」的错误框。
+  Future<void> _showBlocked(ErFkIssue issue) => showForeignKeyBlockedDialog(
+    context,
+    message: erFkIssueMessage(issue),
+    onRequestEditFields: widget.onRequestEditFields,
+  );
+
   /// SQLite 下点建议外键时的明确说明（可点但无法 ALTER，不是静默失败）。
   Future<void> _showSqliteAlterFkNotice() async {
     await showAppModal<void>(
@@ -697,6 +797,18 @@ class _RelationDesignerState extends State<RelationDesigner> {
           builder: (context) =>
               Btn('关闭', onPressed: () => Navigator.of(context).pop()),
         ),
+        if (widget.onRequestEditFields != null)
+          Builder(
+            builder: (context) => Btn(
+              '返回工作表与字段修改',
+              key: const ValueKey('er-back-to-fields'),
+              primary: true,
+              onPressed: () {
+                Navigator.of(context).pop();
+                widget.onRequestEditFields!();
+              },
+            ),
+          ),
       ],
     );
   }
@@ -727,6 +839,18 @@ class _RelationDesignerState extends State<RelationDesigner> {
     required String refColumn,
   }) async {
     if (refTable.columns.isEmpty) return;
+    // 0) 前置条件校验：不满足就在本地报错，不发 SQL。
+    final issue = validateForeignKeyCandidate(
+      localTable: localTable,
+      localColumn: localColumn,
+      refTable: refTable,
+      refColumn: refColumn,
+      refUniqueColumns: _uniqueColumns[refTable.name] ?? const <String>{},
+    );
+    if (issue != null) {
+      await _showBlocked(issue);
+      return;
+    }
     final differentTables = localTable.name != refTable.name;
     // 1) 两表之间已经有中间表：多对多关系已经存在，提示不要重复创建。
     if (differentTables) {
@@ -782,6 +906,17 @@ class _RelationDesignerState extends State<RelationDesigner> {
         existingTableNames: <String>{..._schemaRows.keys},
         onCreate: (payload) => _createForeignKey(localTable.name, payload),
         onCreateJunction: _createJunction,
+        onRequestEditFields: widget.onRequestEditFields,
+        validate: (localColumn, refColumn) {
+          final issue = validateForeignKeyCandidate(
+            localTable: localTable,
+            localColumn: localColumn,
+            refTable: refTable,
+            refColumn: refColumn,
+            refUniqueColumns: _uniqueColumns[refTable.name] ?? const <String>{},
+          );
+          return issue == null ? null : erFkIssueMessage(issue);
+        },
       ),
       actions: <Widget>[
         Builder(
@@ -900,6 +1035,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
         existingTableNames: existingNames,
         reason: reason,
         onCreate: _createJunction,
+        onRequestEditFields: widget.onRequestEditFields,
       ),
       actions: <Widget>[
         Builder(
@@ -1179,17 +1315,15 @@ class _RelationDesignerState extends State<RelationDesigner> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             _toolbar(),
+            const SizedBox(height: 3),
+            _legend(),
             if (_autoAdded.isNotEmpty) ...<Widget>[
               const SizedBox(height: 6),
               _autoAddedHint(),
             ],
             if (_actionError != null) ...<Widget>[
               const SizedBox(height: 6),
-              AlertBox(
-                _actionError!,
-                tone: AlertTone.error,
-                onClose: () => setState(() => _actionError = null),
-              ),
+              _actionErrorBox(),
             ],
             if (_isSqlite) ...<Widget>[
               const SizedBox(height: 6),
@@ -1200,6 +1334,80 @@ class _RelationDesignerState extends State<RelationDesigner> {
           ],
         ),
       ),
+    );
+  }
+
+  /// 画布上方的图例：箭头方向（约束方 → 被约束方）+ 线型 / 颜色含义。
+  Widget _legend() {
+    const legendStyle = TextStyle(fontSize: 11);
+    final muted = legendStyle.copyWith(color: AppColors.muted);
+    return Tooltip(
+      message: pickText(
+        '箭头从「被约束」指向「约束」：被约束方是拥有外键列的子表，约束方是被引用主键的父表。',
+        'The arrow points from the constrained side to the constraining side: the constrained side owns the foreign key column (child table), and the constraining side is the referenced primary key (parent table).',
+      ),
+      waitDuration: const Duration(milliseconds: 300),
+      child: Wrap(
+        key: const ValueKey('er-legend'),
+        spacing: 6,
+        runSpacing: 3,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: <Widget>[
+          Icon(Icons.info_outline, size: 12, color: AppColors.muted),
+          Text(
+            pickText('外键关系：', 'Foreign key: '),
+            style: legendStyle.copyWith(color: AppColors.bodyText),
+          ),
+          Text(
+            pickText('被约束（外键列 / 子表）', 'Constrained (FK column / child)'),
+            style: legendStyle.copyWith(color: AppColors.link),
+          ),
+          Icon(Icons.arrow_forward, size: 12, color: AppColors.bodyText),
+          Text(
+            pickText(
+              '约束（被引用主键 / 父表）',
+              'Constraining (referenced key / parent)',
+            ),
+            style: legendStyle.copyWith(color: AppColors.link),
+          ),
+          Text('·', style: muted),
+          Text(
+            pickText(
+              '实线=已有外键 · 虚线=建议外键 · 橙色=多对多',
+              'solid = existing FK · dashed = suggested FK · orange = many-to-many',
+            ),
+            style: muted,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 批量建立建议外键失败时的提示；可返回字段修改（回调非空时）。
+  Widget _actionErrorBox() {
+    final back = widget.onRequestEditFields;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        AlertBox(
+          _actionError!,
+          tone: AlertTone.error,
+          onClose: () => setState(() => _actionError = null),
+        ),
+        if (back != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Btn(
+              '返回工作表与字段修改',
+              key: const ValueKey('er-back-to-fields'),
+              small: true,
+              onPressed: () {
+                setState(() => _actionError = null);
+                back();
+              },
+            ),
+          ),
+      ],
     );
   }
 
@@ -2436,6 +2644,8 @@ class _NewForeignKeyDialog extends StatefulWidget {
     required this.existingTableNames,
     required this.onCreate,
     required this.onCreateJunction,
+    required this.onRequestEditFields,
+    required this.validate,
   });
 
   final ErTable localTable;
@@ -2447,6 +2657,10 @@ class _NewForeignKeyDialog extends StatefulWidget {
   final Set<String> existingTableNames;
   final Future<void> Function(Map<String, dynamic> payload) onCreate;
   final Future<void> Function(ErJunctionPlan plan) onCreateJunction;
+  final VoidCallback? onRequestEditFields;
+
+  /// 提交前的前置校验；返回错误文案（null = 通过）。
+  final String? Function(String localColumn, String refColumn)? validate;
 
   @override
   State<_NewForeignKeyDialog> createState() => _NewForeignKeyDialogState();
@@ -2550,6 +2764,12 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
     }
     if (_localColumn.isEmpty || _refColumn.isEmpty) {
       setState(() => _error = pickText('请选择本表字段', 'Choose a local column'));
+      return;
+    }
+    // 本地前置校验：目标列必须是主键/单列唯一、类型粗粒度兼容、两端有主键。
+    final validation = widget.validate?.call(_localColumn, _refColumn);
+    if (validation != null) {
+      setState(() => _error = validation);
       return;
     }
     if ((_onDelete == 'SET NULL' || _onUpdate == 'SET NULL') &&
@@ -2737,6 +2957,19 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
         if (_error != null) ...<Widget>[
           const SizedBox(height: 8),
           AlertBox(_error!),
+          if (widget.onRequestEditFields != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Btn(
+                '返回工作表与字段修改',
+                key: const ValueKey('er-back-to-fields'),
+                small: true,
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  widget.onRequestEditFields!();
+                },
+              ),
+            ),
         ],
       ],
     );
@@ -2852,6 +3085,7 @@ class _JunctionDialog extends StatefulWidget {
     required this.existingTableNames,
     required this.reason,
     required this.onCreate,
+    required this.onRequestEditFields,
   });
 
   final ErJunctionPlan plan;
@@ -2861,6 +3095,7 @@ class _JunctionDialog extends StatefulWidget {
   final Set<String> existingTableNames;
   final _JunctionReason reason;
   final Future<void> Function(ErJunctionPlan plan) onCreate;
+  final VoidCallback? onRequestEditFields;
 
   @override
   State<_JunctionDialog> createState() => _JunctionDialogState();
@@ -3014,6 +3249,19 @@ class _JunctionDialogState extends State<_JunctionDialog> {
         if (_error != null) ...<Widget>[
           const SizedBox(height: 8),
           AlertBox(_error!),
+          if (widget.onRequestEditFields != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Btn(
+                '返回工作表与字段修改',
+                key: const ValueKey('er-back-to-fields'),
+                small: true,
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  widget.onRequestEditFields!();
+                },
+              ),
+            ),
         ],
       ],
     );

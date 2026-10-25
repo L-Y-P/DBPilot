@@ -148,6 +148,10 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 | `xlsb` | 流式（workbook.bin + 每表 BrtWsDim + 默认表前两行） | **流式（Row 级）**：zip 的 ZipFile(Read) 边解压边解析 BRT（varint id + varsize、BrtRowHdr/BrtCell*/公式缓存值、sharedStrings/styles） | 工作表 entry 级流式，无 read_to_end；SST/styles 一次性加载；加密 xlsb 报错 |
 
 - CSV/JSON/XML/HTML/Markdown 等文本格式本来就走流式字节读取，本轮不变。
+- 大文件护栏（第 51 轮）：单文件超过 **5 GB** 时，能流式读取的格式只在 warnings 里提醒
+  （「文件约 X GB（超过 5 GB）：会逐行流式读取，耗时与磁盘 IO 会明显增加」）；
+  如果有读取路径需要整表载入内存，则超过 5 GB 直接拒绝并在错误里说明格式与拆分建议。
+  当前 xlsx/xls/xlsb/ODS/SpreadsheetML/CSV/JSON 等全部流式，所以实际行为是「提醒不拒绝」。
 - 内存边界：xlsx / xls / xlsb 的峰值 ≈ 共享字符串表（sharedStrings/SST，字符串总长度）
   + 读缓冲 + 首个 128 行宽度探测缓冲；SpreadsheetML/ODS 只占固定读缓冲。
   行数据本身都是逐行产出，不随文件行数增长（每个解析器都有 5 万行流式单测）。
@@ -157,6 +161,7 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
 ## 8. 已知边界
 
 - 只读：不支持写回 xlsx/xls/xlsb/ods；导出 Excel 仍是 SpreadsheetML 2003（.xls）。
+- 单文件 > 5 GB：流式格式会给 warning；若将来出现必须整表载入的读取路径，会直接拒绝（见 §7 大文件护栏）。
 - 加密/损坏的工作簿在 inspect/preview 阶段返回中文错误（「无法读取 ... 文件可能已损坏、被密码保护」）。
 - 公式单元格读取 Excel 缓存的计算结果；没有缓存时为 NULL。
 - 隐藏工作表不参与选择；默认选第一张可见表。
@@ -178,7 +183,8 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
   - 第 51 轮流式：测试内用 zip writer 合成 2 万行 xlsx（inspect/preview/validate
     行数与进度、sheet 选择、schema）+ execute 2000 行到 SQLite；合成 ODS 预览/选表；
     SpreadsheetML 大文件（8 MB+）单次扫描统计；无 dimension 的 xlsx 进度退化；
-    xls 兜底标记 `streaming:false` + warning。
+        xls(BIFF8) / xlsb 流式（真实 fixture 三表、日期/时间/布尔/NULL、5 万行合成表）；
+    streaming 全为 true，不再有「暂未流式」warning。
 - 集成用例：`cargo test --offline --test data_import --test export_import_round_trip`。
 - 手工验证（本轮）：用户真实 `student_course.xls`（SpreadsheetML，8 行数据）与
   `relational_multi.xlsx`（5 表）inspect/preview/validate 均为流式且行数/类型正确。

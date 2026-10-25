@@ -1630,6 +1630,178 @@ Set<String> erUniqueColumns(Map<String, dynamic> structure) {
   return out;
 }
 
+// ---------------------------------------------------------- 外键前置校验
+
+/// 外键前置校验发现的问题类型。
+enum ErFkIssueKind {
+  /// 本地表没有主键。
+  localTableNoPrimary,
+
+  /// 被引用表没有主键。
+  refTableNoPrimary,
+
+  /// 被引用列不是主键 / 单列唯一键。
+  refColumnNotUnique,
+
+  /// 本地列与目标列粗粒度类型不兼容。
+  typeIncompatible,
+}
+
+/// 一条外键在本地前置校验里的失败原因（带具体表 / 列名，供 UI 组织文案）。
+class ErFkIssue {
+  const ErFkIssue({
+    required this.kind,
+    required this.localTable,
+    required this.localColumn,
+    required this.refTable,
+    required this.refColumn,
+    this.localType = '',
+    this.refType = '',
+  });
+
+  final ErFkIssueKind kind;
+  final String localTable;
+  final String localColumn;
+  final String refTable;
+  final String refColumn;
+  final String localType;
+  final String refType;
+}
+
+/// 字段类型的粗粒度家族：只用来拦住「整数 vs 文本」这类明显不兼容的组合。
+enum ErTypeFamily { numeric, boolean, text, temporal, binary, unknown }
+
+/// 把列类型字符串归类成粗粒度家族；识别不了返回 [ErTypeFamily.unknown]。
+ErTypeFamily erTypeFamily(String rawType) {
+  final type = rawType.toLowerCase().trim();
+  if (type.isEmpty) return ErTypeFamily.unknown;
+  bool has(List<String> needles) => needles.any(type.contains);
+  // 几何 / 网络等特殊类型先排除，避免 point 里的 int 被当成数值。
+  if (has(<String>[
+    'point',
+    'polygon',
+    'line',
+    'circle',
+    'path',
+    'box',
+    'inet',
+    'cidr',
+    'macaddr',
+    'tsvector',
+  ])) {
+    return ErTypeFamily.unknown;
+  }
+  if (has(<String>['bool', 'bit'])) return ErTypeFamily.boolean;
+  if (has(<String>[
+    'json',
+    'uuid',
+    'char',
+    'text',
+    'clob',
+    'enum',
+    'set',
+    'citext',
+    'xml',
+  ])) {
+    return ErTypeFamily.text;
+  }
+  if (has(<String>['date', 'time', 'year', 'interval'])) {
+    return ErTypeFamily.temporal;
+  }
+  if (has(<String>['blob', 'binary', 'bytea'])) return ErTypeFamily.binary;
+  if (has(<String>[
+    'int',
+    'serial',
+    'decimal',
+    'numeric',
+    'real',
+    'double',
+    'float',
+    'money',
+    'number',
+  ])) {
+    return ErTypeFamily.numeric;
+  }
+  return ErTypeFamily.unknown;
+}
+
+/// 粗粒度类型兼容性：只拦明显不兼容的组合（整数/小数 vs 文本/日期/二进制），
+/// 拿不准（空类型、自定义类型）返回 true，交给数据库给出精确错误。
+bool erTypesCompatible(String localType, String refType) {
+  final a = erTypeFamily(localType);
+  final b = erTypeFamily(refType);
+  if (a == ErTypeFamily.unknown || b == ErTypeFamily.unknown) return true;
+  if (a == b) return true;
+  // MySQL 的 BOOLEAN 就是 TINYINT(1)，数值/布尔之间不拦。
+  if ((a == ErTypeFamily.numeric || a == ErTypeFamily.boolean) &&
+      (b == ErTypeFamily.numeric || b == ErTypeFamily.boolean)) {
+    return true;
+  }
+  return false;
+}
+
+/// 关系创建前的前置校验（纯逻辑，可无 FFI 单测）。
+///
+/// 规则（按顺序，返回第一个问题）：
+/// 1. 本地表必须有主键；
+/// 2. 被引用表必须有主键；
+/// 3. 被引用列必须是主键或单列唯一键（[refUniqueColumns] 来自 structure 的
+///    单列唯一索引；拿不到唯一信息时只认 primary）；
+/// 4. 本地列与目标列粗粒度类型必须兼容（拿不准交给数据库报错）。
+ErFkIssue? validateForeignKeyCandidate({
+  required ErTable localTable,
+  required String localColumn,
+  required ErTable refTable,
+  required String refColumn,
+  Set<String> refUniqueColumns = const <String>{},
+}) {
+  if (!localTable.hasPrimary) {
+    return ErFkIssue(
+      kind: ErFkIssueKind.localTableNoPrimary,
+      localTable: localTable.name,
+      localColumn: localColumn,
+      refTable: refTable.name,
+      refColumn: refColumn,
+    );
+  }
+  if (!refTable.hasPrimary) {
+    return ErFkIssue(
+      kind: ErFkIssueKind.refTableNoPrimary,
+      localTable: localTable.name,
+      localColumn: localColumn,
+      refTable: refTable.name,
+      refColumn: refColumn,
+    );
+  }
+  final ref = refTable.columnNamed(refColumn);
+  final refIsUnique =
+      (ref?.primary ?? false) || refUniqueColumns.contains(refColumn);
+  if (ref == null || !refIsUnique) {
+    return ErFkIssue(
+      kind: ErFkIssueKind.refColumnNotUnique,
+      localTable: localTable.name,
+      localColumn: localColumn,
+      refTable: refTable.name,
+      refColumn: refColumn,
+      refType: ref?.typeName ?? '',
+    );
+  }
+  final local = localTable.columnNamed(localColumn);
+  final localType = local?.typeName ?? '';
+  if (!erTypesCompatible(localType, ref.typeName)) {
+    return ErFkIssue(
+      kind: ErFkIssueKind.typeIncompatible,
+      localTable: localTable.name,
+      localColumn: localColumn,
+      refTable: refTable.name,
+      refColumn: refColumn,
+      localType: localType,
+      refType: ref.typeName,
+    );
+  }
+  return null;
+}
+
 // ------------------------------------------------------------ JSON 小工具
 
 /// `Api.structure` / `Api.builderSchema` 返回的列表字段。

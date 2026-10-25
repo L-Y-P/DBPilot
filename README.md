@@ -140,6 +140,7 @@ keyset 游标分页；自动列宽开关与大字段延迟加载（设置 → �
 - **自动列宽可关闭**：关掉后所有列固定 160 px，完全不跑 `TextPainter` 测量。
 - **导入流式**：文本格式 64 KiB 分块；Excel 全格式按行流式解析与校验（xlsx/xlsm 用 zip+XML、xls 用 OLE2+BIFF record、xlsb 用 ZIP entry+BRT record），批量 INSERT 默认 500 行、可取消；单记录 8 MiB / 单语句 16 MiB 上限。
   共享字符串表（xlsx sharedStrings / xls SST / xlsb sharedStrings）为该格式决定的字符串索引表，一次性加载。
+  单文件超过 5 GB 时会给出提示（能流式读取的格式只提醒耗时；无法流式的读取路径会拒绝）。
 - **导出流式**：逐行写出，不把整表拼成一个大字符串。
 
 ## 使用

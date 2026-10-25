@@ -596,7 +596,9 @@ pub async fn table_exists(pool: &MySqlPool, db: &str, table: &str) -> Result<boo
     Ok(c > 0)
 }
 
-/// Execute `statements` inside **one transaction**, one affected result each.
+/// Execute `statements` inside **one transaction**, one affected result each,
+/// then run the requested zero-row existence probes **inside the same
+/// transaction**, right before COMMIT.
 ///
 /// Transaction control goes through sqlx's transaction manager (which issues
 /// `BEGIN` with the simple/text protocol). Issuing `BEGIN` yourself through
@@ -606,12 +608,22 @@ pub async fn table_exists(pool: &MySqlPool, db: &str, table: &str) -> Result<boo
 /// silently lose atomicity. This helper exists instead of looping over the
 /// single-statement path.
 ///
+/// Round 64 moved the zero-row probe in here: it used to run as one extra
+/// autocommit query per zero-row UPDATE *after* COMMIT, which both cost one round
+/// trip per row and left a concurrency window in which the reported reason could
+/// be wrong. Now every needed probe is merged into a single UNION ALL query
+/// ([crate::drivers::zero_row_probe_union]) that sees the transaction's own
+/// writes, and a probe failure only leaves the affected entries unknown —
+/// MySQL keeps the transaction usable after a failed statement, so the batch
+/// still commits.
+///
 /// The first failing statement rolls the whole batch back; its 1-based index is
 /// part of the error message so the caller can point at the offending row.
 pub async fn run_transaction(
     pool: &MySqlPool,
     statements: Vec<String>,
-) -> AppResult<Vec<ResultSet>> {
+    probes: Vec<Option<String>>,
+) -> AppResult<(Vec<ResultSet>, Vec<Option<bool>>)> {
     let mut tx = pool
         .begin()
         .await
@@ -639,13 +651,68 @@ pub async fn run_transaction(
             }
         }
     }
+    // Diagnostics only, still inside the transaction: a probe failure must never
+    // fail the batch or change the commit outcome.
+    let probed = zero_row_probes(&mut tx, &results, &probes).await;
     tx.commit().await.map_err(|e| {
         AppError::bad(format!(
             "提交事务失败：{}",
             crate::error::database_message(&e)
         ))
     })?;
-    Ok(results)
+    Ok((results, probed))
+}
+
+/// Run the zero-row existence probes for one batch (round 64).
+///
+/// Only statements whose `row_count` is 0 and that carry a probe SQL take part;
+/// [crate::drivers::zero_row_probe_union] merges them into one query so ten
+/// zero-row updates cost one round trip instead of ten. The probe runs after
+/// every DML and before COMMIT, so it sees exactly the state the batch is about
+/// to commit.
+///
+/// Anything unexpected (permission, concurrent DDL) leaves the candidates at
+/// `None` — the API reports "unknown" and the batch keeps its result. MySQL
+/// rolls back only the failing statement, not the transaction, so COMMIT stays
+/// valid.
+async fn zero_row_probes(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    results: &[ResultSet],
+    probes: &[Option<String>],
+) -> Vec<Option<bool>> {
+    let mut probed: Vec<Option<bool>> = vec![None; probes.len()];
+    let row_counts: Vec<u64> = results.iter().map(|result| result.row_count).collect();
+    let Some(union) = crate::drivers::zero_row_probe_union(&row_counts, probes) else {
+        return probed;
+    };
+    let rows = match sqlx::query(union.as_str()).fetch_all(&mut **tx).await {
+        Ok(rows) => rows,
+        // Never fail the batch for a diagnostics read.
+        Err(_) => return probed,
+    };
+    for row in rows {
+        let Some(index) = row
+            .try_get::<String, _>(0)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if let Some(slot) = probed.get_mut(index) {
+            *slot = Some(true);
+        }
+    }
+    // Every candidate that returned no row means the key matched nothing.
+    for (index, probe) in probes.iter().enumerate() {
+        if probe.is_some()
+            && index < probed.len()
+            && row_counts.get(index).copied().unwrap_or(0) == 0
+            && probed[index].is_none()
+        {
+            probed[index] = Some(false);
+        }
+    }
+    probed
 }
 
 #[cfg(test)]

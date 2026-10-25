@@ -1130,8 +1130,11 @@ pub(crate) fn change_row_sql<D: DatabaseDriver + ?Sized>(
 /// [change_row_sql] renders the UPDATE / DELETE, but a zero affected-row count
 /// can mean two different things: the key matched nothing, or (MySQL counts only
 /// rows whose values actually changed) the row was there with identical values.
-/// The batched apply path runs this probe after the transaction committed; it
-/// reuses the same dialect quoting/literals, so no user value is pasted into SQL.
+/// The batched apply path builds one probe per zero-row-capable UPDATE and the
+/// driver executes it **inside the batch transaction, after every DML and before
+/// COMMIT** (batched into one UNION ALL query, see
+/// `SqlSession::execute_transaction_probing`); it reuses the same dialect
+/// quoting/literals, so no user value is pasted into SQL.
 pub(crate) fn row_exists_sql<D: DatabaseDriver + ?Sized>(
     driver: &D,
     ns: &str,

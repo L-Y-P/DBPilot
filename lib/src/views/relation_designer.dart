@@ -1213,8 +1213,12 @@ class RelationDesignerState extends State<RelationDesigner> {
     return true;
   }
 
+  /// UNIQUE 索引名的最大尝试次数（第 64 轮）：
+  /// 初次 uk_x + 撞名后换序号名 uk_x_2、uk_x_3、uk_x_4、uk_x_5，共 5 次。
+  static const int _maxUniqueIndexAttempts = 5;
+
   /// 建 UNIQUE 索引；索引名撞名（1826 / Duplicate key name / already exists）
-  /// 时自动换序号名（uk_x_2）重试一次，仍失败弹友好错误（第 63 轮）。
+  /// 时自动换序号名（uk_x_2 … uk_x_5）重试，仍失败弹友好错误（第 63/64 轮）。
   Future<bool> _createUniqueIndex({
     required String table,
     required String column,
@@ -1222,7 +1226,7 @@ class RelationDesignerState extends State<RelationDesigner> {
   }) async {
     final names = <String>{...existingNames};
     var indexName = uniqueIndexNameFor(column, names);
-    for (var attempt = 0; attempt < 2; attempt++) {
+    for (var attempt = 0; attempt < _maxUniqueIndexAttempts; attempt++) {
       try {
         await _alterTable(
           table,
@@ -1238,8 +1242,10 @@ class RelationDesignerState extends State<RelationDesigner> {
         );
         return true;
       } catch (error) {
-        if (attempt == 0 && _isDuplicateIndexNameError(error)) {
-          // 第 63 轮：并发/缓存导致索引名已存在 → 自动换序号名再试一次。
+        if (attempt < _maxUniqueIndexAttempts - 1 &&
+            _isDuplicateIndexNameError(error)) {
+          // 第 63/64 轮：并发/缓存导致索引名已存在 → 自动换序号名再试，
+          // 最多尝试 5 个名字后仍失败才弹友好错误。
           names.add(indexName);
           indexName = uniqueIndexNameFor(column, names);
           continue;
@@ -1269,7 +1275,8 @@ class RelationDesignerState extends State<RelationDesigner> {
         text.contains('重复');
   }
 
-  /// 第 63 轮：孤儿警告里「创建唯一索引并改用同名列」。
+  /// 第 63/64 轮：孤儿警告里「创建唯一索引并改用同名列」（部分匹配也走这里，
+  /// 唯一性检查 / 重复只说明 / 建索引 + 重开弹窗的流程完全相同）。
   ///
   /// 返回 true = 同名列现在可被引用（已唯一 / 已成功建 UNIQUE 索引），调用方
   /// 应关闭当前弹窗并用该列重新打开；false = 查询失败 / 有重复 / 建索引失败，
@@ -1646,10 +1653,11 @@ class RelationDesignerState extends State<RelationDesigner> {
           (sameNameFromSchema != null && sameNameFromSchema != refColumn
               ? sameNameFromSchema
               : null);
-      // 第 63 轮：同名列与本地列基本完全匹配时，提供「建唯一索引并改用它」。
+      // 第 63/64 轮：同名列与本地列有匹配数据（≥99% 或部分匹配）时，提供
+      // 「建唯一索引并改用它」；匹配数为 null（没查到）保持第 63 轮行为。
       final fixable = sameName != null &&
           sameName != refColumn &&
-          report.sameNameMostlyMatches;
+          report.sameNameHasMatches;
       final warning = fkOrphanWarningMessage(
         report,
         localTable: localTable,
@@ -1661,6 +1669,7 @@ class RelationDesignerState extends State<RelationDesigner> {
       final choice = await _confirmCreateDespiteOrphans(
         warning,
         fixSameNameColumn: fixable ? sameName : null,
+        fixSameNameMostlyMatches: report.sameNameMostlyMatches,
       );
       if (!mounted) return;
       if (choice == _OrphanWarningChoice.fixSameName && fixable) {
@@ -1802,9 +1811,13 @@ class RelationDesignerState extends State<RelationDesigner> {
   }
 
   /// 预检发现孤儿行时的警告：取消 / 仍然尝试创建 /（可修复时）改用同名列。
+  ///
+  /// [fixSameNameMostlyMatches] 区分第 63 轮的「基本完全匹配」文案与第 64 轮
+  /// 的部分匹配文案（部分匹配必须诚实说明改用后仍可能有孤儿）。
   Future<_OrphanWarningChoice> _confirmCreateDespiteOrphans(
     String warning, {
     String? fixSameNameColumn,
+    bool fixSameNameMostlyMatches = true,
   }) async {
     final result = await showAppModal<_OrphanWarningChoice>(
       context: context,
@@ -1826,15 +1839,27 @@ class RelationDesignerState extends State<RelationDesigner> {
                           'Fix the data first, or try anyway to see the final database '
                           'error.',
                     )
-                  : pickText(
-                      '现在创建外键会被数据库拒绝。可以先修正数据、仍然尝试，或按'
-                          '建议改为引用「$fixSameNameColumn」列（该列数据与本地'
-                          '列基本完全匹配，若全唯一会先补 UNIQUE 索引）。',
-                      'Creating the foreign key now will be rejected. Fix the data, '
-                          'try anyway, or reference the "$fixSameNameColumn" column '
-                          'instead (its values almost perfectly match this table; a '
-                          'UNIQUE index is added first if needed).',
-                    ),
+                  : fixSameNameMostlyMatches
+                      ? pickText(
+                          '现在创建外键会被数据库拒绝。可以先修正数据、仍然尝试，或按'
+                              '建议改为引用「$fixSameNameColumn」列（该列数据与本地'
+                              '列基本完全匹配，若全唯一会先补 UNIQUE 索引）。',
+                          'Creating the foreign key now will be rejected. Fix the data, '
+                              'try anyway, or reference the "$fixSameNameColumn" column '
+                              'instead (its values almost perfectly match this table; a '
+                              'UNIQUE index is added first if needed).',
+                        )
+                      : pickText(
+                          '现在创建外键会被数据库拒绝。可以先修正数据、仍然尝试，或'
+                              '改为引用「$fixSameNameColumn」列（两表该列只有部分行'
+                              '匹配，改用后仍可能有孤儿、创建外键可能仍失败；唯一性'
+                              '通过时会先补 UNIQUE 索引）。',
+                          'Creating the foreign key now will be rejected. Fix the data, '
+                              'try anyway, or reference the "$fixSameNameColumn" column '
+                              'instead (only some of its rows match this table, so orphan '
+                              'rows may remain and creation may still fail; a UNIQUE index '
+                              'is added first when its values are unique).',
+                        ),
               style: kSmallMuted,
             ),
           ],
@@ -1861,8 +1886,12 @@ class RelationDesignerState extends State<RelationDesigner> {
           Builder(
             builder: (context) => Btn(
               pickText(
-                '创建唯一索引并改用「$fixSameNameColumn」',
-                'Create a UNIQUE index and use "$fixSameNameColumn"',
+                fixSameNameMostlyMatches
+                    ? '创建唯一索引并改用「$fixSameNameColumn」'
+                    : '改用同名列「$fixSameNameColumn」并建唯一索引',
+                fixSameNameMostlyMatches
+                    ? 'Create a UNIQUE index and use "$fixSameNameColumn"'
+                    : 'Use the same-name column "$fixSameNameColumn" and add a UNIQUE index',
               ),
               key: const ValueKey<String>('er-orphan-fix-samename'),
               primary: true,

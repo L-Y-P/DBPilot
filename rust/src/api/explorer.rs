@@ -528,32 +528,71 @@ struct PlannedChange {
     action: String,
     sql: String,
     keys: serde_json::Map<String, Value>,
+    /// Existence probe for an UPDATE, built with the driver's quoting helper
+    /// (`SELECT 1 ... WHERE keys LIMIT 1`); `None` for INSERT / DELETE.
+    ///
+    /// Generated during planning together with the DML, then executed by the
+    /// driver **inside the batch transaction** (after all DML, before COMMIT).
+    probe: Option<String>,
 }
 
-/// UPDATE / DELETE items whose driver affected-row count is 0.
+/// Probe SQL for one planned change, or `None` when a zero row count needs no
+/// existence check.
+///
+/// Only UPDATE is ambiguous: MySQL counts only rows whose values actually
+/// changed, so 0 can mean "the key matched nothing" or "the row was already
+/// identical". INSERT reports 0 normally, and a DELETE can only mean the row is
+/// gone. A probe that cannot be built is a diagnostics problem, not a batch
+/// problem, so it degrades to `None` ("unknown") instead of failing the save.
+fn probe_sql_for(
+    driver: &dyn crate::core::DatabaseDriver,
+    namespace: &str,
+    table: &str,
+    action: &str,
+    keys: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    if !action.eq_ignore_ascii_case("update") {
+        return None;
+    }
+    driver.row_exists_sql(namespace, table, keys).ok()
+}
+
+/// UPDATE / DELETE items whose driver affected-row count is 0, with the reason
+/// resolved from the in-transaction probe.
 ///
 /// Diagnostics only: the batch is not a failure, the transaction commits and
 /// ok / rows_affected keep their meaning. MySQL counts only rows whose values
-/// actually changed, so a same-value UPDATE also reports 0 there — the list
-/// means "the key matched no row, or the row's values did not change" (the Dart
-/// page words it that way). INSERT is excluded because 0 rows affected is its
-/// normal count.
-fn zero_row_results(changes: &[PlannedChange], row_counts: &[u64]) -> Vec<Value> {
+/// actually changed, so a same-value UPDATE also reports 0 there — the reason
+/// says "the key matched no row" (not_found) or "the row's values did not
+/// change" (unchanged); a probe that could not run is "unknown". INSERT is
+/// excluded because 0 rows affected is its normal count.
+///
+/// `probes` is indexed like `changes`: `Some(true)` the row still exists,
+/// `Some(false)` the key matched nothing, `None` no answer (probe failed).
+/// DELETE never carries a probe: 0 rows there can only mean the row is gone.
+fn zero_row_results(
+    changes: &[PlannedChange],
+    row_counts: &[u64],
+    probes: &[Option<bool>],
+) -> Vec<Value> {
     changes
         .iter()
+        .enumerate()
         .zip(row_counts)
-        .filter(|(change, count)| {
+        .filter(|((_, change), count)| {
             **count == 0
                 && matches!(
                     change.action.to_ascii_lowercase().as_str(),
                     "update" | "delete"
                 )
         })
-        .map(|(change, _)| {
+        .map(|((position, change), _)| {
+            let reason = zero_row_reason(&change.action, probes.get(position).copied().flatten());
             json!({
                 "index": change.index,
                 "action": change.action,
                 "keys": Value::Object(change.keys.clone()),
+                "reason": reason,
             })
         })
         .collect()
@@ -585,43 +624,21 @@ impl ZeroRowReasons {
     }
 }
 
-/// Reason for one zero-row change.
+/// Reason for one zero-row change, based on the in-transaction probe.
 ///
 /// DELETE always means the key matched nothing (there is no "value unchanged"
-/// for a delete). UPDATE needs the existence probe: the key still matching a row
+/// for a delete). UPDATE uses the probe result: the key still matching a row
 /// means the values were already identical (MySQL counts only real changes),
-/// otherwise the row is gone. A failed probe (permission/concurrency) must never
-/// fail the batch, so it becomes "unknown".
-fn zero_row_reason(action: &str, probe: Result<bool, ()>) -> &'static str {
+/// otherwise the row is gone. A probe that could not run (or was skipped) must
+/// never claim a cause, so it becomes "unknown".
+fn zero_row_reason(action: &str, probe: Option<bool>) -> &'static str {
     if action.eq_ignore_ascii_case("delete") {
         return "not_found";
     }
     match probe {
-        Ok(true) => "unchanged",
-        Ok(false) => "not_found",
-        Err(()) => "unknown",
-    }
-}
-
-/// Does the row key still match a row after the batch committed?
-///
-/// Uses the driver's quoting helper (SELECT 1 ... WHERE keys LIMIT 1), so no
-/// user value is pasted into SQL. The probe runs as a separate autocommit query
-/// after COMMIT: it can never affect the batch result, and a concurrent change
-/// between COMMIT and this read may make the answer approximate.
-async fn probe_row_exists(
-    driver: &dyn crate::core::DatabaseDriver,
-    conn: &crate::core::ConnectionHandle,
-    namespace: &str,
-    table: &str,
-    keys: &serde_json::Map<String, Value>,
-) -> Result<bool, ()> {
-    let sql = driver
-        .row_exists_sql(namespace, table, keys)
-        .map_err(|_| ())?;
-    match conn.fetch_named(sql).await {
-        Ok(rows) => Ok(!rows.is_empty()),
-        Err(_) => Err(()),
+        Some(true) => "unchanged",
+        Some(false) => "not_found",
+        None => "unknown",
     }
 }
 
@@ -635,9 +652,9 @@ async fn probe_row_exists(
 /// Every statement is validated and built **before** the transaction starts, so
 /// a bad item (unknown action, update without keys, ...) cannot leave a
 /// half-applied write behind. The batch then runs through
-/// `ConnectionHandle::execute_transaction` (one sqlx transaction, driver-issued
-/// `BEGIN`/`COMMIT`); the first server error rolls the whole batch back and
-/// the error names the failing item.
+/// `ConnectionHandle::execute_transaction_probing` (one sqlx transaction,
+/// driver-issued `BEGIN`/`COMMIT`); the first server error rolls the whole batch
+/// back and the error names the failing item.
 ///
 /// Returns per-item results plus the total affected rows, so the table page can
 /// show "已保存 N 行" and flag the item that matched no row. Matching no row is
@@ -645,11 +662,16 @@ async fn probe_row_exists(
 /// meaning. [zero_row_results] (added in round 60) lists the UPDATE / DELETE
 /// items whose driver row count was 0; since MySQL counts only rows whose values
 /// changed, that means "the key matched nothing, or the value did not change".
-/// Round 63 resolves that ambiguity after COMMIT: each zero-row UPDATE gets one
-/// existence probe (SELECT 1 ... WHERE keys LIMIT 1), so every item carries
+/// Round 63 resolves that ambiguity with an existence probe
+/// (SELECT 1 ... WHERE keys LIMIT 1), so every item carries
 /// reason = not_found | unchanged | unknown, and zero_row_reasons aggregates the
-/// counts. The probe is diagnostics only — a failed probe becomes "unknown" and
-/// never fails the batch. DELETE zero rows are always not_found.
+/// counts. Round 64 moved that probe **inside the same transaction** (after every
+/// DML, before COMMIT) and batches all of them into a single UNION ALL query
+/// (`execute_transaction_probing`), so a concurrent writer can no longer
+/// change the answer between the write and the probe, and N zero-row UPDATEs no
+/// longer cost N round trips. The probe is diagnostics only — a failed probe
+/// becomes "unknown" and never fails the batch. DELETE zero rows are always
+/// not_found and are never probed.
 ///
 pub async fn apply_row_changes(
     database: String,
@@ -667,11 +689,15 @@ pub async fn apply_row_changes(
         let sql = driver
             .change_row_sql(&database, &table, &change.action, &keys, &values, change.limit_one)
             .map_err(anyhow::Error::from)?;
+        // Build the existence probe with the same quoting helper now; the driver
+        // runs it inside the transaction, only when the UPDATE affected 0 rows.
+        let probe = probe_sql_for(driver.as_ref(), &database, &table, &change.action, &keys);
         planned.push(PlannedChange {
             index,
             action: change.action.clone(),
             sql,
             keys,
+            probe,
         });
     }
     if planned.is_empty() {
@@ -688,10 +714,13 @@ pub async fn apply_row_changes(
     // One transaction on one pooled connection. The driver issues BEGIN/COMMIT
     // through sqlx's transaction manager (a prepared `BEGIN` is rejected by
     // MySQL, error 1295) and rolls the whole batch back when a statement fails.
+    // The zero-row probes travel with the statements and run inside that same
+    // transaction, before COMMIT, in one batched query (round 64).
     let conn = state.connection_for(Some(&database)).await?;
     let sqls: Vec<String> = planned.iter().map(|change| change.sql.clone()).collect();
-    let executed = conn
-        .execute_transaction(sqls)
+    let probes: Vec<Option<String>> = planned.iter().map(|change| change.probe.clone()).collect();
+    let (executed, probe_results) = conn
+        .execute_transaction_probing(sqls, probes)
         .await
         .map_err(anyhow::Error::from)?;
     let mut results: Vec<Value> = Vec::with_capacity(executed.len());
@@ -707,26 +736,14 @@ pub async fn apply_row_changes(
         }));
     }
     // Additive diagnostics only: which UPDATE / DELETE matched no row (or, on
-    // MySQL, changed no value). Never changes ok or the transaction outcome.
-    // Passing only the row counts keeps ResultSet out of the FRB-facing module.
+    // MySQL, changed no value), with the reason taken from the in-transaction
+    // probe. Never changes ok or the transaction outcome. Passing only the row
+    // counts / probe answers keeps ResultSet out of the FRB-facing module.
     let row_counts: Vec<u64> = executed.iter().map(|result| result.row_count).collect();
-    let mut zero_rows = zero_row_results(&planned, &row_counts);
-    // Round 63: resolve "row not found" vs "values unchanged". UPDATE needs the
-    // existence probe; DELETE can only mean the row is gone. A failed probe is
-    // reported as unknown and never fails the batch.
+    let zero_rows = zero_row_results(&planned, &row_counts, &probe_results);
     let mut zero_row_reasons = ZeroRowReasons::default();
-    for item in zero_rows.iter_mut() {
-        let action = item["action"].as_str().unwrap_or_default().to_string();
-        let reason = if action.eq_ignore_ascii_case("delete") {
-            "not_found"
-        } else {
-            let keys = item["keys"].as_object().cloned().unwrap_or_default();
-            let probe =
-                probe_row_exists(driver.as_ref(), &conn, &database, &table, &keys).await;
-            zero_row_reason(&action, probe)
-        };
-        zero_row_reasons.count(reason);
-        item["reason"] = json!(reason);
+    for item in &zero_rows {
+        zero_row_reasons.count(item["reason"].as_str().unwrap_or_default());
     }
     Ok(json!({
         "ok": true,
@@ -971,7 +988,49 @@ mod tests {
             action: action.to_string(),
             sql: String::new(),
             keys,
+            probe: None,
         }
+    }
+
+    #[test]
+    fn probe_sql_is_generated_only_for_update() {
+        use crate::core::DriverKind;
+        use crate::drivers::builtin::driver_for;
+
+        let keys = |value: Value| {
+            let Value::Object(keys) = value else {
+                panic!("keys must be an object");
+            };
+            keys
+        };
+        let sqlite = driver_for(DriverKind::Sqlite);
+        let id = keys(json!({ "id": 1 }));
+        // INSERT and DELETE zero rows explain themselves: no probe SQL.
+        assert_eq!(
+            probe_sql_for(sqlite, "main", "items", "insert", &id),
+            None
+        );
+        assert_eq!(
+            probe_sql_for(sqlite, "main", "items", "delete", &id),
+            None
+        );
+        // UPDATE reuses the driver's quoting helper, so the probe is exactly
+        // row_exists_sql's output (dialect identifiers/literals, no user values).
+        let probe = probe_sql_for(sqlite, "main", "items", "UPDATE", &id)
+            .expect("update probe");
+        assert_eq!(
+            probe,
+            sqlite
+                .row_exists_sql("main", "items", &id)
+                .expect("row_exists_sql")
+        );
+        assert_eq!(probe, r#"SELECT 1 FROM "main"."items" WHERE "id" = 1 LIMIT 1"#);
+        // A probe that cannot be built is a diagnostics problem, not a failure:
+        // the caller gets None ("unknown") and the batch still runs.
+        assert_eq!(
+            probe_sql_for(sqlite, "main", "items", "update", &keys(json!({}))),
+            None
+        );
     }
 
     #[test]
@@ -990,11 +1049,24 @@ mod tests {
             1,    // insert is never reported
             2,    // delete hit two rows, not zero
         ];
+        // Only the zero-row UPDATE actually gets a probe; DELETE is always
+        // not_found (there is no "unchanged" for a delete).
+        let probes = vec![Some(false), None, None, None, None];
         assert_eq!(
-            zero_row_results(&changes, &row_counts),
+            zero_row_results(&changes, &row_counts, &probes),
             vec![
-                json!({ "index": 0, "action": "update", "keys": { "id": 1 } }),
-                json!({ "index": 2, "action": "delete", "keys": { "id": 3 } }),
+                json!({
+                    "index": 0,
+                    "action": "update",
+                    "keys": { "id": 1 },
+                    "reason": "not_found",
+                }),
+                json!({
+                    "index": 2,
+                    "action": "delete",
+                    "keys": { "id": 3 },
+                    "reason": "not_found",
+                }),
             ]
         );
     }
@@ -1006,7 +1078,8 @@ mod tests {
             change(1, "delete", json!({ "id": 2 })),
         ];
         let row_counts = vec![1u64, 1];
-        assert!(zero_row_results(&changes, &row_counts).is_empty());
+        let probes = vec![None, None];
+        assert!(zero_row_results(&changes, &row_counts, &probes).is_empty());
     }
 
     #[test]
@@ -1019,24 +1092,54 @@ mod tests {
             change(2, "update", json!({ "id": 8 })),
         ];
         let row_counts = vec![1u64, 0, 0];
-        let zero = zero_row_results(&changes, &row_counts);
+        let probes = vec![None, Some(false), None];
+        let zero = zero_row_results(&changes, &row_counts, &probes);
         assert_eq!(zero.len(), 2);
         assert_eq!(zero[0]["index"], json!(1));
         assert_eq!(zero[1]["index"], json!(2));
         assert_eq!(zero[0]["keys"], json!({ "id": 9 }));
+        assert_eq!(zero[0]["reason"], json!("not_found"));
+        // The probe answer is absent (failed inside the transaction): unknown,
+        // never a made-up cause.
+        assert_eq!(zero[1]["reason"], json!("unknown"));
+    }
+
+    #[test]
+    fn zero_row_results_map_probe_answers_to_reasons() {
+        // One zero-row UPDATE whose probe says the row is still there: on MySQL
+        // that means the values were already identical (it counts only changed
+        // rows). Another whose probe says the key matches nothing. A third whose
+        // probe failed is unknown.
+        let changes = vec![
+            change(0, "update", json!({ "id": 1 })),
+            change(1, "update", json!({ "id": 2 })),
+            change(2, "update", json!({ "id": 3 })),
+            change(3, "delete", json!({ "id": 4 })),
+        ];
+        let row_counts = vec![0u64, 0, 0, 0];
+        let probes = vec![Some(true), Some(false), None, None];
+        let zero = zero_row_results(&changes, &row_counts, &probes);
+        assert_eq!(
+            zero
+                .iter()
+                .map(|item| item["reason"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["unchanged", "not_found", "unknown", "not_found"]
+        );
     }
 
     #[test]
     fn zero_row_reason_splits_not_found_unchanged_and_unknown() {
-        // DELETE has no "value unchanged" case: 0 rows means the row is gone.
-        assert_eq!(zero_row_reason("delete", Ok(true)), "not_found");
-        assert_eq!(zero_row_reason("DELETE", Ok(false)), "not_found");
+        // DELETE has no "value unchanged" case: 0 rows means the row is gone,
+        // even though a delete never carries a probe.
+        assert_eq!(zero_row_reason("delete", None), "not_found");
+        assert_eq!(zero_row_reason("DELETE", Some(true)), "not_found");
         // UPDATE: the key still matches -> the values were already identical
         // (MySQL only counts rows whose values actually changed).
-        assert_eq!(zero_row_reason("update", Ok(true)), "unchanged");
-        assert_eq!(zero_row_reason("update", Ok(false)), "not_found");
-        // Probe failed (permission / concurrency): never claim a cause.
-        assert_eq!(zero_row_reason("update", Err(())), "unknown");
+        assert_eq!(zero_row_reason("update", Some(true)), "unchanged");
+        assert_eq!(zero_row_reason("update", Some(false)), "not_found");
+        // Probe failed / skipped: never claim a cause.
+        assert_eq!(zero_row_reason("update", None), "unknown");
     }
 
     #[test]

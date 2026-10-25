@@ -2415,6 +2415,132 @@ void main() {
     });
   });
 
+  // =====================================================================
+  // 第 64 轮：同名列部分匹配也能一键改选（判定 + 诚实文案）
+  // =====================================================================
+
+  group('同名列可一键改选判定（第 64 轮）', () {
+    FkOrphanReport reportWith(int? matchCount, int? total) => FkOrphanReport(
+      count: 3,
+      childSamples: const <String>['A'],
+      parentSamples: const <String>['B'],
+      sameNameColumn: '学号',
+      sameNameMatchCount: matchCount,
+      childNonEmptyCount: total,
+    );
+
+    test('ratio 0.99（99/100）→ 基本完全匹配，也是可一键改选', () {
+      final report = reportWith(99, 100);
+      expect(report.sameNameMatchRatio, closeTo(0.99, 1e-12));
+      expect(report.sameNameMostlyMatches, isTrue);
+      expect(report.sameNameHasMatches, isTrue);
+      expect(report.sameNamePartiallyMatches, isFalse);
+      expect(report.sameNameRemainingOrphans, 1);
+    });
+
+    test('ratio 0.9（27/30）→ 部分匹配，仍可一键改选', () {
+      final report = reportWith(27, 30);
+      expect(report.sameNameMostlyMatches, isFalse);
+      expect(report.sameNameHasMatches, isTrue);
+      expect(report.sameNamePartiallyMatches, isTrue);
+      expect(report.sameNameRemainingOrphans, 3);
+    });
+
+    test('ratio 0（0/30）→ 没有匹配数据，不给一键改选', () {
+      final report = reportWith(0, 30);
+      expect(report.sameNameHasMatches, isFalse);
+      expect(report.sameNamePartiallyMatches, isFalse);
+      expect(report.sameNameRemainingOrphans, 30);
+    });
+
+    test('匹配数为 null（没查到）→ 保持第 63 轮行为：不给一键改选', () {
+      final report = reportWith(null, 30);
+      expect(report.sameNameMatchRatio, isNull);
+      expect(report.sameNameHasMatches, isFalse);
+      expect(report.sameNamePartiallyMatches, isFalse);
+      expect(report.sameNameRemainingOrphans, isNull);
+    });
+  });
+
+  group('同名列部分匹配文案（第 64 轮）', () {
+    const partialReport = FkOrphanReport(
+      count: 30,
+      childSamples: <String>['20260101'],
+      parentSamples: <String>['1'],
+      sameNameColumn: '学号',
+      sameNameMatchCount: 27,
+      childNonEmptyCount: 30,
+    );
+
+    test('孤儿警告：说明只有 27/30 行匹配、仍有 3 行孤儿，不声称基本匹配', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkOrphanWarningMessage(
+        partialReport,
+        localTable: '年级成绩单',
+        localColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      );
+      expect(message, contains('27/30'));
+      expect(message, contains('3 行孤儿'));
+      expect(message, contains('创建外键仍可能失败'));
+      expect(message, contains('补齐数据'));
+      expect(message, contains('UNIQUE 索引'));
+      expect(message, isNot(contains('基本完全匹配')));
+    });
+
+    test('孤儿警告英文：同样说明匹配行数与剩余孤儿', () {
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final message = fkOrphanWarningMessage(
+        partialReport,
+        localTable: 'grade',
+        localColumn: '学号',
+        refTable: 'students',
+        refColumn: 'id',
+      );
+      expect(message, contains('27/30'));
+      expect(message, contains('3 orphan row(s)'));
+      expect(message, contains('fill in the missing data'));
+      expect(message, isNot(contains('almost perfectly')));
+    });
+
+    test('基本完全匹配（99/100）保留第 63 轮文案', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkOrphanWarningMessage(
+        const FkOrphanReport(
+          count: 1,
+          sameNameColumn: '学号',
+          sameNameMatchCount: 99,
+          childNonEmptyCount: 100,
+        ),
+        localTable: '年级成绩单',
+        localColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      );
+      expect(message, contains('基本完全匹配'));
+      expect(message, isNot(contains('行孤儿')));
+    });
+
+    test('1452 错误提示与警告一致：部分匹配给出 27/30、不暗示基本匹配', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkConstraintFailureMessage(
+        'ERROR 1452 (23000): Cannot add or update a child row: '
+            'a foreign key constraint fails',
+        localTable: '年级成绩单',
+        refTable: '学生名单',
+        localColumn: '学号',
+        refColumn: 'id',
+        report: partialReport,
+      );
+      expect(message, contains('27/30'));
+      expect(message, contains('UNIQUE'));
+      expect(message, contains('补齐数据'));
+      expect(message, isNot(contains('基本完全匹配')));
+    });
+  });
+
   group('fkConstraintFailureMessage：错误映射（第 61 轮）', () {
     const mysql1452 =
         'Cannot add or update a child row: a foreign key constraint fails '

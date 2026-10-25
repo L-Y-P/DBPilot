@@ -537,5 +537,33 @@ Future<void> showRelationDesigner(
 - apply_row_changes 在 COMMIT 后仅对零行 UPDATE 逐条探测：存在→reason=unchanged、不存在→not_found、探测失败→unknown（不影响批次）；DELETE 零行直接 not_found；zero_row_results[] 追加 reason，新增汇总 zero_row_reasons{not_found,unchanged,unknown}。
 - Dart table_view：BatchApplyOutcome 增加 notFound/unchanged/unknown 与纯函数 batchApplyCopy/batchZeroRowCopy；提示「N 条未命中（目标行不存在）」「M 条值未变化（未写入）」或组合；unknown/旧后端沿用原「未命中任何行」文案。
 - 重要发现：sqlx-mysql 握手请求 CLIENT_FOUND_ROWS，MySQL 同值 UPDATE 的 affected rows 是 1（matched）而不是 0；PG/SQLite 同样计 matched → 当前驱动栈上零行 UPDATE 实际只代表行不存在，unchanged 为防御性分支（单测覆盖，未来驱动若回报 changed-rows 自然生效），不会误报。
-- 风险：每条零行 UPDATE 多 1 次点查（keys 通常主键/唯一键；无索引表会扫表）；探测在 COMMIT 后独立查询，并发窗口内 reason 可能与提交瞬间不一致（仅影响提示）。
+- 风险（第 64 轮已修，见 §20.3）：每条零行 UPDATE 多 1 次点查、探测在 COMMIT 后独立查询导致并发窗口内 reason 可能不一致；第 64 轮改为同一事务内、COMMIT 前、一次 UNION ALL 批量探测。
+
+## 20. 第 64 轮修订（同名列部分匹配 / 1826 多次重试 / 零行探测事务内批量 / 改名冲突提示）
+
+### 20.1 孤儿警告「改用同名列」覆盖部分匹配
+
+- FkOrphanReport 新增 sameNameHasMatches（sameNameMatchCount > 0）、sameNamePartiallyMatches、sameNameRemainingOrphans（childNonEmptyCount - matchCount，clamp ≥ 0，仅用于「可能有」措辞）。
+- _createForeignKey 的 fixable 从 sameNameMostlyMatches 放宽到 sameNameHasMatches：≥99% 与部分匹配都会出现第三按钮 key=er-orphan-fix-samename；matchCount 为 null（没查到 / 查询失败）保持第 63 轮行为，不出按钮。
+- 文案：≥99% 保留「基本完全匹配」；部分匹配明确「两表该列只有 X/Y 行能匹配；改用后仍可能有 N 行孤儿，创建外键仍可能失败，需要先补齐数据」，不得声称基本匹配。按钮：≥99%「创建唯一索引并改用「X」」；部分匹配「改用同名列「X」并建唯一索引」。
+- 流程复用 _fixBySameNameColumn：唯一性检查→有重复只说明不发 DDL / 数据全唯一则建 UNIQUE（含 1826 重试）→成功经 FkRetryWithRefColumnException 重开弹窗且 refColumn=同名列；建索引失败保持原警告弹窗。fkConstraintFailureMessage 的 <99% 提示同步为同一事实口径。
+
+### 20.2 UNIQUE 索引名 1826 多次重试
+
+- _createUniqueIndex 最多 5 次尝试：uk_x、uk_x_2 … uk_x_5；仍撞名才走友好错误对话框。第 62 轮「引用列非唯一一键索引」与第 63 轮「孤儿同名列一键索引」共用该 helper。
+
+### 20.3 零行探测改到事务内并批量执行（消除并发窗口与 N 次点查）
+
+- SqlSession 新增 execute_transaction_probing(statements, probes: Vec<Option<String>>) → (Vec<ResultSet>, Vec<Option<bool>>)；原 execute_transaction 变为默认包装。PoolSession 三池转发；各驱动在 DML 全部执行后、COMMIT 之前，只对 row_count==0 且带 probe 的 UPDATE 执行探测。
+- 多条探测由 drivers::zero_row_probe_union 合并成一条 UNION ALL 查询（row_exists_sql 的输出原样作为派生表，语句下标用文本字面量返回），从「每条零行 UPDATE 一次往返」降为「每批一次往返」。
+- 探测失败只让对应条目 reason=unknown，绝不影响提交：MySQL/SQLite 语句错误不会 abort 事务；PostgreSQL 用 SAVEPOINT dbpilot_zero_row_probe 包住探测，失败 ROLLBACK TO SAVEPOINT，成功路径由 COMMIT 释放（已知代价：PG 有零行 UPDATE 时多一次 SAVEPOINT 往返）。
+- apply_row_changes：planning 阶段为 UPDATE 预生成 probe（INSERT/DELETE 为 None），reason 直接来自事务内探测；删除 COMMIT 后的 probe_row_exists 循环。JSON 契约不变：zero_row_results[].{index,action,keys,reason} + zero_row_reasons{not_found,unchanged,unknown}。
+- 测试：zero_row_probe_union 纯单测；SQLite driver 的「事务内 / 合并一条 / 探测失败不影响提交 / 非零行不探测」单测；SQLite 集成、MySQL live（两条零行 UPDATE）、PG live 各覆盖。
+
+### 20.4 表设计器列改名冲突可见化
+
+- 新增 tableDesignRenameConflicts(designColumns) + TableDesignRenameConflict（zh/en 完整文案），覆盖：新名为空、目标名是另一列原名（两列互换 / 链式改名）、目标名被未改名或新增列占用、多列改成同一目标名（后一条被跳过，otherColumn 指出先占用者）。
+- tableDesignRenameColumns 与冲突检测共用 _planDesignRenameColumns 同一份判定，输出语义逐字不变，避免两处逻辑漂移。
+- _applyDesign 在 dry_run 前弹中英双语警告框（取消 / 继续应用其余修改），取消什么都不做，确认后才 dry_run + ALTER；成功提示「修改已应用；N 处改名未生效（已跳过）」。_previewDesign 在结果区显示「预览 SQL 不包含以下 N 处改名」，设计 tab 保留可关闭的警示；无其它修改时提示「当前没有其它修改；继续不会修改数据库」。
+- 测试：table_design_rename_conflict_test.dart（28 例：纯逻辑、冲突集合与被跳过改名集合一致性、中英文案、弹窗 widget、SQLite live 接线）。
 

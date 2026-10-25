@@ -2555,4 +2555,311 @@ void main() {
     await settle(tester, rounds: 8);
     expect(tester.takeException(), isNull);
   });
+
+  // =====================================================================
+  // 第 64 轮：同名列部分匹配也能一键改选 + 1826 最多 5 次换名重试
+  // =====================================================================
+
+  Future<void> createPartialSameNameTables(WidgetTester tester) async {
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS 学生名单64 '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, 学号 INTEGER)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS 年级成绩单64 '
+        '(学号 INTEGER PRIMARY KEY AUTOINCREMENT, 姓名 TEXT)',
+      );
+      await Api.instance.query('DELETE FROM 学生名单64');
+      await Api.instance.query('DROP INDEX IF EXISTS "uk_学号"');
+      await Api.instance.query(
+        'INSERT INTO 学生名单64 (学号) VALUES '
+        '(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),'
+        '(11),(12),(13),(14),(15),(16),(17),(18),(19),(20),'
+        '(21),(22),(23),(24),(25),(26),(27)',
+      );
+    });
+  }
+
+  testWidgets('同名列部分匹配（27/30）：出现一键改选按钮且文案诚实（第 64 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    await createPartialSameNameTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['年级成绩单64', '学生名单64'],
+          height: 560,
+          driverOverride: 'mysql',
+          orphanReportOverride:
+              (localTable, localColumn, refTable, refColumn) =>
+                  const FkOrphanReport(
+                    count: 30,
+                    childSamples: <String>['20260101'],
+                    parentSamples: <String>['1'],
+                    sameNameColumn: '学号',
+                    sameNameMatchCount: 27,
+                    childNonEmptyCount: 30,
+                  ),
+          alterTableOverride: (table, body) async =>
+              <String, dynamic>{'failed': 0, 'results': <dynamic>[]},
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: '年级成绩单64',
+        localColumn: '学号',
+        refTable: '学生名单64',
+        refColumn: 'id',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    expect(find.text('新建外键关系'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 10);
+    // 部分匹配（27/30）也有第三按钮，且 key 与第 63 轮共用。
+    expect(find.byKey(const ValueKey('er-orphan-fix-samename')), findsOneWidget);
+    expect(find.textContaining('27/30'), findsWidgets);
+    expect(find.textContaining('3 行孤儿'), findsWidgets);
+    expect(find.textContaining('补齐数据'), findsWidgets);
+    expect(find.textContaining('基本完全匹配'), findsNothing);
+    expect(find.textContaining('改用同名列「学号」并建唯一索引'), findsOneWidget);
+
+    // 取消：不关闭新建外键弹窗，警告保留。
+    await tester.tap(find.byKey(const ValueKey('fk-precheck-cancel')));
+    await settle(tester, rounds: 8);
+    expect(find.text('新建外键关系'), findsOneWidget);
+    expect(find.textContaining('27/30'), findsWidgets);
+    await tester.tap(find.widgetWithText(Btn, '取消'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('部分匹配 + 同名列唯一：建 UNIQUE 后重开弹窗且引用列=同名列（第 64 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    await createPartialSameNameTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    final bodies = <Map<String, dynamic>>[];
+    var precheckCalls = 0;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['年级成绩单64', '学生名单64'],
+          height: 560,
+          driverOverride: 'mysql',
+          orphanReportOverride:
+              (localTable, localColumn, refTable, refColumn) {
+                precheckCalls++;
+                if (precheckCalls == 1) {
+                  return const FkOrphanReport(
+                    count: 30,
+                    childSamples: <String>['20260101'],
+                    parentSamples: <String>['1'],
+                    sameNameColumn: '学号',
+                    sameNameMatchCount: 27,
+                    childNonEmptyCount: 30,
+                  );
+                }
+                // 改用同名列后两表数据匹配：不再有孤儿行。
+                return const FkOrphanReport(count: 0);
+              },
+          uniquenessOverride: (table, column) async =>
+              const ErColumnUniqueness(total: 27, distinct: 27),
+          alterTableOverride: (table, body) async {
+            bodies.add(body);
+            // 模拟真实数据库：把 UNIQUE 索引真正建出来，_reloadTable 才能把
+            // 同名列计入「单列唯一」，重开的新建外键弹窗才不会被本地校验拦回。
+            for (final raw
+                in (body['add_indexes'] as List? ?? const <dynamic>[])) {
+              final index = raw as Map;
+              final name = (index['name'] as String).replaceAll('"', '""');
+              final columnName = ((index['columns'] as List).single as String)
+                  .replaceAll('"', '""');
+              final tableName = table.replaceAll('"', '""');
+              await Api.instance.query(
+                'CREATE UNIQUE INDEX "$name" ON "$tableName"("$columnName")',
+              );
+            }
+            return <String, dynamic>{'failed': 0, 'results': <dynamic>[]};
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: '年级成绩单64',
+        localColumn: '学号',
+        refTable: '学生名单64',
+        refColumn: 'id',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 10);
+    expect(find.byKey(const ValueKey('er-orphan-fix-samename')), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('er-orphan-fix-samename')));
+    await settle(tester, rounds: 24);
+    // 同名列数据全唯一 → 收到 add_indexes（unique=true，列=学号）。
+    final indexBodies = bodies
+        .where((body) => body['add_indexes'] != null)
+        .toList();
+    expect(indexBodies, hasLength(1));
+    final index = (indexBodies.single['add_indexes'] as List).single as Map;
+    expect(index['unique'], isTrue);
+    expect((index['columns'] as List).single, '学号');
+    expect(index['name'], startsWith('uk_学号'));
+    // 索引建好后用同名列重新打开弹窗（引用列=学号）。
+    expect(find.text('新建外键关系'), findsOneWidget);
+    expect(find.text('目标列不是唯一键'), findsNothing);
+
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 20);
+    final fkPayload = (bodies.last['add_foreign_keys'] as List).single as Map;
+    expect(fkPayload['ref_table'], '学生名单64');
+    expect((fkPayload['ref_columns'] as List).single, '学号');
+    expect(find.text('新建外键关系'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('部分匹配 + 同名列有重复：只说明、不发 DDL，保留原警告（第 64 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    await createPartialSameNameTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    var alterCalls = 0;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['年级成绩单64', '学生名单64'],
+          height: 560,
+          driverOverride: 'mysql',
+          orphanReportOverride:
+              (localTable, localColumn, refTable, refColumn) =>
+                  const FkOrphanReport(
+                    count: 30,
+                    childSamples: <String>['20260101'],
+                    parentSamples: <String>['1'],
+                    sameNameColumn: '学号',
+                    sameNameMatchCount: 27,
+                    childNonEmptyCount: 30,
+                  ),
+          uniquenessOverride: (table, column) async =>
+              const ErColumnUniqueness(
+                total: 27,
+                distinct: 1,
+                duplicates: <ErDuplicateValue>[
+                  ErDuplicateValue('20260101', 27),
+                ],
+              ),
+          alterTableOverride: (table, body) async {
+            alterCalls++;
+            return <String, dynamic>{'failed': 0, 'results': <dynamic>[]};
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: '年级成绩单64',
+        localColumn: '学号',
+        refTable: '学生名单64',
+        refColumn: 'id',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 10);
+    await tester.tap(find.byKey(const ValueKey('er-orphan-fix-samename')));
+    await settle(tester, rounds: 12);
+    // 重复值说明（数量/示例），不发任何 ALTER。
+    expect(find.text('目标列不是唯一键'), findsOneWidget);
+    expect(find.textContaining('27 行非空'), findsWidgets);
+    expect(find.textContaining('20260101'), findsWidgets);
+    expect(find.textContaining('出现 27 次'), findsWidgets);
+    expect(alterCalls, 0);
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 8);
+    // 回到原新建外键弹窗，仍保留部分匹配警告（引用列没变）。
+    expect(find.text('新建外键关系'), findsOneWidget);
+    expect(find.textContaining('27/30'), findsWidgets);
+    expect(tester.takeException(), isNull);
+    await tester.tap(find.widgetWithText(Btn, '取消'));
+    await settle(tester, rounds: 8);
+  });
+
+  testWidgets('1826 连续失败两次：第 3 次改用 uk_x_3 成功（第 64 轮）', (tester) async {
+    await setSurface(tester);
+    await createUniqueIndexScenarioTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    final bodies = <Map<String, dynamic>>[];
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['uq_child', 'uq_parent'],
+          height: 520,
+          driverOverride: 'mysql',
+          uniquenessOverride: (table, column) async =>
+              const ErColumnUniqueness(total: 3, distinct: 3),
+          alterTableOverride: (table, body) async {
+            bodies.add(body);
+            // 前两次撞名（模拟并发/缓存里索引名已被占用），第三次成功。
+            if (bodies.length <= 2) {
+              throw StateError(
+                'ERROR 1826 (HY000): Duplicate key name uk_code',
+              );
+            }
+            return <String, dynamic>{'failed': 0, 'results': <dynamic>[]};
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: 'uq_child',
+        localColumn: 'code',
+        refTable: 'uq_parent',
+        refColumn: 'code',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    expect(find.text('目标列不是唯一键'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-create-unique-index')));
+    await settle(tester, rounds: 26);
+
+    // 三次尝试的载荷：uk_code → uk_code_2 → uk_code_3，全部 unique=true。
+    expect(bodies, hasLength(3));
+    Map indexPayload(Map body) => (body['add_indexes'] as List).single as Map;
+    expect(indexPayload(bodies[0])['name'], 'uk_code');
+    expect(indexPayload(bodies[1])['name'], 'uk_code_2');
+    expect(indexPayload(bodies[2])['name'], 'uk_code_3');
+    for (final body in bodies) {
+      expect(indexPayload(body)['unique'], isTrue);
+      expect((indexPayload(body)['columns'] as List).single, 'code');
+    }
+    // override 假成功：重开后仍被真实结构拦回阻止提示；真实 DB 会打开弹窗。
+    expect(find.text('无法创建外键'), findsWidgets);
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
 }

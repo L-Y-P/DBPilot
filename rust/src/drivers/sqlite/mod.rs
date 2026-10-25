@@ -448,7 +448,9 @@ pub async fn run_one_limited_batched_owned(
     (result, truncated, stopped, conn)
 }
 
-/// Execute `statements` inside **one transaction**, one affected result each.
+/// Execute `statements` inside **one transaction**, one affected result each,
+/// then run the requested zero-row existence probes **inside the same
+/// transaction**, right before COMMIT.
 ///
 /// Transaction control goes through sqlx's transaction manager; the first
 /// failing statement rolls the whole batch back. SQLite is in-process, so no
@@ -457,11 +459,20 @@ pub async fn run_one_limited_batched_owned(
 ///
 /// INSERT detection mirrors [run_one_owned]: SQLite's `last_insert_rowid()` is
 /// per connection and must be read on the same transaction connection.
+///
+/// Round 64 moved the zero-row probe in here (it used to be one autocommit query
+/// per zero-row UPDATE *after* COMMIT) and merges all needed probes into a single
+/// UNION ALL query ([crate::drivers::zero_row_probe_union]), so the diagnostics
+/// see the transaction's own writes and cost one round trip instead of N. A
+/// failed statement in SQLite rolls back only that statement, so a failed probe
+/// leaves the candidates `None` ("unknown") and the batch still commits.
+///
 /// The failing statement's 1-based index is part of the error message.
 pub async fn run_transaction(
     pool: &SqlitePool,
     statements: Vec<String>,
-) -> AppResult<Vec<ResultSet>> {
+    probes: Vec<Option<String>>,
+) -> AppResult<(Vec<ResultSet>, Vec<Option<bool>>)> {
     let mut tx = pool
         .begin()
         .await
@@ -502,13 +513,68 @@ pub async fn run_transaction(
             }
         }
     }
+    // Diagnostics only, still inside the transaction: a probe failure must never
+    // fail the batch or change the commit outcome.
+    let probed = zero_row_probes(&mut tx, &results, &probes).await;
     tx.commit().await.map_err(|e| {
         AppError::bad(format!(
             "提交事务失败：{}",
             crate::error::database_message(&e)
         ))
     })?;
-    Ok(results)
+    Ok((results, probed))
+}
+
+/// Run the zero-row existence probes for one batch (round 64).
+///
+/// Only statements whose `row_count` is 0 and that carry a probe SQL take part;
+/// [crate::drivers::zero_row_probe_union] merges them into one query so ten
+/// zero-row updates cost one round trip instead of ten. The probe runs after
+/// every DML and before COMMIT, so it sees exactly the state the batch is about
+/// to commit.
+///
+/// Anything unexpected (permission, concurrent DDL) leaves the candidates at
+/// `None` — the API reports "unknown" and the batch keeps its result. SQLite
+/// rolls back only the failing statement, not the transaction, so COMMIT stays
+/// valid.
+async fn zero_row_probes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    results: &[ResultSet],
+    probes: &[Option<String>],
+) -> Vec<Option<bool>> {
+    let mut probed: Vec<Option<bool>> = vec![None; probes.len()];
+    let row_counts: Vec<u64> = results.iter().map(|result| result.row_count).collect();
+    let Some(union) = crate::drivers::zero_row_probe_union(&row_counts, probes) else {
+        return probed;
+    };
+    let rows = match sqlx::query(union.as_str()).fetch_all(&mut **tx).await {
+        Ok(rows) => rows,
+        // Never fail the batch for a diagnostics read.
+        Err(_) => return probed,
+    };
+    for row in rows {
+        let Some(index) = row
+            .try_get::<String, _>(0)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if let Some(slot) = probed.get_mut(index) {
+            *slot = Some(true);
+        }
+    }
+    // Every candidate that returned no row means the key matched nothing.
+    for (index, probe) in probes.iter().enumerate() {
+        if probe.is_some()
+            && index < probed.len()
+            && row_counts.get(index).copied().unwrap_or(0) == 0
+            && probed[index].is_none()
+        {
+            probed[index] = Some(false);
+        }
+    }
+    probed
 }
 
 fn error_set(stmt: String, e: sqlx::Error) -> ResultSet {
@@ -1810,5 +1876,128 @@ mod batch_stream_tests {
         assert!(!stopped);
         let _ = conn.close().await;
         cleanup(pool, path).await;
+    }
+}
+
+/// 第 64 轮：零行探测必须在同一事务内、COMMIT 之前、合并成一条查询执行。
+#[cfg(test)]
+mod transaction_probe_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    async fn temp_pool(tag: &str) -> (SqlitePool, std::path::PathBuf) {
+        let seq = TEST_DB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rma-sqlite-probe-{}-{}-{}.sqlite",
+            tag,
+            std::process::id(),
+            seq
+        ));
+        let _ = std::fs::remove_file(&path);
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("open the temp database");
+        (pool, path)
+    }
+
+    fn probe(id: i64) -> Option<String> {
+        Some(format!(
+            r#"SELECT 1 FROM "main"."t" WHERE "id" = {id} LIMIT 1"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn zero_row_probes_run_in_the_transaction_and_batch_into_one_query() {
+        let (pool, path) = temp_pool("batch").await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let statements = vec![
+            // 0 rows -> probed. The planted probe says row id=1 exists, which
+            // proves the supplied probe SQL is what actually executes (the driver
+            // does not invent its own existence check).
+            "UPDATE t SET v = 'x' WHERE id = 999".to_string(),
+            // DELETE 0 rows -> never probed.
+            "DELETE FROM t WHERE id = 888".to_string(),
+            // 1 row -> probe skipped; the probe is deliberately invalid SQL, so
+            // the batch would fail here if non-zero-row statements were probed.
+            "UPDATE t SET v = 'y' WHERE id = 1".to_string(),
+            // 0 rows -> probed, key really absent.
+            "UPDATE t SET v = 'z' WHERE id = 998".to_string(),
+        ];
+        let probes = vec![
+            probe(1),
+            None,
+            Some("SELECT * FROM definitely_missing_table".to_string()),
+            probe(998),
+        ];
+        let (results, probed) = run_transaction(&pool, statements, probes)
+            .await
+            .expect("batch must commit");
+        assert_eq!(
+            results.iter().map(|result| result.row_count).collect::<Vec<_>>(),
+            vec![0, 0, 1, 0]
+        );
+        assert_eq!(probed, vec![Some(true), None, None, Some(false)]);
+        // The DML really committed: the diagnostics did not roll anything back.
+        let value: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "y");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_is_unknown_and_never_fails_the_batch() {
+        let (pool, path) = temp_pool("failure").await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (id, v) VALUES (1, 'a')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let statements = vec![
+            "UPDATE t SET v = 'x' WHERE id = 999".to_string(), // 0 rows, probe fails
+            "UPDATE t SET v = 'y' WHERE id = 1".to_string(),   // 1 row, no probe
+        ];
+        let probes = vec![
+            // Invalid SQL: the batched probe query cannot run. That must only make
+            // the reason unknown, never roll the batch back.
+            Some("SELECT 1 FROM definitely_missing_table WHERE id = 1 LIMIT 1".to_string()),
+            None,
+        ];
+        let (results, probed) = run_transaction(&pool, statements, probes)
+            .await
+            .expect("a failed probe must not fail the batch");
+        assert_eq!(
+            results.iter().map(|result| result.row_count).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(probed, vec![None, None]);
+        // ...and the matching UPDATE still committed.
+        let value: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "y");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -645,10 +645,12 @@ pub trait DatabaseDriver: Send + Sync + fmt::Debug {
 
     /// 生成（不执行）一行存在性探测 SQL：SELECT 1 ... WHERE <keys> LIMIT 1。
     ///
-    /// 批量保存（api::explorer::apply_row_changes）在事务提交后用它区分
-    /// 「UPDATE 影响 0 行」的两种原因：行还在（值本来就一样，MySQL 只统计真正
-    /// 改变的行）还是行已经不在了。标识符/字面量走与 [Self::change_row_sql]
-    /// 相同的 dialect helper，绝不拼接未转义的值。
+    /// 批量保存（api::explorer::apply_row_changes）在**同一事务内、所有 DML 之后、
+    /// COMMIT 之前**用它区分「UPDATE 影响 0 行」的两种原因：行还在（值本来就一样，
+    /// MySQL 只统计真正改变的行）还是行已经不在了。多条探测由驱动合并成一次
+    /// UNION ALL 查询（[crate::connection::SqlSession::execute_transaction_probing]）。
+    /// 标识符/字面量走与 [Self::change_row_sql] 相同的 dialect helper，绝不拼接
+    /// 未转义的值。
     fn row_exists_sql(
         &self,
         namespace: &str,

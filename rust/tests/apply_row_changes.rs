@@ -548,11 +548,30 @@ async fn postgres_batch_edits_are_atomic() {
             { "action": "update", "keys": { "id": 1 }, "values": { "code": "ONE", "qty": 10 } },
             { "action": "update", "keys": { "id": 2 }, "values": { "qty": 20 } },
             { "action": "insert", "values": { "id": 3, "code": "three", "qty": 30 } },
+            // Zero-row UPDATE: its existence probe runs inside the same
+            // transaction before COMMIT (PostgreSQL wraps it in a SAVEPOINT, so a
+            // probe error could never turn the batch into a rollback).
+            { "action": "update", "keys": { "id": 999 }, "values": { "qty": 0 } },
         ]),
     ))
     .await;
     assert_eq!(done["ok"], json!(true), "{done}");
     assert_eq!(done["rows_affected"], json!(3), "{done}");
+    assert_eq!(
+        done["zero_row_results"],
+        json!([{
+            "index": 3,
+            "action": "update",
+            "keys": { "id": 999 },
+            "reason": "not_found"
+        }]),
+        "{done}"
+    );
+    assert_eq!(
+        done["zero_row_reasons"],
+        json!({ "not_found": 1, "unchanged": 0, "unknown": 0 }),
+        "{done}"
+    );
     let rows = run(&format!(
         "SELECT id, code, qty FROM {table_sql} ORDER BY id"
     ))
@@ -656,6 +675,9 @@ async fn mysql_zero_row_reasons_distinguish_missing_and_unchanged() {
             { "action": "delete", "keys": { "id": 999 } },
             // real change -> normal hit, not a diagnostic.
             { "action": "update", "keys": { "id": 1 }, "values": { "qty": 20 } },
+            // A second zero-row UPDATE: both probes are merged into one UNION ALL
+            // round trip inside the transaction (round 64).
+            { "action": "update", "keys": { "id": 998 }, "values": { "qty": 2 } },
         ]),
     ))
     .await;
@@ -679,12 +701,18 @@ async fn mysql_zero_row_reasons_distinguish_missing_and_unchanged() {
                 "keys": { "id": 999 },
                 "reason": "not_found"
             },
+            {
+                "index": 4,
+                "action": "update",
+                "keys": { "id": 998 },
+                "reason": "not_found"
+            },
         ]),
         "{result}"
     );
     assert_eq!(
         result["zero_row_reasons"],
-        json!({ "not_found": 2, "unchanged": 0, "unknown": 0 }),
+        json!({ "not_found": 3, "unchanged": 0, "unknown": 0 }),
         "{result}"
     );
     let rows = run(&format!(

@@ -166,11 +166,204 @@ Json tableDesignResetColumnRow(Json baseline) {
   };
 }
 
+/// 一条会被静默跳过的列改名（第 64 轮）。
+///
+/// [TableDesignRenameConflict.zh] / [TableDesignRenameConflict.en] 是可直接展示
+/// 的完整文案（含「原名 → 新名」与原因），供应用前的警告对话框和 SQL 预览警示
+/// 使用。判定与 [tableDesignRenameColumns] 共用同一份规划：只要这里报一条冲突，
+/// 那条改名就一定不会进入 `rename_columns`，反之亦然。
+class TableDesignRenameConflict {
+  const TableDesignRenameConflict({
+    required this.from,
+    required this.to,
+    required this.kind,
+    this.otherColumn = '',
+  });
+
+  /// 数据库里的原名（trim 后，非空）。
+  final String from;
+
+  /// 用户输入的新名（trim 后；[TableDesignRenameConflictKind.emptyName] 时为空串）。
+  final String to;
+
+  /// 被跳过的主要原因。
+  final TableDesignRenameConflictKind kind;
+
+  /// 仅 [TableDesignRenameConflictKind.duplicateTarget] 使用：先占用该目标名的
+  /// 那一列的原名。
+  final String otherColumn;
+
+  /// 中文完整文案（始终中文，不受当前界面语言影响）。
+  String get zh {
+    final target = to.isEmpty ? '（空）' : to;
+    final reason = switch (kind) {
+      TableDesignRenameConflictKind.emptyName => '新列名为空，不会执行改名（数据库里仍然是原来的列名）。',
+      TableDesignRenameConflictKind.originalNameTaken =>
+        '目标名「$to」还是另一列的原名（两列互换或链式改名也一样）；'
+            '逐条改名时会撞名，所以跳过。',
+      TableDesignRenameConflictKind.nameOccupied =>
+        '目标名「$to」已被另一列占用（那列没有改名，或是新增列），所以跳过。',
+      TableDesignRenameConflictKind.duplicateTarget =>
+        '列「$otherColumn」也要改名为「$to」；只有第一列会生效，这一条被跳过。',
+    };
+    return '$from → $target：$reason';
+  }
+
+  /// 英文完整文案（始终英文，不受当前界面语言影响）。
+  String get en {
+    final target = to.isEmpty ? '(blank)' : to;
+    final reason = switch (kind) {
+      TableDesignRenameConflictKind.emptyName =>
+        'The new name is blank, so the column keeps its current name.',
+      TableDesignRenameConflictKind.originalNameTaken =>
+        'The target name "$to" is still another column\'s old name (the same '
+            'applies to swapped or chained renames); renaming column by column '
+            'would collide, so this rename is skipped.',
+      TableDesignRenameConflictKind.nameOccupied =>
+        'The target name "$to" is already used by another column (it is not '
+            'being renamed, or it is a newly added column), so this rename is '
+            'skipped.',
+      TableDesignRenameConflictKind.duplicateTarget =>
+        'Column "$otherColumn" is also renamed to "$to"; only the first one '
+            'takes effect, so this rename is skipped.',
+    };
+    return '$from → $target: $reason';
+  }
+}
+
+/// 列改名被跳过的原因（第 64 轮）。
+enum TableDesignRenameConflictKind {
+  /// 新列名为空：不执行改名，数据库里保持原名。
+  emptyName,
+
+  /// 目标名仍是另一列的原名，包括两列互换 / A→B→C 链式改名。
+  originalNameTaken,
+
+  /// 目标名被一个不参与改名的列占用（典型：新增列用了同一个名字）。
+  nameOccupied,
+
+  /// 多列改成同一个目标名：只有按列顺序的第一列会生效。
+  duplicateTarget,
+}
+
+/// 单条「用户想改名」的计划（第 64 轮内部结构，[tableDesignRenameColumns] 与
+/// [tableDesignRenameConflicts] 共用，避免两处判定再次漂移）。
+class _PlannedDesignRename {
+  _PlannedDesignRename({required this.from, required this.to});
+
+  final String from;
+  final String to;
+
+  /// null = 会真正生成 RENAME；非 null = 被跳过及原因。
+  TableDesignRenameConflict? conflict;
+}
+
+/// 规划每一列的改名：哪些会生效、哪些会被跳过以及原因。
+///
+/// 「想改名」= 现有列（isNew != true）、原名非空、trim 后新旧名不同（含新名为
+/// 空的输入）。逐条模拟 [tableDesignRenameColumns] 原有的顺序判定：
+///   1. 新名为空 → 跳过；
+///   2. 目标名与前一条已生效改名的目标名相同 → 只有第一条生效；
+///   3. 目标名是任一其它列的原名 → 逐条 RENAME 中间态撞名；
+///   4. 目标名被一个不参与改名的列（新增列等）占用 → 撞名。
+List<_PlannedDesignRename> _planDesignRenameColumns(List<Json> designColumns) {
+  final count = designColumns.length;
+  final originals = <String>[];
+  final currentNames = <String>[];
+  final candidates = <bool>[];
+  final desired = <bool>[];
+  for (var i = 0; i < count; i++) {
+    final column = designColumns[i];
+    final original = (column['original'] ?? '').toString().trim();
+    final name = (column['name'] ?? '').toString().trim();
+    originals.add(original.toLowerCase());
+    currentNames.add(name.toLowerCase());
+    // candidates 与第 56 轮的判定逐字一致：它决定「不参与改名的列」和「空名
+    // 列」在撞名检查里的身份，不能为了 UI 提示而改动。
+    candidates.add(
+      column['isNew'] != true &&
+          original.isNotEmpty &&
+          name.isNotEmpty &&
+          original != name,
+    );
+    // desired 额外包含「新名为空」的现有列：那也是一次用户想改名但不会生效的
+    // 输入，需要进冲突列表（candidates 里它是 false，不会生成 RENAME）。
+    desired.add(
+      column['isNew'] != true && original.isNotEmpty && original != name,
+    );
+  }
+
+  final planned = <_PlannedDesignRename>[];
+  // 小写目标名 → 第一条生效改名的原名（重复目标名时用来说明「谁占了名字」）。
+  final taken = <String, String>{};
+  for (var i = 0; i < count; i++) {
+    if (!desired[i]) continue;
+    final from = (designColumns[i]['original'] ?? '').toString().trim();
+    final to = (designColumns[i]['name'] ?? '').toString().trim();
+    final entry = _PlannedDesignRename(from: from, to: to);
+    planned.add(entry);
+    if (to.isEmpty) {
+      entry.conflict = TableDesignRenameConflict(
+        from: from,
+        to: to,
+        kind: TableDesignRenameConflictKind.emptyName,
+      );
+      continue;
+    }
+    final key = to.toLowerCase();
+    final first = taken[key];
+    if (first != null) {
+      entry.conflict = TableDesignRenameConflict(
+        from: from,
+        to: to,
+        kind: TableDesignRenameConflictKind.duplicateTarget,
+        otherColumn: first,
+      );
+      continue;
+    }
+    var conflictKind = _RenameCollision.none;
+    for (var j = 0; j < count; j++) {
+      if (j == i) continue;
+      if (originals[j] == key) {
+        // 目标名还是另一列的原名：逐条 RENAME 时该列尚未改名 → 撞名。
+        conflictKind = _RenameCollision.originalName;
+        break;
+      }
+      if (!candidates[j] && currentNames[j] == key) {
+        // 目标名被一个不参与重命名的列（例如新增列）占用。
+        conflictKind = _RenameCollision.nameOccupied;
+        break;
+      }
+    }
+    if (conflictKind == _RenameCollision.originalName) {
+      entry.conflict = TableDesignRenameConflict(
+        from: from,
+        to: to,
+        kind: TableDesignRenameConflictKind.originalNameTaken,
+      );
+      continue;
+    }
+    if (conflictKind == _RenameCollision.nameOccupied) {
+      entry.conflict = TableDesignRenameConflict(
+        from: from,
+        to: to,
+        kind: TableDesignRenameConflictKind.nameOccupied,
+      );
+      continue;
+    }
+    taken[key] = from;
+  }
+  return planned;
+}
+
+enum _RenameCollision { none, originalName, nameOccupied }
+
 /// 设计器里需要重命名的列（第 56 轮补充：列重命名真正生效）。
 ///
 /// 只输出「数据库里已存在（isNew != true）且名字真的变了」的列，按设计器里的
 /// 列顺序返回 `{'from': 原名, 'to': 新名}`。以下情况不生成，避免 ALTER 指向
-/// 不存在/冲突的列（UI 如需更细的提示可另做校验）：
+/// 不存在/冲突的列（第 64 轮起这些情况由 [tableDesignRenameConflicts] 明确列给
+/// 用户，不再静默跳过）：
 ///   * 新加的列（isNew）没有原名，不能 RENAME；
 ///   * 原名/新名为空（不会产生空 to）；
 ///   * 新旧名相同（trim 后比较）；
@@ -183,47 +376,128 @@ Json tableDesignResetColumnRow(Json baseline) {
 /// [tableDesignColumnAlterPayload]）；未改名或改名因撞名被跳过时仍用原名。
 /// SQLite 由驱动按自己的重建/rename 语义处理同一个 spec。
 List<Json> tableDesignRenameColumns(List<Json> designColumns) {
-  final count = designColumns.length;
-  final originals = <String>[];
-  final currentNames = <String>[];
-  final candidates = <bool>[];
-  for (var i = 0; i < count; i++) {
-    final column = designColumns[i];
-    final original = (column['original'] ?? '').toString().trim();
-    final name = (column['name'] ?? '').toString().trim();
-    originals.add(original.toLowerCase());
-    currentNames.add(name.toLowerCase());
-    candidates.add(
-      column['isNew'] != true &&
-          original.isNotEmpty &&
-          name.isNotEmpty &&
-          original != name,
-    );
-  }
   final out = <Json>[];
-  final taken = <String>{};
-  for (var i = 0; i < count; i++) {
-    if (!candidates[i]) continue;
-    final from = (designColumns[i]['original'] ?? '').toString().trim();
-    final to = (designColumns[i]['name'] ?? '').toString().trim();
-    final key = to.toLowerCase();
-    if (taken.contains(key)) continue;
-    var conflict = false;
-    for (var j = 0; j < count && !conflict; j++) {
-      if (j == i) continue;
-      if (originals[j] == key) {
-        // 目标名还是另一列的原名：逐条 RENAME 时该列尚未改名 → 撞名。
-        conflict = true;
-      } else if (!candidates[j] && currentNames[j] == key) {
-        // 目标名被一个不参与重命名的列占用。
-        conflict = true;
-      }
-    }
-    if (conflict) continue;
-    taken.add(key);
-    out.add(<String, dynamic>{'from': from, 'to': to});
+  for (final entry in _planDesignRenameColumns(designColumns)) {
+    if (entry.conflict != null) continue;
+    out.add(<String, dynamic>{'from': entry.from, 'to': entry.to});
   }
   return out;
+}
+
+/// 列出「用户改了列名，但不会生效」的所有情况及原因（第 64 轮）。
+///
+/// 与 [tableDesignRenameColumns] 共用 [_planDesignRenameColumns] 的判定：返回的
+/// 每一条都恰好对应一条被跳过的改名，顺序与设计器里的列顺序一致。空列表表示
+/// 所有改名都会真正执行。
+List<TableDesignRenameConflict> tableDesignRenameConflicts(
+  List<Json> designColumns,
+) {
+  final out = <TableDesignRenameConflict>[];
+  for (final entry in _planDesignRenameColumns(designColumns)) {
+    final conflict = entry.conflict;
+    if (conflict != null) out.add(conflict);
+  }
+  return out;
+}
+
+/// 把冲突列表渲染成多行警示文案（应用前对话框 / 预览结果共用，第 64 轮）。
+///
+/// [preview] 为 true 时说明「预览 SQL 不包含这些改名」，否则说明「继续应用会
+/// 跳过它们」。
+String tableDesignRenameConflictWarning(
+  List<TableDesignRenameConflict> conflicts, {
+  bool preview = false,
+}) {
+  final count = conflicts.length;
+  final head = preview
+      ? pickText(
+          '预览 SQL 不包含以下 $count 处改名（它们不会生效）：',
+          'The preview SQL does not include the following $count rename(s) '
+              '(they will not take effect):',
+        )
+      : pickText(
+          '以下 $count 处改名不会生效（继续应用会跳过它们）：',
+          'The following $count rename(s) will not take effect (they are '
+              'skipped when you continue):',
+        );
+  final lines = conflicts
+      .map((conflict) => '• ${pickText(conflict.zh, conflict.en)}')
+      .join('\n');
+  return '$head\n$lines';
+}
+
+/// 应用修改前把「哪些改名会被跳过」明确告诉用户（第 64 轮）。
+///
+/// 返回 true 表示用户选择继续应用其余修改；false（取消 / 关闭）表示什么都不做。
+/// 调用方必须先拿到 true 才执行 dry_run 与真正的 ALTER。
+Future<bool> showTableDesignRenameConflictDialog(
+  BuildContext context, {
+  required List<TableDesignRenameConflict> conflicts,
+  bool hasOtherChanges = true,
+}) async {
+  final result = await showAppModal<bool>(
+    context: context,
+    title: pickText('有改名不会生效', 'Some renames will not take effect'),
+    builder: (context) => ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 720),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          AlertBox(
+            pickText(
+              '有 ${conflicts.length} 处列改名会被跳过：数据库里的列名保持原名，'
+                  '不是您输入的新名字。',
+              '${conflicts.length} column rename(s) will be skipped: the database '
+                  'keeps the old names, not the names you typed.',
+            ),
+            tone: AlertTone.warn,
+          ),
+          for (final conflict in conflicts)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                '• ${pickText(conflict.zh, conflict.en)}',
+                style: kSmall,
+              ),
+            ),
+          const SizedBox(height: 4),
+          Text(
+            hasOtherChanges
+                ? pickText(
+                    '选择「继续应用其余修改」会跳过这些改名，其余修改照常应用。',
+                    '"Apply the other changes" skips these renames and applies '
+                        'everything else as usual.',
+                  )
+                : pickText(
+                    '当前没有其它修改；继续不会修改数据库。',
+                    'There are no other changes: continuing will not modify the '
+                        'database.',
+                  ),
+            style: kSmallMuted,
+          ),
+        ],
+      ),
+    ),
+    actions: <Widget>[
+      Builder(
+        builder: (context) => Btn(
+          pickText('取消', 'Cancel'),
+          key: const ValueKey<String>('table-design-rename-conflict-cancel'),
+          onPressed: () => Navigator.of(context).pop(false),
+        ),
+      ),
+      Builder(
+        builder: (context) => Btn(
+          pickText('继续应用其余修改', 'Apply the other changes'),
+          key: const ValueKey<String>('table-design-rename-conflict-continue'),
+          primary: true,
+          onPressed: () => Navigator.of(context).pop(true),
+        ),
+      ),
+    ],
+  );
+  return result ?? false;
 }
 
 /// 现有列在 ALTER 载荷里的列名（第 56 轮补充：rename 改成独立语句先执行后，
@@ -552,6 +826,8 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   String? _designSql;
   List<Json> _designResults = <Json>[];
   String? _designError;
+  /// 第 64 轮：预览/应用时算出的「会被跳过的列改名」警示（空 = 无冲突）。
+  String? _designWarning;
   final _renameTo = TextEditingController();
   final _tableComment = TextEditingController();
 
@@ -783,6 +1059,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       _designSql = null;
       _designResults = <Json>[];
       _designError = null;
+      _designWarning = null;
       // Another table's total must not be shown while this one loads: the
       // header pill reads _data / _knownTotal, and both used to survive the
       // switch (round34 P2-01).
@@ -1115,8 +1392,10 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
         'original': (column['name'] ?? '').toString(),
       });
     }
-    // 重新播种 = 回到数据库里的基线：清掉「用户动过设计器」的标记。
+    // 重新播种 = 回到数据库里的基线：清掉「用户动过设计器」的标记，以及上一
+    // 次预览/应用留下的改名警示（第 64 轮）。
     _designRevision.value = 0;
+    _designWarning = null;
     final info = _structure['info'];
     if (info is Map) {
       _renameTo.clear();
@@ -2093,6 +2372,12 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                 ],
               ),
               const SizedBox(height: 8),
+              if (_designWarning != null)
+                AlertBox(
+                  _designWarning!,
+                  tone: AlertTone.warn,
+                  onClose: () => setState(() => _designWarning = null),
+                ),
               if (_designError != null) AlertBox(_designError!),
               if (_designSql != null) CodeBlock(_designSql!),
               for (final result in _designResults)
@@ -2621,6 +2906,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       _designSql = null;
       _designResults = <Json>[];
       _designError = null;
+      _designWarning = null;
       _designRevision.value = 0;
     });
     widget.notice.show(
@@ -2673,16 +2959,23 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
 
   Future<void> _previewDesign() async {
     final body = _buildAlter();
+    // 第 64 轮：撞名/互换/空名/重复目标名的改名不会进入 SQL。预览里明确警示，
+    // 避免用户看着预览 SQL 以为改名也会生效。
+    final conflicts = tableDesignRenameConflicts(_designColumns);
+    setState(() {
+      _designWarning = conflicts.isEmpty
+          ? null
+          : tableDesignRenameConflictWarning(conflicts, preview: true);
+    });
     if (tableDesignBodyEmpty(body)) {
       setState(() => _designError = '没有需要应用的修改');
       return;
     }
     try {
-      final res = await Api.instance.alterTable(
-        widget.db,
-        widget.table,
-        {...body, 'dry_run': true},
-      );
+      final res = await Api.instance.alterTable(widget.db, widget.table, {
+        ...body,
+        'dry_run': true,
+      });
       final statements = res['statements'];
       setState(() {
         _designError = null;
@@ -2694,19 +2987,35 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     }
   }
 
-
   Future<void> _applyDesign() async {
     final body = _buildAlter();
+    // 第 64 轮：tableDesignRenameColumns 会安全跳过撞名/互换/空名/重复目标名的
+    // 改名，但界面不能装作它们生效了。先把「哪些改名会被跳过」逐条说清楚：
+    // 取消则什么都不做；确认后才继续 dry_run + 真正的 ALTER（DDL 载荷语义不变）。
+    final conflicts = tableDesignRenameConflicts(_designColumns);
+    if (conflicts.isNotEmpty) {
+      setState(() {
+        _designWarning = tableDesignRenameConflictWarning(conflicts);
+      });
+      if (!mounted) return;
+      final proceed = await showTableDesignRenameConflictDialog(
+        context,
+        conflicts: conflicts,
+        hasOtherChanges: !tableDesignBodyEmpty(body),
+      );
+      if (!proceed || !mounted) return;
+    } else if (_designWarning != null) {
+      setState(() => _designWarning = null);
+    }
     if (tableDesignBodyEmpty(body)) {
       setState(() => _designError = '没有需要应用的修改');
       return;
     }
     try {
-      final preview = await Api.instance.alterTable(
-        widget.db,
-        widget.table,
-        {...body, 'dry_run': true},
-      );
+      final preview = await Api.instance.alterTable(widget.db, widget.table, {
+        ...body,
+        'dry_run': true,
+      });
       final statements = preview['statements'];
       final sql = statements is List ? statements.join(';\n') : '';
       if (!mounted) return;
@@ -2728,7 +3037,14 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       });
       final failed = _designResults.where((r) => r['error'] != null).length;
       if (failed == 0) {
-        widget.notice.show('修改已应用');
+        widget.notice.show(
+          conflicts.isEmpty
+              ? pickText('修改已应用', 'Changes applied')
+              : pickText(
+                  '修改已应用；${conflicts.length} 处改名未生效（已跳过）',
+                  'Changes applied; ${conflicts.length} rename(s) were skipped',
+                ),
+        );
         await _reloadAll();
       } else {
         setState(() => _designError = '有 $failed 条语句执行失败，请查看下方结果');
@@ -2737,7 +3053,6 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       if (mounted) setState(() => _designError = describeDbError(e));
     }
   }
-
 
   // -------------------------------------------------------------------- sql
 

@@ -541,6 +541,54 @@ impl PoolSession {
     }
 }
 
+// ------------------------------------------- 零行探测的批量 SQL（64 轮）
+
+/// 把多条「行是否还在」探测合并成**一条** UNION ALL 查询。
+///
+/// 批量保存（`api::explorer::apply_row_changes`）里每条影响 0 行的 UPDATE 都
+/// 需要一个存在性探测。逐条发查询在大批量零行时会变成 N 次数据库往返（第 63
+/// 轮遗留问题），这里按语句顺序把探测合成一条：
+///
+/// ~~~sql
+/// SELECT '3' AS probe_index FROM (SELECT 1 FROM t WHERE id = 9 LIMIT 1) AS dbpilot_probe_3
+/// UNION ALL SELECT '7' AS probe_index FROM (...) AS dbpilot_probe_7
+/// ~~~
+///
+/// - `probe_index` 是语句下标（我们自己生成的十进制整数，不是用户输入），
+///   用**文本字面量**避免 MySQL/PostgreSQL/SQLite 对无类型整数字面量的类型分歧；
+///   返回的行据此映射回 statements，不依赖返回顺序。
+/// - 探测 SQL 原样作为派生表（子查询），所以标识符/字面量仍由
+///   `DatabaseDriver::row_exists_sql` 按方言转义，这里不拼接任何用户值。
+/// - 只有 `row_counts[i] == 0` 且 `probes[i].is_some()` 的语句参与；一条都不
+///   需要时返回 `None`（不产生任何往返）。
+///
+/// 该查询由各驱动在自己的事务里执行，失败只影响诊断（见
+/// `crate::core::connection::SqlSession::execute_transaction_probing`）。
+pub(crate) fn zero_row_probe_union(
+    row_counts: &[u64],
+    probes: &[Option<String>],
+) -> Option<String> {
+    let branches: Vec<String> = probes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, probe)| {
+            let probe = probe.as_deref()?;
+            if row_counts.get(index).copied().unwrap_or(0) != 0 {
+                return None;
+            }
+            Some(format!(
+                "SELECT '{}' AS probe_index FROM ({}) AS dbpilot_probe_{}",
+                index, probe, index
+            ))
+        })
+        .collect();
+    if branches.is_empty() {
+        None
+    } else {
+        Some(branches.join(" UNION ALL "))
+    }
+}
+
 // ------------------------------------------------- core trait impl (32 轮)
 
 /// `PoolSession` 是 `SqlSession` 的唯一实现：api 只持有 `ConnectionHandle`，
@@ -577,21 +625,27 @@ impl crate::core::connection::SqlSession for PoolSession {
         self.pool.close().await;
     }
 
-    /// 一个事务内执行多条语句（批量保存：全部成功才提交，否则整批回滚）。
+    /// 一个事务内执行多条语句（批量保存：全部成功才提交，否则整批回滚），
+    /// 并在 COMMIT 之前为调用方指定的语句批量执行零行存在性探测。
     ///
     /// 事务控制由各驱动用 sqlx 的 transaction API 发出。**不要**在这里执行
     /// 文本 `BEGIN`：MySQL 的 prepared-statement 协议拒绝它（1295），而
     /// 单语句执行路径对这类错误会回退到池里另一条连接。
-    async fn execute_transaction(
+    ///
+    /// 探测与 DML 在同一事务里（所有 DML 之后、COMMIT 之前），并由
+    /// [zero_row_probe_union] 合并成一条 UNION ALL 查询；探测失败只会让对应条目
+    /// 回 `None`（unknown），不影响提交。
+    async fn execute_transaction_probing(
         &self,
         statements: Vec<String>,
-    ) -> AppResult<Vec<ResultSet>> {
+        probes: Vec<Option<String>>,
+    ) -> AppResult<(Vec<ResultSet>, Vec<Option<bool>>)> {
         match &self.pool {
             Pool::MySql(pool) => {
-                crate::drivers::mysql::exec::run_transaction(pool, statements).await
+                crate::drivers::mysql::exec::run_transaction(pool, statements, probes).await
             }
-            Pool::Postgres(pool) => postgres::run_transaction(pool, statements).await,
-            Pool::Sqlite(pool) => sqlite::run_transaction(pool, statements).await,
+            Pool::Postgres(pool) => postgres::run_transaction(pool, statements, probes).await,
+            Pool::Sqlite(pool) => sqlite::run_transaction(pool, statements, probes).await,
         }
     }
 
@@ -1114,6 +1168,48 @@ mod wording_tests {
             .for_database("mysql")
             .to_string();
         assert_eq!(twice, message);
+    }
+}
+
+/// 第 64 轮：零行探测的 UNION ALL 构造是三个驱动共用的纯函数。
+#[cfg(test)]
+mod probe_union_tests {
+    use super::zero_row_probe_union;
+
+    fn probe(table: &str) -> Option<String> {
+        Some(format!("SELECT 1 FROM {table} WHERE id = 1 LIMIT 1"))
+    }
+
+    #[test]
+    fn no_probe_needed_means_no_round_trip() {
+        // DELETE / INSERT never carry a probe, and a probe only runs when its
+        // statement affected 0 rows.
+        assert_eq!(zero_row_probe_union(&[0, 0], &[None, None]), None);
+        assert_eq!(zero_row_probe_union(&[1], &[probe("t")]), None);
+        assert_eq!(zero_row_probe_union(&[], &[]), None);
+        // Defensive: a probes slice shorter than the row counts must not panic.
+        assert_eq!(zero_row_probe_union(&[0], &[]), None);
+    }
+
+    #[test]
+    fn every_needed_probe_becomes_one_union_branch() {
+        let probes = vec![
+            probe("a"),  // affected 0 rows -> probed
+            probe("b"),  // affected 1 row -> skipped
+            None,        // INSERT / DELETE -> never probed
+            probe("c"),  // affected 0 rows -> probed
+        ];
+        let union = zero_row_probe_union(&[0, 1, 0, 0], &probes).expect("two branches");
+        // One round trip regardless of how many rows need explaining.
+        assert_eq!(union.matches(" UNION ALL ").count(), 1, "{union}");
+        // The statement index travels as a text literal (integer literals decode
+        // differently per driver) and the probe SQL is embedded verbatim as a
+        // derived table, so dialect quoting is still the driver's job.
+        assert_eq!(
+            union,
+            "SELECT '0' AS probe_index FROM (SELECT 1 FROM a WHERE id = 1 LIMIT 1) AS dbpilot_probe_0 \
+             UNION ALL SELECT '3' AS probe_index FROM (SELECT 1 FROM c WHERE id = 1 LIMIT 1) AS dbpilot_probe_3"
+        );
     }
 }
 /// 第 56 轮补充：列重命名（rename_columns）必须是独立的 ALTER 语句，并且排在

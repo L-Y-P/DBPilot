@@ -2453,6 +2453,31 @@ class FkOrphanReport {
     final ratio = sameNameMatchRatio;
     return ratio != null && ratio >= 0.99;
   }
+
+  /// 同名列是否有可用于「一键改选」的匹配数据（第 64 轮）。
+  ///
+  /// ≥99%（[sameNameMostlyMatches]）与部分匹配（匹配数 > 0）都算；匹配数为
+  /// null（没查询 / 查询失败）时保持第 63 轮行为：不建议一键改。
+  bool get sameNameHasMatches {
+    final matched = sameNameMatchCount;
+    return matched != null && matched > 0;
+  }
+
+  /// 同名列只部分匹配（匹配数 > 0 但未到 99%）：一键改选后仍可能留下孤儿行。
+  bool get sameNamePartiallyMatches =>
+      sameNameHasMatches && !sameNameMostlyMatches;
+
+  /// 改用同名列后按行数估算仍可能留下的孤儿行数；无法计算时为 null。
+  ///
+  /// 用「子列非空行数 - 同名列匹配行数」估算（引用表同名列有重复值时 JOIN 会
+  /// 放大匹配数，这里按 0 下限处理，文案只说「可能有」）。
+  int? get sameNameRemainingOrphans {
+    final total = childNonEmptyCount;
+    final matched = sameNameMatchCount;
+    if (total == null || matched == null) return null;
+    final remaining = total - matched;
+    return remaining > 0 ? remaining : 0;
+  }
 }
 
 /// 从 Api.query 的返回里取第一个语句的行（容忍 results/rows 与 List/Map 行）。
@@ -2584,6 +2609,35 @@ String fkOrphanWarningMessage(
               '"$qualifiedName" instead.',
         ),
       );
+    } else if (report.sameNameHasMatches) {
+      // 第 64 轮：部分匹配也能一键改选，但必须诚实说明「改用后仍可能有孤儿」，
+      // 不能声称基本匹配（否则文员会以为改一下就好，创建仍会失败）。
+      final remaining = report.sameNameRemainingOrphans;
+      final countsClauseZh = counts.isEmpty
+          ? '，两表该列只有部分行能匹配'
+          : '，两表该列只有 $counts 行能匹配';
+      final countsClauseEn = counts.isEmpty
+          ? ' and only some of its rows match'
+          : ' and only $counts rows match';
+      final remainingClauseZh = remaining == null
+          ? '改用后仍可能有孤儿行'
+          : '改用后仍可能有 $remaining 行孤儿';
+      final remainingClauseEn = remaining == null
+          ? 'switching to it may still leave orphan rows'
+          : 'switching to it may still leave $remaining orphan row(s)';
+      lines.add(
+        pickText(
+          '注意：引用表「$refTable」里也有「$sameName」列$countsClauseZh；'
+              '$remainingClauseZh，创建外键仍可能失败，需要先补齐数据。如果该列才'
+              '是正确的关系列，请先补齐数据并给它建 UNIQUE 索引，再引用'
+              '「$qualifiedName」。',
+          'Note: "$refTable" also has a "$sameName" column$countsClauseEn, so '
+              '$remainingClauseEn and the foreign key may still fail; fill in the '
+              'missing data first. If that is the right column to reference, fill '
+              'in the data and add a UNIQUE index to it before referencing '
+              '"$qualifiedName".',
+        ),
+      );
     } else {
       final countsClauseZh =
           counts.isEmpty ? '' : '，两表该列有 $counts 行能匹配';
@@ -2636,6 +2690,13 @@ String fkConstraintFailureMessage(
   final raw = _fkCleanError(error);
   final lower = raw.toLowerCase();
   final sameName = report?.sameNameColumn;
+  // 第 64 轮：同名列匹配数（部分匹配时也要在错误提示里说清「只有 X/Y 行匹配」，
+  // 与孤儿警告一致，不能暗示基本匹配）。
+  final sameNameCounts = (report != null &&
+          report.sameNameMatchCount != null &&
+          (report.childNonEmptyCount ?? 0) > 0)
+      ? '${report.sameNameMatchCount}/${report.childNonEmptyCount}'
+      : '';
   final sameNameHint = (sameName != null && sameName != refColumn)
       ? (report!.sameNameMostlyMatches
           ? pickText(
@@ -2646,12 +2707,35 @@ String fkConstraintFailureMessage(
                   'match almost perfectly, but it has no UNIQUE index. Add one to '
                   '"$refTable.$sameName" and reference that column instead.',
             )
-          : pickText(
-              '\n提示：引用表「$refTable」也有「$sameName」列，可能才是正确的关系'
-                  '列；需要该列有 UNIQUE 索引才能被引用。',
-              '\nHint: "$refTable" also has a "$sameName" column that may be the '
-                  'right one to reference; MySQL requires a UNIQUE index on it.',
-            ))
+          : report.sameNameHasMatches
+              ? pickText(
+                  sameNameCounts.isEmpty
+                      ? '\n提示：引用表「$refTable」也有「$sameName」列，但两表'
+                          '该列只有部分行能匹配；改用后仍可能有孤儿，创建外键可能'
+                          '仍失败，需要先补齐数据并给该列建 UNIQUE 索引后才能引用。'
+                      : '\n提示：引用表「$refTable」也有「$sameName」列，但两表'
+                          '该列只有 $sameNameCounts 行能匹配；改用后仍可能有孤儿，'
+                          '创建外键可能仍失败，需要先补齐数据并给该列建 UNIQUE '
+                          '索引后才能引用。',
+                  sameNameCounts.isEmpty
+                      ? '\nHint: "$refTable" also has a "$sameName" column, but '
+                          'only some of its rows match. Switching to it may still '
+                          'leave orphan rows and the foreign key may still fail; '
+                          'fill in the missing data and add a UNIQUE index to it '
+                          'first.'
+                      : '\nHint: "$refTable" also has a "$sameName" column, but '
+                          'only $sameNameCounts rows match. Switching to it may '
+                          'still leave orphan rows and the foreign key may still '
+                          'fail; fill in the missing data and add a UNIQUE index '
+                          'to it first.',
+                )
+              : pickText(
+                  '\n提示：引用表「$refTable」也有「$sameName」列，可能才是正确的关系'
+                      '列；需要先补齐数据并给它建 UNIQUE 索引才能被引用。',
+                  '\nHint: "$refTable" also has a "$sameName" column that may be '
+                      'the right one to reference; fill in the data and add a '
+                      'UNIQUE index to it before referencing.',
+                ))
       : '';
   if (lower.contains('1826') ||
       lower.contains('duplicate foreign key constraint name')) {

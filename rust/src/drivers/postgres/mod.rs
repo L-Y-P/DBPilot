@@ -440,18 +440,29 @@ pub async fn run_one_limited_batched_owned(
     (result, truncated, stopped, conn)
 }
 
-/// Execute `statements` inside **one transaction**, one affected result each.
+/// Execute `statements` inside **one transaction**, one affected result each,
+/// then run the requested zero-row existence probes **inside the same
+/// transaction**, right before COMMIT.
 ///
 /// Transaction control goes through sqlx's transaction manager; the first
 /// failing statement rolls the whole batch back. PostgreSQL supports `BEGIN`
 /// over the extended protocol too, but going through the same helper as MySQL /
 /// SQLite keeps the batched row-edit path driver-agnostic.
 ///
+/// Round 64 moved the zero-row probe in here (it used to be one autocommit query
+/// per zero-row UPDATE *after* COMMIT), and merges all needed probes into a
+/// single UNION ALL query ([crate::drivers::zero_row_probe_union]). PostgreSQL
+/// differs from MySQL/SQLite in one important way: any statement error aborts the
+/// transaction and makes the later COMMIT perform a rollback, so the diagnostics
+/// probe runs under a SAVEPOINT and is rolled back to on failure — a failed probe
+/// must never turn the batch into a rollback.
+///
 /// The failing statement's 1-based index is part of the error message.
 pub async fn run_transaction(
     pool: &PgPool,
     statements: Vec<String>,
-) -> AppResult<Vec<ResultSet>> {
+    probes: Vec<Option<String>>,
+) -> AppResult<(Vec<ResultSet>, Vec<Option<bool>>)> {
     let mut tx = pool
         .begin()
         .await
@@ -479,13 +490,86 @@ pub async fn run_transaction(
             }
         }
     }
+    // Diagnostics only, still inside the transaction: a probe failure must never
+    // fail the batch or change the commit outcome.
+    let probed = zero_row_probes(&mut tx, &results, &probes).await;
     tx.commit().await.map_err(|e| {
         AppError::bad(format!(
             "提交事务失败：{}",
             crate::error::database_message(&e)
         ))
     })?;
-    Ok(results)
+    Ok((results, probed))
+}
+
+/// Run the zero-row existence probes for one batch (round 64).
+///
+/// Only statements whose `row_count` is 0 and that carry a probe SQL take part;
+/// [crate::drivers::zero_row_probe_union] merges them into one query so ten
+/// zero-row updates cost one round trip instead of ten. The probe runs after
+/// every DML and before COMMIT, so it sees exactly the state the batch is about
+/// to commit.
+///
+/// PostgreSQL aborts the current transaction on the first statement error, and a
+/// later COMMIT would then silently roll back — so the diagnostics query is
+/// wrapped in a SAVEPOINT. On failure it rolls back to that savepoint (leaving
+/// the batch's DML intact) and every candidate stays `None` ("unknown" in the
+/// API); COMMIT releases the savepoint on the happy path.
+async fn zero_row_probes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    results: &[ResultSet],
+    probes: &[Option<String>],
+) -> Vec<Option<bool>> {
+    const SAVEPOINT: &str = "dbpilot_zero_row_probe";
+    let mut probed: Vec<Option<bool>> = vec![None; probes.len()];
+    let row_counts: Vec<u64> = results.iter().map(|result| result.row_count).collect();
+    let Some(union) = crate::drivers::zero_row_probe_union(&row_counts, probes) else {
+        return probed;
+    };
+    let savepoint_sql = format!("SAVEPOINT {SAVEPOINT}");
+    if sqlx::query(savepoint_sql.as_str())
+        .execute(&mut **tx)
+        .await
+        .is_err()
+    {
+        // Without a savepoint a probe error could poison the transaction; leave
+        // the diagnostics unknown instead.
+        return probed;
+    }
+    match sqlx::query(union.as_str()).fetch_all(&mut **tx).await {
+        Ok(rows) => {
+            for row in rows {
+                let Some(index) = row
+                    .try_get::<String, _>(0)
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                if let Some(slot) = probed.get_mut(index) {
+                    *slot = Some(true);
+                }
+            }
+            // Every candidate that returned no row means the key matched nothing.
+            for (index, probe) in probes.iter().enumerate() {
+                if probe.is_some()
+                    && index < probed.len()
+                    && row_counts.get(index).copied().unwrap_or(0) == 0
+                    && probed[index].is_none()
+                {
+                    probed[index] = Some(false);
+                }
+            }
+        }
+        Err(_) => {
+            // A failed probe must not affect the batch: undo only the probe.
+            let rollback_sql = format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}");
+            let _ = sqlx::query(rollback_sql.as_str())
+                .execute(&mut **tx)
+                .await;
+        }
+    }
+    probed
 }
 
 fn error_set(stmt: String, e: sqlx::Error) -> ResultSet {

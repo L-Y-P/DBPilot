@@ -124,12 +124,41 @@ pub trait SqlSession: Send + Sync {
     ///
     /// 全部成功才提交；任一条失败则整批回滚并返回错误（错误里带失败序号）。
     /// 用来实现行批量保存（`api::explorer::apply_row_changes`）这类
-    /// "多行必须一起成功" 的写入。默认实现报告不支持，池化会话按驱动实现。
+    /// "多行必须一起成功" 的写入。默认实现走
+    /// [Self::execute_transaction_probing]（不带探测），池化会话按驱动实现。
     ///
     /// 注意：事务控制由驱动用 sqlx 的 transaction API 发出，不要在这个方法里
     /// 执行 `BEGIN`：MySQL 的 prepared-statement 协议拒绝 `BEGIN`（错误 1295），
     /// 而 `sqlx::query("BEGIN")` 恰好走 prepared 路径。
-    async fn execute_transaction(&self, _statements: Vec<String>) -> AppResult<Vec<ResultSet>> {
+    async fn execute_transaction(&self, statements: Vec<String>) -> AppResult<Vec<ResultSet>> {
+        let probes = vec![None; statements.len()];
+        self.execute_transaction_probing(statements, probes)
+            .await
+            .map(|(results, _)| results)
+    }
+
+    /// 执行多条语句，并在**同一事务内、所有语句之后、COMMIT 之前**做零行探测。
+    ///
+    /// `probes[i]` 与 `statements[i]` 一一对应：`Some(sql)` 表示这条语句影响
+    /// 0 行时需要执行该存在性查询（`DatabaseDriver::row_exists_sql` 生成，标识符/
+    /// 字面量已按方言转义）来解释原因；`None` 表示不探测（INSERT / DELETE）。
+    /// 驱动只在 `row_counts[i] == 0` 时才真正执行探测，并把多条探测合并成一次
+    /// 数据库往返（UNION ALL），大批量零行不会退化成 N 次点查。
+    ///
+    /// 返回 `(每条语句的 ResultSet, 每条语句的探测结果)`：`Some(true)` 行还在、
+    /// `Some(false)` 行已不存在、`None` 未知（没有探测，或探测执行失败）。
+    ///
+    /// 探测是诊断性的：**它失败绝不能让整批失败，也不能改变提交结果**。驱动必须
+    /// 吞掉探测错误并回 `None`；PostgreSQL 会让出错事务进入 aborted 状态并导致
+    /// COMMIT 变成回滚，所以那边的探测要用 SAVEPOINT 包住、失败时 ROLLBACK TO。
+    ///
+    /// 事务控制同样由驱动用 sqlx 的 transaction API 发出，不要在这里执行 `BEGIN`
+    /// （MySQL prepared 协议拒绝 BEGIN，错误 1295）。
+    async fn execute_transaction_probing(
+        &self,
+        _statements: Vec<String>,
+        _probes: Vec<Option<String>>,
+    ) -> AppResult<(Vec<ResultSet>, Vec<Option<bool>>)> {
         Err(AppError::Internal("该会话不支持事务批量执行".to_string()))
     }
 
@@ -260,6 +289,21 @@ impl ConnectionHandle {
         statements: Vec<String>,
     ) -> AppResult<Vec<ResultSet>> {
         self.inner.execute_transaction(statements).await
+    }
+
+    /// 一个事务内执行多条语句，并在 COMMIT 之前批量做零行存在性探测。
+    ///
+    /// 返回 `(结果, 探测结果)`；探测结果只用于提示（not_found / unchanged /
+    /// unknown），不影响提交结果。细节见
+    /// [SqlSession::execute_transaction_probing]。
+    pub async fn execute_transaction_probing(
+        &self,
+        statements: Vec<String>,
+        probes: Vec<Option<String>>,
+    ) -> AppResult<(Vec<ResultSet>, Vec<Option<bool>>)> {
+        self.inner
+            .execute_transaction_probing(statements, probes)
+            .await
     }
 
     /// 流式扫描（导出/备份）：逐行回调、不整表载入内存。

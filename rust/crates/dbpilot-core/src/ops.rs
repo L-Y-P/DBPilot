@@ -303,16 +303,28 @@ const RESTORE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// dump from materialising an unbounded result set.
 const RESTORE_MAX_ROWS: usize = 1_000_000;
 
-/// Outcome of [restore_sql].
+/// Outcome of [restore_sql] / [restore_sql_atomic].
 pub struct RestoreReport {
-    /// One entry per dump statement, in dump order (same shape as [run_sql]).
+    /// One entry per executed dump statement, in dump order (same shape as
+    /// [run_sql]). An atomic restore that fails early stops at the failing
+    /// statement, so this may hold fewer entries than total_statements; a
+    /// failed COMMIT appends one synthetic entry whose statement is COMMIT.
     pub results: Vec<ResultSet>,
-    /// DML batches that finished with a COMMIT (diagnostics).
+    /// DML batches that finished with a COMMIT (diagnostics). The atomic path
+    /// reports 1 on success (the whole dump is one transaction) and 0 otherwise.
     pub transaction_batches: u64,
     /// Statements committed inside those batches (diagnostics).
     pub statements_in_transactions: u64,
     /// Round trips sent to the server (diagnostics).
     pub round_trips: u64,
+    /// True when the whole dump ran inside one transaction ([restore_sql_atomic]).
+    /// False for the grouped path (MySQL, or an atomic-restore fallback).
+    pub atomic: bool,
+    /// True when the atomic transaction was rolled back (statement or COMMIT
+    /// failed). Always false on the grouped path.
+    pub rolled_back: bool,
+    /// Number of statements in the dump after splitting (before execution).
+    pub total_statements: usize,
 }
 
 impl RestoreReport {
@@ -322,6 +334,12 @@ impl RestoreReport {
 
     pub fn failed(&self) -> usize {
         self.results.iter().filter(|r| r.error.is_some()).count()
+    }
+
+    /// Statements that were never executed because an atomic restore stopped at
+    /// the first failure. Always 0 on the grouped path (every statement runs).
+    pub fn skipped_statements(&self) -> usize {
+        self.total_statements.saturating_sub(self.results.len())
     }
 }
 
@@ -536,20 +554,25 @@ async fn run_restore_batch(
     }
 }
 
-/// Execute a backup dump through one pinned session (backup restore).
+/// Execute a backup dump through one pinned session, in commit-saving groups.
 ///
-/// This replaces the old `driver.run_sql` loop (one prepared statement per
-/// call, autocommit) for the restore path:
+/// This is the **non-atomic** path. It replaces the old driver.run_sql loop
+/// (one prepared statement per call, autocommit):
 ///
 /// * consecutive DML statements share one transaction, so a 500k-row dump pays
 ///   a handful of commits instead of one per INSERT — that is the dominant
 ///   restore cost on InnoDB;
 /// * statements are executed on the **same pinned connection**, so session
-///   state written by one dump statement (`USE`, `SET FOREIGN_KEY_CHECKS`,
-///   `SET search_path`) still applies to the next one;
+///   state written by one dump statement (USE, SET FOREIGN_KEY_CHECKS,
+///   SET search_path) still applies to the next one;
 /// * failure reporting is unchanged: [RestoreReport::results] still has one
 ///   entry per dump statement, and a failed batch is rolled back and replayed
 ///   so every other statement is attempted exactly once.
+///
+/// MySQL must use this path: its DDL implicitly commits, so a whole-dump
+/// transaction is impossible. PostgreSQL / SQLite should use
+/// [restore_sql_atomic] instead; this function is also its fallback when the
+/// driver refuses BEGIN.
 pub async fn restore_sql(
     session: &mut (dyn SessionHandle + Send),
     sql: &str,
@@ -560,6 +583,9 @@ pub async fn restore_sql(
         transaction_batches: 0,
         statements_in_transactions: 0,
         round_trips: 0,
+        atomic: false,
+        rolled_back: false,
+        total_statements: statements.len(),
     };
     for group in restore_groups(&statements) {
         match group {
@@ -578,6 +604,75 @@ pub async fn restore_sql(
             }
         }
     }
+    report
+}
+
+/// Execute a whole backup dump as one transaction (PostgreSQL / SQLite).
+///
+/// Both drivers have transactional DDL, so a dump can be all-or-nothing:
+///
+/// * success: BEGIN -> every statement -> COMMIT. transaction_batches = 1 and
+///   statements_in_transactions = total_statements (one commit for the dump).
+/// * failure: BEGIN -> statements until the first failure -> ROLLBACK and stop.
+///   results holds the statements that were executed (the failing one last,
+///   with its error), rolled_back = true, and the statements after the failure
+///   never run (see RestoreReport::skipped_statements).
+/// * a failed COMMIT appends one synthetic COMMIT error entry so failed()
+///   counts it, rolls back best-effort and stops.
+/// * if BEGIN itself is rejected (unusual proxy / driver), the old grouped path
+///   runs instead and the report says atomic = false, so a dump that used to
+///   restore does not start failing outright.
+///
+/// MySQL must keep using [restore_sql]: its DDL implicitly commits, so a
+/// whole-dump transaction is impossible there. A MySQL session handed to this
+/// function is forwarded to [restore_sql] instead of pretending to be atomic.
+pub async fn restore_sql_atomic(
+    session: &mut (dyn SessionHandle + Send),
+    sql: &str,
+) -> RestoreReport {
+    if session.driver_id() == "mysql" {
+        return restore_sql(session, sql).await;
+    }
+    let statements = split_statements(sql);
+    let total = statements.len();
+    let tx = restore_tx_for(session.driver_id());
+    let mut report = RestoreReport {
+        results: Vec::with_capacity(total),
+        transaction_batches: 0,
+        statements_in_transactions: 0,
+        round_trips: 0,
+        atomic: true,
+        rolled_back: false,
+        total_statements: total,
+    };
+    let begin = run_restore_statement(session, tx.begin, &mut report).await;
+    if begin.error.is_some() {
+        // No usable transaction control: fall back to the grouped path so the
+        // dump still restores (old behaviour) instead of failing outright.
+        return restore_sql(session, sql).await;
+    }
+    for statement in &statements {
+        let result = run_restore_statement(session, statement, &mut report).await;
+        if result.error.is_some() {
+            let _ = run_restore_statement(session, tx.rollback, &mut report).await;
+            report.rolled_back = true;
+            report.results.push(result);
+            return report;
+        }
+        report.results.push(result);
+    }
+    let commit = run_restore_statement(session, tx.commit, &mut report).await;
+    if let Some(error) = commit.error {
+        let _ = run_restore_statement(session, tx.rollback, &mut report).await;
+        report.rolled_back = true;
+        let mut failed = restore_ok_result(tx.commit);
+        failed.kind = "error".to_string();
+        failed.error = Some(error);
+        report.results.push(failed);
+        return report;
+    }
+    report.transaction_batches = 1;
+    report.statements_in_transactions = total as u64;
     report
 }
 
@@ -837,9 +932,11 @@ pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_transactional_restore_statement, restore_groups, restore_tx_for, RestoreGroup,
-        RESTORE_BATCH_BYTES, RESTORE_BATCH_STATEMENTS,
+        is_transactional_restore_statement, restore_groups, restore_sql, restore_sql_atomic,
+        restore_tx_for, RestoreGroup, RESTORE_BATCH_BYTES, RESTORE_BATCH_STATEMENTS,
     };
+    use crate::db::ResultSet;
+    use crate::session::SessionHandle;
 
     fn statements(sql_parts: &[&str]) -> Vec<String> {
         sql_parts.iter().map(|s| s.to_string()).collect()
@@ -958,6 +1055,236 @@ mod tests {
         assert_eq!(postgres.reset, None);
         let sqlite = restore_tx_for("sqlite");
         assert_eq!(sqlite.begin, "BEGIN");
+    }
+
+    // ------------------------------------------------ restore_sql_atomic (round 58)
+
+    /// Scripted session for the restore path: records the statements it is
+    /// asked to run and fails those matching a configured needle.
+    struct FakeSession {
+        driver: &'static str,
+        executed: Vec<String>,
+        fail_contains: Vec<&'static str>,
+    }
+
+    impl FakeSession {
+        fn new(driver: &'static str) -> Self {
+            FakeSession {
+                driver,
+                executed: Vec::new(),
+                fail_contains: Vec::new(),
+            }
+        }
+
+        fn executed(&self) -> Vec<&str> {
+            self.executed.iter().map(String::as_str).collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionHandle for FakeSession {
+        fn driver_id(&self) -> &'static str {
+            self.driver
+        }
+
+        async fn run_limited(&mut self, statement: String, _max_rows: usize) -> ResultSet {
+            self.executed.push(statement.clone());
+            let fails = self
+                .fail_contains
+                .iter()
+                .any(|needle| statement.contains(needle));
+            ResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: if fails { 0 } else { 1 },
+                last_insert_id: 0,
+                kind: if fails { "error" } else { "affected" }.to_string(),
+                error: fails.then(|| format!("boom: {statement}")),
+                statement,
+                truncated: false,
+            }
+        }
+
+        async fn search_path(&mut self) -> String {
+            String::new()
+        }
+
+        async fn release(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn atomic_restore_runs_the_whole_dump_in_one_transaction() {
+        let mut session = FakeSession::new("postgres");
+        let report = restore_sql_atomic(
+            &mut session,
+            "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+        )
+        .await;
+        // Order matters: BEGIN first, every statement, then one COMMIT.
+        assert_eq!(
+            session.executed(),
+            vec![
+                "BEGIN",
+                "CREATE TABLE t (id INT)",
+                "INSERT INTO t VALUES (1)",
+                "INSERT INTO t VALUES (2)",
+                "COMMIT",
+            ]
+        );
+        assert!(report.atomic);
+        assert!(!report.rolled_back);
+        assert_eq!(report.total_statements, 3);
+        assert_eq!(report.statements(), 3);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.skipped_statements(), 0);
+        // One transaction group covers the whole dump.
+        assert_eq!(report.transaction_batches, 1);
+        assert_eq!(report.statements_in_transactions, 3);
+    }
+
+    #[tokio::test]
+    async fn atomic_restore_rolls_back_at_the_first_failure_and_skips_the_rest() {
+        let mut session = FakeSession::new("postgres");
+        session.fail_contains.push("BROKEN");
+        let report = restore_sql_atomic(
+            &mut session,
+            "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); INSERT INTO t VALUES BROKEN; INSERT INTO t VALUES (3)",
+        )
+        .await;
+        // Stops at the failing statement: BEGIN, 3 executed, ROLLBACK; no COMMIT.
+        assert_eq!(
+            session.executed(),
+            vec![
+                "BEGIN",
+                "CREATE TABLE t (id INT)",
+                "INSERT INTO t VALUES (1)",
+                "INSERT INTO t VALUES BROKEN",
+                "ROLLBACK",
+            ]
+        );
+        assert!(report.atomic);
+        assert!(report.rolled_back);
+        assert_eq!(report.total_statements, 4);
+        assert_eq!(report.statements(), 3, "results only hold executed statements");
+        assert_eq!(report.failed(), 1);
+        assert_eq!(
+            report.results.last().map(|r| r.statement.as_str()),
+            Some("INSERT INTO t VALUES BROKEN")
+        );
+        assert_eq!(report.skipped_statements(), 1);
+        assert_eq!(report.transaction_batches, 0);
+        assert_eq!(report.statements_in_transactions, 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_restore_rolls_back_when_the_commit_itself_fails() {
+        let mut session = FakeSession::new("postgres");
+        session.fail_contains.push("COMMIT");
+        let report = restore_sql_atomic(&mut session, "INSERT INTO t VALUES (1)").await;
+        // BEGIN, INSERT, COMMIT (fails), best-effort ROLLBACK.
+        assert_eq!(
+            session.executed(),
+            vec!["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT", "ROLLBACK"]
+        );
+        assert!(report.atomic);
+        assert!(report.rolled_back);
+        assert_eq!(report.total_statements, 1);
+        assert_eq!(
+            report.statements(),
+            2,
+            "one dump statement plus the synthetic COMMIT error entry"
+        );
+        assert_eq!(report.failed(), 1);
+        assert_eq!(report.results.last().map(|r| r.statement.as_str()), Some("COMMIT"));
+        assert_eq!(report.skipped_statements(), 0);
+        assert_eq!(report.transaction_batches, 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_restore_falls_back_to_grouped_execution_when_begin_is_rejected() {
+        let mut session = FakeSession::new("postgres");
+        session.fail_contains.push("BEGIN");
+        let report = restore_sql_atomic(
+            &mut session,
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+        )
+        .await;
+        // The atomic BEGIN failed, then the grouped fallback tries its own BEGIN
+        // (also rejected) and runs every statement in autocommit mode.
+        assert_eq!(
+            session.executed(),
+            vec![
+                "BEGIN",
+                "BEGIN",
+                "INSERT INTO t VALUES (1)",
+                "INSERT INTO t VALUES (2)",
+            ]
+        );
+        assert!(!report.atomic, "a rejected BEGIN must not pretend to be atomic");
+        assert!(!report.rolled_back);
+        assert_eq!(report.total_statements, 2);
+        assert_eq!(report.statements(), 2);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.skipped_statements(), 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_restore_for_a_mysql_session_uses_the_grouped_path() {
+        // MySQL DDL implicitly commits: calling the atomic entry point with a
+        // MySQL session must not pretend to be atomic.
+        let mut session = FakeSession::new("mysql");
+        let report = restore_sql_atomic(
+            &mut session,
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+        )
+        .await;
+        assert!(!report.atomic);
+        assert!(!report.rolled_back);
+        assert!(!session.executed().iter().any(|s| *s == "BEGIN"));
+        // The grouped path uses MySQL's autocommit toggle instead of BEGIN.
+        assert!(session.executed().contains(&"SET autocommit = 0"));
+        assert!(session.executed().contains(&"COMMIT"));
+        assert_eq!(report.total_statements, 2);
+        assert_eq!(report.statements(), 2);
+    }
+
+    #[tokio::test]
+    async fn atomic_restore_also_uses_one_transaction_for_sqlite() {
+        // SQLite has transactional DDL too, so the backup path uses the same
+        // atomic entry point there.
+        let mut session = FakeSession::new("sqlite");
+        let report = restore_sql_atomic(
+            &mut session,
+            "CREATE TABLE t (id INT); INSERT INTO t VALUES (1)",
+        )
+        .await;
+        assert_eq!(
+            session.executed(),
+            vec![
+                "BEGIN",
+                "CREATE TABLE t (id INT)",
+                "INSERT INTO t VALUES (1)",
+                "COMMIT",
+            ]
+        );
+        assert!(report.atomic);
+        assert!(!report.rolled_back);
+        assert_eq!(report.transaction_batches, 1);
+        assert_eq!(report.statements_in_transactions, 2);
+    }
+
+    #[tokio::test]
+    async fn grouped_restore_stays_non_atomic_and_attempts_every_statement() {
+        let mut session = FakeSession::new("mysql");
+        let report =
+            restore_sql(&mut session, "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)").await;
+        assert!(!report.atomic);
+        assert!(!report.rolled_back);
+        assert_eq!(report.total_statements, 2);
+        assert_eq!(report.statements(), 2);
+        assert_eq!(report.transaction_batches, 1);
+        assert_eq!(report.statements_in_transactions, 2);
+        assert!(session.executed().contains(&"COMMIT"));
     }
 }
 

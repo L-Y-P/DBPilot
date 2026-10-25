@@ -19,3 +19,8 @@ anyhow = "1"
 sqlx = { version = "0.8", default-features = false }
 base64 = "0.22"
 hex = "0.4"
+
+[dev-dependencies]
+# 只用于 restore_sql_atomic 的异步单元测试（fake SessionHandle）；
+# 运行时依赖仍然保持"不依赖 tokio"的契约层约束。
+tokio = { version = "1", features = ["rt", "macros"] }

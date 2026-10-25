@@ -450,3 +450,21 @@ Future<void> showRelationDesigner(
 - **apply_row_changes（PG）**：符合设计——整批一个事务，任一失败全部回滚（合法的 UPDATE 也回滚），错误带失败序号与服务端消息（新增 #[ignore] live 测试）。
 - **restore_sql（PG）**：实测整段脚本**不是原子的**（ops.rs 已注释的设计）：DDL/SET 是 barrier 逐条 autocommit；连续 DML 进事务；DML 批次失败时回滚后会重放已成功前缀，且失败语句之后的语句继续执行。除失败语句外都会生效。新增 live 测试如实断言该现状；若未来改为整段原子，需要同步更新该测试与内部注释。
 
+
+## 14. 第 58 轮修订（PG/SQLite 整段原子 restore）
+
+- 背景：第 57 轮 PG live 测试证实 restore_sql 整段非原子（DDL barrier 逐条 autocommit、DML 批次失败后回滚并重放前缀、失败后语句继续执行）。
+- 新增 dbpilot_core::ops::restore_sql_atomic：BEGIN → 逐条执行 → 全部成功 COMMIT（transaction_batches=1、statements_in_transactions=total）；
+  任一失败立即 ROLLBACK 并停止，results 只含已执行语句（失败那条带 error），report 标记 rolled_back=true、skipped_statements()=总数-已执行；
+  COMMIT 失败追加合成 COMMIT 错误项并尽力 ROLLBACK；BEGIN 被拒时回退旧分组路径（atomic=false），MySQL session 防御性转发旧路径。
+- RestoreReport 新增 atomic / rolled_back / total_statements；backup.rs 按驱动分派：Postgres | Sqlite → 原子路径，Mysql → 分组路径；
+  restoreBackup JSON 追加 atomic / rolled_back / total_statements / executed / skipped（旧键不变，ok = failed==0 && !rolled_back），
+  statements 改为 dump 语句总数（原子失败时大于已执行数）。
+- Dart backups_view：describeRestoreOutcome 依据这些字段给中文/英文提示——回滚失败「已整体回滚，未写入任何数据（共 N 条，已执行 X，跳过 S）」、
+  原子成功「还原成功（整段事务，N 条）」，MySQL 追加「DDL 隐式提交，无法整段回滚」；旧后端自动降级为原提示。
+- 测试：core fake SessionHandle 7 例（成功 BEGIN→COMMIT、失败 ROLLBACK 无 COMMIT、COMMIT 失败、BEGIN 回退、MySQL 转发、SQLite、分组路径）；
+  live_transactions：SQLite 原子 restore（默认跑）+ PG 原子 restore（--ignored，失败后 to_regclass 为 NULL、无表无数据）；
+  Dart restore_outcome_test 8 例。
+- 风险/权衡：原子事务意味着事务内非法语句（PG CREATE INDEX CONCURRENTLY / VACUUM / CREATE DATABASE，SQLite VACUUM/部分 PRAGMA）
+  会让整次还原回滚（本应用自产 dump 仅 CREATE TABLE + INSERT，不受影响）；超大 dump 在 PG 上成为长事务（WAL/锁增加），是换取原子性的代价。
+

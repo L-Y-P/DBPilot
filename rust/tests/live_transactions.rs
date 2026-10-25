@@ -1,4 +1,4 @@
-//! PostgreSQL transaction semantics of the two server-write paths.
+//! PostgreSQL transaction semantics of the server-write paths.
 //!
 //! Live tests only: they need a reachable PostgreSQL (endpoint from
 //! DBPILOT_TEST_PG_*, see tests/common/mod.rs) and are #[ignore]d so the default
@@ -10,6 +10,16 @@
 //! maintenance database and DROPs it at the end; no existing table or database
 //! is touched. It also DROPs IF EXISTS at the start, so a previous failed run
 //! cannot make the next one fail.
+//!
+//! Since round 58 the backup restore path for PostgreSQL / SQLite uses
+//! dbpilot_core::ops::restore_sql_atomic: the whole dump is one transaction, so
+//! a failing dump leaves no table or row behind. MySQL keeps the grouped
+//! restore_sql path (its DDL implicitly commits, so a whole-dump transaction is
+//! impossible there); the grouped/non-atomic behaviour is covered by the
+//! fake-session unit tests in dbpilot-core/src/ops.rs.
+//!
+//! The SQLite test below needs no server (a temp database file), so it runs in
+//! the normal cargo test run as well; only the PostgreSQL test is #[ignore]d.
 
 use rust_myadmin_core::core::{DriverKind, SessionHandle};
 use rust_myadmin_core::db::ResultSet;
@@ -61,22 +71,18 @@ async fn run_ok(session: &mut dyn SessionHandle, sql: &str) {
     );
 }
 
-/// restore_sql groups consecutive DML statements into one transaction, but it is
-/// deliberately NOT atomic as a whole script:
-///
-/// * DDL / SET / USE statements are barriers that run in autocommit;
-/// * a failed DML batch is rolled back, then its successful prefix is replayed
-///   in autocommit mode and the statements after the failure still run (the
-///   legacy "every statement is attempted exactly once" semantics documented in
-///   dbpilot-core/src/ops.rs).
-///
-/// This test pins that current behaviour against a real PostgreSQL: the failure
-/// is reported, the failing statement has no effect, but the table + prefix
-/// INSERTs + post-failure UPDATE are still there. The task explicitly asks to
-/// record the gap instead of changing product logic.
+fn duplicate_message(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("duplicate key") || lower.contains("unique") || lower.contains("23505")
+}
+
+/// PostgreSQL restore is all-or-nothing (round 58): DBPilot uses
+/// restore_sql_atomic there, so a dump that fails halfway rolls the schema and
+/// every row back. The old grouped behaviour (DDL autocommit + prefix replay) is
+/// gone for PostgreSQL and is asserted for MySQL by the dbpilot-core unit tests.
 #[tokio::test]
-#[ignore = "requires DBPILOT_TEST_PG_* (PostgreSQL restore transaction semantics)"]
-async fn postgres_restore_sql_reports_the_failing_statement_and_is_not_atomic_as_a_whole() {
+#[ignore = "requires DBPILOT_TEST_PG_* (PostgreSQL atomic restore)"]
+async fn postgres_restore_is_atomic_and_a_failing_dump_leaves_nothing_behind() {
     if !common::postgres_usable().await {
         eprintln!("SKIP: DBPILOT_TEST_PG_* does not authenticate");
         return;
@@ -96,9 +102,9 @@ async fn postgres_restore_sql_reports_the_failing_statement_and_is_not_atomic_as
     run_ok(&mut *session, &format!("DROP SCHEMA IF EXISTS {schema_sql} CASCADE")).await;
     run_ok(&mut *session, &format!("CREATE SCHEMA {schema_sql}")).await;
 
-    // DDL barrier + 2 successful INSERTs + 1 UNIQUE-violating INSERT + 1 UPDATE.
-    // The UPDATE sits after the failure so we can observe that later statements
-    // still run.
+    // -------- failing dump: DDL + 2 good INSERTs + 1 UNIQUE-violating INSERT +
+    // 1 UPDATE after it. The whole dump is one transaction, so neither the table
+    // nor the rows may survive.
     let script = format!(
         "CREATE TABLE {table_sql} (id INT PRIMARY KEY, code TEXT UNIQUE, qty INT);\n\
          INSERT INTO {table_sql} (id, code, qty) VALUES (1, 'a', 1);\n\
@@ -106,36 +112,73 @@ async fn postgres_restore_sql_reports_the_failing_statement_and_is_not_atomic_as
          INSERT INTO {table_sql} (id, code, qty) VALUES (2, 'dup', 9);\n\
          UPDATE {table_sql} SET qty = qty + 100;"
     );
-    let report = dbpilot_core::ops::restore_sql(session.as_mut(), &script).await;
+    let report = dbpilot_core::ops::restore_sql_atomic(session.as_mut(), &script).await;
 
-    assert_eq!(report.statements(), 5, "one result per dump statement");
+    assert!(report.atomic, "PostgreSQL restore must use the transaction path");
+    assert!(report.rolled_back, "a failing dump must be rolled back");
+    assert_eq!(report.total_statements, 5);
+    assert_eq!(
+        report.statements(),
+        4,
+        "results hold the executed statements only (CREATE + 2 INSERTs + failing INSERT)"
+    );
     assert_eq!(report.failed(), 1, "only the duplicate INSERT fails");
+    assert_eq!(
+        report.skipped_statements(),
+        1,
+        "the UPDATE after the failure must not run"
+    );
+    assert_eq!(report.transaction_batches, 0);
+    assert_eq!(report.statements_in_transactions, 0);
     let errors: Vec<&str> = report
         .results
         .iter()
         .filter_map(|result| result.error.as_deref())
         .collect();
     assert_eq!(errors.len(), 1);
-    let message = errors[0].to_ascii_lowercase();
     assert!(
-        message.contains("duplicate key")
-            || message.contains("unique")
-            || message.contains("23505"),
+        duplicate_message(errors[0]),
         "server message must be visible: {errors:?}"
     );
 
-    // Current behaviour, recorded rather than "fixed": the failed batch was
-    // rolled back and its successful prefix replayed in autocommit, and the
-    // UPDATE after the failure still ran, so the script is not atomic.
+    // The rollback removed the table created earlier in the same dump.
+    let absent = run_on(
+        &mut *session,
+        &format!("SELECT to_regclass('{schema}.items') IS NULL"),
+    )
+    .await;
+    assert!(absent.error.is_none(), "{:?}", absent.error);
+    assert_eq!(
+        absent.rows,
+        vec![vec![serde_json::json!(true)]],
+        "the table must not exist after the atomic rollback: {:?}",
+        absent.rows
+    );
+
+    // -------- successful dump: one transaction, data committed at the end.
+    let script = format!(
+        "CREATE TABLE {table_sql} (id INT PRIMARY KEY, code TEXT UNIQUE, qty INT);\n\
+         INSERT INTO {table_sql} (id, code, qty) VALUES (1, 'a', 1);\n\
+         INSERT INTO {table_sql} (id, code, qty) VALUES (2, 'b', 2);\n\
+         UPDATE {table_sql} SET qty = qty + 100;"
+    );
+    let report = dbpilot_core::ops::restore_sql_atomic(session.as_mut(), &script).await;
+    assert!(report.atomic);
+    assert!(!report.rolled_back);
+    assert_eq!(report.failed(), 0);
+    assert_eq!(report.total_statements, 4);
+    assert_eq!(report.statements(), 4);
+    assert_eq!(report.skipped_statements(), 0);
+    assert_eq!(report.transaction_batches, 1);
+    assert_eq!(report.statements_in_transactions, 4);
     let rows = run_on(
         &mut *session,
         &format!("SELECT id, code, qty FROM {table_sql} ORDER BY id"),
     )
     .await;
     assert!(rows.error.is_none(), "{:?}", rows.error);
-    let rows = rows.rows;
     assert_eq!(
-        rows,
+        rows.rows,
         vec![
             vec![
                 serde_json::json!(1),
@@ -147,45 +190,6 @@ async fn postgres_restore_sql_reports_the_failing_statement_and_is_not_atomic_as
                 serde_json::json!("b"),
                 serde_json::json!(102)
             ],
-        ],
-        "prefix INSERTs replayed and the later UPDATE applied: {rows:?}"
-    );
-    // The failing statement itself left no trace.
-    assert!(
-        !rows
-            .iter()
-            .any(|row| row.get(1) == Some(&serde_json::json!("dup"))),
-        "the failed INSERT must not be applied: {rows:?}"
-    );
-    // A failed batch never counts as a committed transaction group.
-    assert_eq!(report.transaction_batches, 0);
-    assert_eq!(report.statements_in_transactions, 0);
-
-    // A fully successful run of consecutive DML statements: one BEGIN/COMMIT
-    // group, and the diagnostics report it.
-    let script = format!(
-        "INSERT INTO {table_sql} (id, code, qty) VALUES (5, 'e', 5);\n\
-         INSERT INTO {table_sql} (id, code, qty) VALUES (6, 'f', 6);\n\
-         UPDATE {table_sql} SET qty = qty + 1 WHERE id IN (5, 6);"
-    );
-    let report = dbpilot_core::ops::restore_sql(session.as_mut(), &script).await;
-    assert_eq!(report.failed(), 0);
-    assert_eq!(
-        report.transaction_batches, 1,
-        "consecutive DML statements share one transaction"
-    );
-    assert_eq!(report.statements_in_transactions, 3);
-    let rows = run_on(
-        &mut *session,
-        &format!("SELECT id, qty FROM {table_sql} WHERE id IN (5, 6) ORDER BY id"),
-    )
-    .await;
-    assert!(rows.error.is_none(), "{:?}", rows.error);
-    assert_eq!(
-        rows.rows,
-        vec![
-            vec![serde_json::json!(5), serde_json::json!(6)],
-            vec![serde_json::json!(6), serde_json::json!(7)],
         ]
     );
 
@@ -197,4 +201,77 @@ async fn postgres_restore_sql_reports_the_failing_statement_and_is_not_atomic_as
     .await;
     assert!(cleanup.error.is_none(), "{:?}", cleanup.error);
     session.release().await;
+}
+
+/// SQLite has transactional DDL too, so the same atomic restore path is used
+/// there. This one is hermetic (temp file, no server), so it runs in the normal
+/// test suite: a dump that fails halfway must leave neither the table nor rows.
+#[tokio::test]
+async fn sqlite_restore_is_atomic_and_a_failing_dump_leaves_nothing_behind() {
+    let dir = std::env::temp_dir().join(format!("rma-atomic-restore-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let db = dir.join("atomic.sqlite");
+    std::fs::write(&db, b"").expect("create empty database file");
+    let spec = ConnSpec {
+        driver: DriverKind::Sqlite,
+        database: Some(db.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let driver = driver_for(DriverKind::Sqlite);
+    let registry = PoolRegistry::default();
+    let Ok(mut session) = driver.open_session(&registry, &spec, None).await else {
+        eprintln!("SKIP: cannot open a SQLite session");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+
+    // -------- failing dump: CREATE + good INSERT + duplicate PK INSERT.
+    let report = dbpilot_core::ops::restore_sql_atomic(
+        session.as_mut(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);
+         INSERT INTO t VALUES (1);
+         INSERT INTO t VALUES (1);",
+    )
+    .await;
+    assert!(report.atomic, "SQLite must use the transaction path");
+    assert!(report.rolled_back);
+    assert_eq!(report.total_statements, 3);
+    assert_eq!(report.statements(), 3, "CREATE + INSERT + failing INSERT");
+    assert_eq!(report.failed(), 1);
+    assert_eq!(report.skipped_statements(), 0);
+    let tables = run_on(
+        &mut *session,
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 't'",
+    )
+    .await;
+    assert!(tables.error.is_none(), "{:?}", tables.error);
+    assert_eq!(
+        tables.rows,
+        vec![vec![serde_json::json!(0)]],
+        "the table must not exist after the atomic rollback"
+    );
+
+    // -------- successful dump: one transaction, both rows committed.
+    let report = dbpilot_core::ops::restore_sql_atomic(
+        session.as_mut(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);
+         INSERT INTO t VALUES (1);
+         INSERT INTO t VALUES (2);",
+    )
+    .await;
+    assert!(report.atomic);
+    assert!(!report.rolled_back);
+    assert_eq!(report.failed(), 0);
+    assert_eq!(report.transaction_batches, 1);
+    assert_eq!(report.statements_in_transactions, 3);
+    let rows = run_on(&mut *session, "SELECT id FROM t ORDER BY id").await;
+    assert!(rows.error.is_none(), "{:?}", rows.error);
+    assert_eq!(
+        rows.rows,
+        vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]]
+    );
+
+    session.release().await;
+    let _ = std::fs::remove_dir_all(dir);
 }

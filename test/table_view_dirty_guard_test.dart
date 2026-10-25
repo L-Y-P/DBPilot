@@ -101,6 +101,16 @@ Future<String?> storedValue(
   return row.isEmpty ? null : row.first?.toString();
 }
 
+Future<int> rowCount(WidgetTester tester, String table, int id) async {
+  final res = await tester.runAsync(
+    () => Api.instance.query(
+      'SELECT COUNT(*) AS c FROM "$table" WHERE id = $id;',
+    ),
+  );
+  final rows = ((res!['results'] as List).first as Map)['rows'] as List;
+  return ((rows.first as List).first as num).toInt();
+}
+
 void main() {
   late Directory temporary;
 
@@ -157,9 +167,15 @@ void main() {
 
   setUp(() async {
     I18n.setLang(AppLang.zh);
-    // 用例之间互不影响：把被前面用例改过的值恢复成初始数据。
-    await Api.instance.query("UPDATE guard_rows SET name = 'row_' || id;");
-    await Api.instance.query("UPDATE guard_rows2 SET name = 'second';");
+    // 用例之间互不影响：恢复初始数据（含被前面用例删除的行）。
+    for (var i = 1; i <= 30; i++) {
+      await Api.instance.query(
+        "INSERT OR REPLACE INTO guard_rows (id, name) VALUES ($i, 'row_$i');",
+      );
+    }
+    await Api.instance.query(
+      "INSERT OR REPLACE INTO guard_rows2 (id, name) VALUES (1, 'second');",
+    );
     // 「保存失败」用例会 DROP guard_fail；补回来，避免测试顺序变化时失败。
     try {
       await Api.instance.query(
@@ -307,6 +323,39 @@ void main() {
     expect(find.text('row_1'), findsWidgets);
     expect(find.text('row_26'), findsNothing);
     expect(stagedPill(1), findsOneWidget);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('有暂存编辑时删除行：取消不删、放弃后删除', (tester) async {
+    size(tester);
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    await pumpTableView(tester, 'guard_rows', notice);
+
+    await editCell(tester, 'row_1', 'row_1_delete');
+    expect(stagedPill(1), findsOneWidget);
+
+    // 第一次点行删除：先弹未保存确认；取消 → 不删除，编辑仍在。
+    await tester.tap(find.byKey(const ValueKey('row-delete')).first);
+    await settle(tester, rounds: 6);
+    expect(find.text('有未保存的修改'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('batch-leave-cancel')));
+    await settle(tester, rounds: 6);
+    expect(find.text('row_1'), findsWidgets);
+    expect(stagedPill(1), findsOneWidget);
+    expect(await rowCount(tester, 'guard_rows', 1), 1);
+
+    // 再点删除 → 放弃暂存编辑 → 进入原本的删除确认 → 确认后行消失。
+    await tester.tap(find.byKey(const ValueKey('row-delete')).first);
+    await settle(tester, rounds: 6);
+    await tester.tap(find.byKey(const ValueKey('batch-leave-discard')));
+    await settle(tester, rounds: 8);
+    expect(find.text('确定删除该行吗？'), findsOneWidget);
+    await tester.tap(find.text('删除'));
+    await settle(tester, rounds: 20);
+    expect(find.text('row_1'), findsNothing);
+    expect(stagedPill(1), findsNothing);
+    expect(await rowCount(tester, 'guard_rows', 1), 0);
     await tester.pump(const Duration(seconds: 4));
   });
 }

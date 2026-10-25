@@ -128,13 +128,17 @@ pub async fn read_backup(id: String) -> anyhow::Result<Value> {
 
 /// Execute every statement in a backup against its original database.
 ///
-/// The dump runs through **one pinned connection** and consecutive DML
-/// statements are grouped into transactions (see
-/// [dbpilot_core::ops::restore_sql]): a 500k-row dump pays a handful of commits
-/// instead of one autocommit per INSERT. Failure reporting is unchanged — one
-/// entry per dump statement, the first 20 errors are returned — and a failed
-/// batch is rolled back and replayed so every other statement is still
-/// attempted.
+/// The dump runs through **one pinned connection**. PostgreSQL and SQLite get
+/// a really atomic restore ([dbpilot_core::ops::restore_sql_atomic]): one
+/// transaction around the whole dump, so a failure at any statement rolls the
+/// schema and data back too. MySQL keeps the grouped path
+/// ([dbpilot_core::ops::restore_sql]) because its DDL implicitly commits and a
+/// whole-dump transaction is impossible there — a MySQL restore can leave the
+/// successfully applied prefix behind.
+///
+/// Failure reporting: one entry per executed dump statement, the first 20
+/// errors are returned, and for MySQL a failed DML batch is rolled back and
+/// replayed so every other statement is still attempted.
 pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
     let state = state()?;
     let (meta, content) = state.backups.read(&id).await?;
@@ -155,9 +159,23 @@ pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
     // what lets the DML batches run in a transaction (and makes a dump's
     // USE / SET FOREIGN_KEY_CHECKS actually apply to the next statement).
     let mut session = state.open_session(target_database.as_deref()).await?;
-    let report = dbpilot_core::ops::restore_sql(session.as_mut(), &content).await;
+    // PostgreSQL / SQLite have transactional DDL, so the whole dump can be one
+    // transaction. MySQL cannot: every DDL statement implicitly commits there,
+    // which is why it keeps the grouped (per-run) restore path.
+    let report = match driver.kind() {
+        crate::drivers::DriverKind::Postgres | crate::drivers::DriverKind::Sqlite => {
+            dbpilot_core::ops::restore_sql_atomic(session.as_mut(), &content).await
+        }
+        crate::drivers::DriverKind::Mysql => {
+            dbpilot_core::ops::restore_sql(session.as_mut(), &content).await
+        }
+    };
     drop(session);
-    let statements = report.statements();
+    // Number of statements in the dump (the whole file), not just the executed
+    // prefix: the Dart restore banner prints "共 N 条语句，已执行 X，跳过 Y", and
+    // an atomic failure stops early. On the grouped (MySQL) path every statement
+    // is attempted, so this equals the results length as before.
+    let statements = report.total_statements;
     let failed = report.failed();
     let errors: Vec<Value> = report
         .results
@@ -170,13 +188,23 @@ pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
         .take(20)
         .collect();
     Ok(json!({
-        "ok": failed == 0,
+        "ok": failed == 0 && !report.rolled_back,
         "statements": statements,
         "failed": failed,
         "errors": errors,
-        // Additive diagnostics: how the restore was batched. MySQL DDL
-        // implicitly commits, so statements_in_transactions covers only the
-        // consecutive DML runs; a dump is never atomic as a whole on MySQL.
+        // Additive diagnostics: how the restore was batched. PostgreSQL /
+        // SQLite run the whole dump in one transaction (atomic = true,
+        // transaction_batches = 1 on success); MySQL DDL implicitly commits, so
+        // its statements_in_transactions covers only consecutive DML runs and a
+        // dump is never atomic as a whole there (atomic = false).
+        "atomic": report.atomic,
+        "rolled_back": report.rolled_back,
+        "total_statements": report.total_statements,
+        // Executed dump statements (the failing one included) and the ones an
+        // atomic restore never reached. The Dart restore banner reads these as
+        // executed / skipped.
+        "executed": report.statements().min(report.total_statements),
+        "skipped": report.skipped_statements(),
         "transaction_batches": report.transaction_batches,
         "statements_in_transactions": report.statements_in_transactions,
         "round_trips": report.round_trips,

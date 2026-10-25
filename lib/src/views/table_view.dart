@@ -1345,13 +1345,19 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   }
 
   Future<void> _deleteRow(int index) async {
+    // 第 58 轮：删除会 reload 当前页，先处理未保存的批量编辑（取消则什么都不做）。
+    // 行键必须在确认之前按当前 rows 计算：守卫里选「保存后继续」会 reload，
+    // 行索引可能不再指向同一行。
+    final keys = _rowKeys(index);
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
     final ok = await confirmDialog(context,
         message: '确定删除该行吗？', confirmLabel: t('delete'), danger: true);
     if (!ok) return;
     try {
       await Api.instance.changeRow(widget.db, widget.table, {
         'action': 'delete',
-        'keys': _rowKeys(index),
+        'keys': keys,
         'limit_one': _primaryKey.isEmpty,
       });
       widget.notice.show('行已删除');
@@ -1362,17 +1368,24 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   }
 
   Future<void> _deleteRows(List<int> indices) async {
+    // 第 58 轮：同 _deleteRow，删除前先处理未保存的批量编辑。行键先算好，
+    // 守卫里的保存会 reload rows。
+    final keyList = <Map<String, dynamic>>[
+      for (final index in indices) _rowKeys(index),
+    ];
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
     final ok = await confirmDialog(context,
         message: '确定删除选中的 ${indices.length} 行吗？',
         confirmLabel: t('delete'),
         danger: true);
     if (!ok) return;
     var deleted = 0;
-    for (final index in indices) {
+    for (final keys in keyList) {
       try {
         await Api.instance.changeRow(widget.db, widget.table, {
           'action': 'delete',
-          'keys': _rowKeys(index),
+          'keys': keys,
           'limit_one': _primaryKey.isEmpty,
         });
         deleted++;
@@ -1390,6 +1403,10 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// Row editor modal: one control per column, skipping primary-key columns on
   /// update because those identify the row.
   Future<void> _showRowEditor(int index) async {
+    if (index < 0 || index >= _rows.length) return;
+    // 第 58 轮：行键在打开时算好——保存前的未保存确认里选「保存后继续」会
+    // reload rows，行索引可能不再指向同一行。
+    final keys = _rowKeys(index);
     final row = _rows[index];
     final controllers = <String, TextEditingController>{};
     final nulls = <String, bool>{};
@@ -1420,6 +1437,10 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           builder: (context) => Btn(t('save_changes'),
               primary: true,
               onPressed: () async {
+                // 第 58 轮：行编辑器保存后会 reload 当前页，先处理未保存的
+                // 批量编辑；取消则停留在编辑器里，不写数据库。
+                if (!await _confirmLeaveDirty()) return;
+                if (!mounted) return;
                 final values = <String, dynamic>{};
                 for (final column in _columns) {
                   final name = column['name'].toString();
@@ -1431,7 +1452,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                 try {
                   await Api.instance.changeRow(widget.db, widget.table, {
                     'action': 'update',
-                    'keys': _rowKeys(index),
+                    'keys': keys,
                     'values': values,
                     'limit_one': _primaryKey.isEmpty,
                   });

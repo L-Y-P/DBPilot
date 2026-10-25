@@ -13,6 +13,112 @@ import '../sqlite_sources.dart';
 import '../theme.dart';
 import '../widgets.dart';
 
+/// 一次备份还原的结果文案（第 58 轮）。
+///
+/// 纯数据 + 纯函数，便于中英文 / 原子 / 回滚 / 旧后端降级单测；UI 用 [message]。
+class RestoreOutcomeCopy {
+  const RestoreOutcomeCopy({
+    required this.zh,
+    required this.en,
+    required this.isError,
+  });
+
+  final String zh;
+  final String en;
+
+  /// 失败（有 failed 语句或整段回滚）时为 true；UI 据此决定是否展示错误列表。
+  final bool isError;
+
+  String get message => pickText(zh, en);
+}
+
+/// 把 restoreBackup 的返回翻译成用户提示（第 58 轮）。
+///
+/// 新后端（Rust）返回：
+///   * `total_statements`：切分后的语句总数；
+///   * `statements`：实际执行过的语句数（= results 数量，含失败的那条）；
+///   * `skipped_statements`：原子还原中途失败后没执行的语句数；
+///   * `atomic` / `rolled_back` / `failed`。
+/// 规则：
+///   * 失败且 `rolled_back == true`：整段事务已回滚，明确告诉用户「未写入任何
+///     数据」，并给出 总数 / 已执行 / 跳过；
+///   * 成功且 `atomic == true`：提示这是整段事务；
+///   * 其它（旧后端没有这些字段 / MySQL 非原子）：沿用原提示；[mysql] 时补一句
+///     「MySQL 的 DDL 会隐式提交，无法整段回滚」。
+///
+/// 兼容旧后端与 `executed` / `skipped` 这组备用字段名，缺失时按 `statements`
+/// 与总数推断，保证降级时提示仍然合理。
+RestoreOutcomeCopy describeRestoreOutcome(Json result, {bool mysql = false}) {
+  final total =
+      (result['total_statements'] as num?)?.toInt() ??
+      (result['statements'] as num?)?.toInt() ??
+      0;
+  final failed = (result['failed'] as num?)?.toInt() ?? 0;
+  final executed =
+      (result['executed'] as num?)?.toInt() ??
+      (result['statements'] as num?)?.toInt() ??
+      0;
+  final skipped =
+      (result['skipped_statements'] as num?)?.toInt() ??
+      (result['skipped'] as num?)?.toInt() ??
+      (total - executed < 0 ? 0 : total - executed);
+  final rolledBack = result['rolled_back'] == true;
+  final atomic = result['atomic'] == true;
+  final ok = result['ok'] != false;
+  const mysqlHintZh = '；MySQL 的 DDL 会隐式提交，无法整段回滚';
+  const mysqlHintEn =
+      '; MySQL DDL commits implicitly, so the restore cannot roll back as a whole';
+  if (failed > 0 || rolledBack || !ok) {
+    if (rolledBack) {
+      return RestoreOutcomeCopy(
+        zh: '还原失败，已整体回滚，未写入任何数据'
+            '（共 $total 条语句，已执行 $executed，跳过 $skipped）',
+        en: 'Restore failed and was rolled back as a whole; no data was written '
+            '($total statement(s) total, $executed executed, '
+            '$skipped skipped)',
+        isError: true,
+      );
+    }
+    if (atomic) {
+      return RestoreOutcomeCopy(
+        zh: '还原失败（整段事务未提交；共 $total 条语句，跳过 $skipped）',
+        en: 'Restore failed inside the whole-restore transaction and was not '
+            'committed ($total statement(s) total, $skipped skipped)',
+        isError: true,
+      );
+    }
+    if (failed > 0) {
+      return RestoreOutcomeCopy(
+        zh: '备份还原完成，但 $failed / $total 条语句失败'
+            '${mysql ? mysqlHintZh : ''}',
+        en: 'Restore finished with $failed / $total statement(s) failed'
+            '${mysql ? mysqlHintEn : ''}',
+        isError: true,
+      );
+    }
+    // 兜底：后端标记 ok=false 但没有逐条错误（理论上不会发生）。
+    return RestoreOutcomeCopy(
+      zh: '还原失败（共 $total 条语句，跳过 $skipped）'
+          '${mysql ? mysqlHintZh : ''}',
+      en: 'Restore failed ($total statement(s) total, $skipped skipped)'
+          '${mysql ? mysqlHintEn : ''}',
+      isError: true,
+    );
+  }
+  if (atomic) {
+    return RestoreOutcomeCopy(
+      zh: '还原成功（整段事务，$total 条语句）',
+      en: 'Restored successfully in one transaction ($total statement(s))',
+      isError: false,
+    );
+  }
+  return RestoreOutcomeCopy(
+    zh: '备份已还原（$total 条语句）${mysql ? mysqlHintZh : ''}',
+    en: 'Backup restored ($total statement(s))${mysql ? mysqlHintEn : ''}',
+    isError: false,
+  );
+}
+
 /// Backup list and restore actions. Ports Backups.vue: create a dump of a whole
 /// database or a single table, then save a copy, restore it, or delete the file.
 class BackupsView extends StatefulWidget {
@@ -207,11 +313,13 @@ class _BackupsViewState extends State<BackupsView> {
     setState(() => _error = null);
     try {
       final res = await Api.instance.restoreBackup(entry['id'].toString());
-      final statements = (res['statements'] as num?)?.toInt() ?? 0;
-      final failed = (res['failed'] as num?)?.toInt() ?? 0;
-      widget.notice.show(failed == 0
-          ? '备份已还原（$statements 条语句）'
-          : '备份还原完成，但 $failed / $statements 条语句失败');
+      // 第 58 轮：新后端会返回 atomic / rolled_back / skipped，按结果给出
+      // 「整段事务 / 已整体回滚」等更准确的提示；旧后端自动降级到原提示。
+      final outcome = describeRestoreOutcome(
+        res,
+        mysql: AppState.instance.isMysql,
+      );
+      widget.notice.show(outcome.message);
       // A PostgreSQL backup records its physical database; follow it if the
       // restore switched the Rust-side active database.
       final state = AppState.instance;
@@ -225,7 +333,8 @@ class _BackupsViewState extends State<BackupsView> {
         }
       }
       await _loadTables();
-      if (failed > 0 && mounted) {
+      if (outcome.isError && mounted) {
+        // 回滚/部分失败都保留逐条错误列表，方便定位失败的语句。
         setState(() => _error = _prettyErrors(res['errors']));
       }
     } catch (e) {

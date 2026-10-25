@@ -241,19 +241,85 @@ async fn sqlite_batch_edits_are_atomic() {
         .as_array()
         .expect("zero_row_results array");
     assert_eq!(zero_rows.len(), 2, "{result}");
+    // Round 63: SQLite can tell "row not found" apart from "values unchanged";
+    // both missed items point at rows that do not exist.
     assert_eq!(
         zero_rows[0],
-        json!({ "index": 0, "action": "update", "keys": { "id": 999 } }),
+        json!({
+            "index": 0,
+            "action": "update",
+            "keys": { "id": 999 },
+            "reason": "not_found"
+        }),
         "{result}"
     );
     assert_eq!(
         zero_rows[1],
-        json!({ "index": 1, "action": "delete", "keys": { "id": 999 } }),
+        json!({
+            "index": 1,
+            "action": "delete",
+            "keys": { "id": 999 },
+            "reason": "not_found"
+        }),
+        "{result}"
+    );
+    assert_eq!(
+        result["zero_row_reasons"],
+        json!({ "not_found": 2, "unchanged": 0, "unknown": 0 }),
         "{result}"
     );
     // The matched update committed; the zero-row items changed nothing.
     let rows = run("SELECT id, qty FROM items WHERE id IN (2, 999) ORDER BY id").await;
     assert_eq!(rows["rows"], json!([[2, 21]]), "{rows}");
+
+    // -------- SQLite counts matched rows even when the values are identical, so
+    // a same-value UPDATE still reports 1 row and produces no diagnostic. The
+    // "unchanged" reason is a MySQL distinction (its count skips unchanged rows);
+    // it is covered by the ignored MySQL test below and the unit tests.
+    let same = ok(api::explorer::apply_row_changes(
+        "main".into(),
+        "items".into(),
+        json!([{ "action": "update", "keys": { "id": 2 }, "values": { "qty": 21 } }]),
+    ))
+    .await;
+    assert_eq!(same["rows_affected"], json!(1), "{same}");
+    assert_eq!(same["zero_row_results"], json!([]), "{same}");
+
+    // -------- complex key without a primary key (limit_one): the existence
+    // probe uses the whole key, so a non-matching multi-column key is still
+    // reported as not_found.
+    run("CREATE TABLE noid (name TEXT, qty INTEGER)").await;
+    run("INSERT INTO noid (name, qty) VALUES ('x', 1), ('x', 1)").await;
+    let result = ok(api::explorer::apply_row_changes(
+        "main".into(),
+        "noid".into(),
+        json!([{
+            "action": "update",
+            "keys": { "name": "x", "qty": 999 },
+            "values": { "qty": 7 },
+            "limit_one": true
+        }]),
+    ))
+    .await;
+    assert_eq!(result["ok"], json!(true), "{result}");
+    assert_eq!(result["rows_affected"], json!(0), "{result}");
+    assert_eq!(
+        result["zero_row_results"],
+        json!([{
+            "index": 0,
+            "action": "update",
+            "keys": { "name": "x", "qty": 999 },
+            "reason": "not_found"
+        }]),
+        "{result}"
+    );
+    assert_eq!(
+        result["zero_row_reasons"],
+        json!({ "not_found": 1, "unchanged": 0, "unknown": 0 }),
+        "{result}"
+    );
+    let rows = run("SELECT qty FROM noid ORDER BY qty").await;
+    assert_eq!(rows["rows"], json!([[1], [1]]), "nothing may change: {rows}");
 
     // -------- validation happens before BEGIN: a bad item changes nothing
     let invalid = api::explorer::apply_row_changes(
@@ -280,6 +346,11 @@ async fn sqlite_batch_edits_are_atomic() {
     assert_eq!(empty["rows_affected"], json!(0), "{empty}");
     assert_eq!(empty["results"], json!([]), "{empty}");
     assert_eq!(empty["zero_row_results"], json!([]), "{empty}");
+    assert_eq!(
+        empty["zero_row_reasons"],
+        json!({ "not_found": 0, "unchanged": 0, "unknown": 0 }),
+        "{empty}"
+    );
 
     // -------- limit_one: a key made of every column touches a single row
     run("CREATE TABLE dup (name TEXT, qty INTEGER)").await;
@@ -297,6 +368,11 @@ async fn sqlite_batch_edits_are_atomic() {
     .await;
     assert_eq!(result["rows_affected"], json!(1), "{result}");
     assert_eq!(result["zero_row_results"], json!([]), "{result}");
+    assert_eq!(
+        result["zero_row_reasons"],
+        json!({ "not_found": 0, "unchanged": 0, "unknown": 0 }),
+        "{result}"
+    );
     let rows = run("SELECT qty FROM dup ORDER BY qty").await;
     assert_eq!(rows["rows"], json!([[1], [9]]), "{rows}");
 
@@ -521,6 +597,103 @@ async fn postgres_batch_edits_are_atomic() {
 
     // -------- cleanup: only our own schema, then disconnect.
     run(&format!("DROP SCHEMA IF EXISTS {schema_sql} CASCADE")).await;
+    let _ = api::connections::disconnect().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Live MySQL variant of the zero-row reasons: MySQL's affected-row count only
+/// counts rows whose values actually changed, so the same-value UPDATE is
+/// exactly the case the existence probe has to classify as "unchanged" (SQLite
+/// counts the matched row and never produces this diagnostic).
+#[tokio::test]
+#[ignore = "requires DBPILOT_TEST_MYSQL_* (MySQL affected-rows semantics)"]
+async fn mysql_zero_row_reasons_distinguish_missing_and_unchanged() {
+    if !common::mysql_usable().await {
+        eprintln!("SKIP: DBPILOT_TEST_MYSQL_* does not authenticate");
+        return;
+    }
+    let dir = temp_dir("mysql-zero-row");
+    let init = api::init_app(dir.to_string_lossy().to_string());
+    assert_eq!(init.get("ok"), Some(&Value::Bool(true)), "init: {init}");
+
+    // Connect through the maintenance database and create a throw-away one, so
+    // the test never depends on (or touches) a pre-existing user database.
+    let created = ok(api::connections::create_connection(mysql_body(
+        "Apply MySQL zero row",
+        "mysql",
+    )))
+    .await;
+    let conn_id = created["connection"]["id"].as_str().unwrap().to_string();
+    if let Err(error) = api::connections::connect_connection(conn_id).await {
+        eprintln!("SKIP: cannot open MySQL maintenance database: {error}");
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
+
+    let database = format!("rma_zero_row_{}", std::process::id());
+    run(&format!("DROP DATABASE IF EXISTS `{database}`")).await;
+    run(&format!("CREATE DATABASE `{database}`")).await;
+    run(&format!(
+        "CREATE TABLE `{database}`.items (id INT PRIMARY KEY, qty INT)"
+    ))
+    .await;
+    run(&format!(
+        "INSERT INTO `{database}`.items (id, qty) VALUES (1, 10)"
+    ))
+    .await;
+
+    let result = ok(api::explorer::apply_row_changes(
+        database.clone(),
+        "items".into(),
+        json!([
+            // same values: sqlx requests CLIENT_FOUND_ROWS, so MySQL reports the
+            // matched row (1), not "changed rows". It therefore is a normal hit
+            // here and never reaches the zero-row diagnostics — the "unchanged"
+            // reason is exercised by the unit tests and stays correct for drivers
+            // that report changed-rows semantics.
+            { "action": "update", "keys": { "id": 1 }, "values": { "qty": 10 } },
+            { "action": "update", "keys": { "id": 999 }, "values": { "qty": 1 } },
+            { "action": "delete", "keys": { "id": 999 } },
+            // real change -> normal hit, not a diagnostic.
+            { "action": "update", "keys": { "id": 1 }, "values": { "qty": 20 } },
+        ]),
+    ))
+    .await;
+    assert_eq!(result["ok"], json!(true), "{result}");
+    assert_eq!(result["rows_affected"], json!(2), "{result}");
+    // Same-value update is a matched row on this stack (FOUND_ROWS), not a
+    // zero-row diagnostic.
+    assert_eq!(result["results"][0]["rows_affected"], json!(1), "{result}");
+    assert_eq!(
+        result["zero_row_results"],
+        json!([
+            {
+                "index": 1,
+                "action": "update",
+                "keys": { "id": 999 },
+                "reason": "not_found"
+            },
+            {
+                "index": 2,
+                "action": "delete",
+                "keys": { "id": 999 },
+                "reason": "not_found"
+            },
+        ]),
+        "{result}"
+    );
+    assert_eq!(
+        result["zero_row_reasons"],
+        json!({ "not_found": 2, "unchanged": 0, "unknown": 0 }),
+        "{result}"
+    );
+    let rows = run(&format!(
+        "SELECT qty FROM `{database}`.items WHERE id = 1"
+    ))
+    .await;
+    assert_eq!(rows["rows"], json!([[20]]), "{rows}");
+
+    run(&format!("DROP DATABASE `{database}`")).await;
     let _ = api::connections::disconnect().await;
     let _ = std::fs::remove_dir_all(dir);
 }

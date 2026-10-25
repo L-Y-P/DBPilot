@@ -518,3 +518,24 @@ Future<void> showRelationDesigner(
 - **MySQL 8.4 规则验证**：新增 MySQL live 测试 test/fk_reference_live_test.dart（3 例）：无索引引用列报 6125 Missing unique key；加 UNIQUE 后成功且孤儿插入被拒（1452）；普通非唯一 KEY 仍报 6125。结论：产品本地校验与 MySQL 8.4 一致；phpMyAdmin web 能建通常是因为该列已有 UNIQUE，或服务器是 MariaDB/旧版 MySQL（规则不同），不是本地应用更严格。
 - **修复的回归问题**：唯一性 SQL 原用裸别名 AS distinct（MySQL 保留字）→ 1064 被静默吞掉，导致错误显示「没有非空值」；已改别名 + 可空解析 + 失败降级。GUI 实测通过。
 
+
+## 19. 第 63 轮修订（孤儿警告一键改选同名列 / 零行原因区分）
+
+### 19.1 孤儿警告一键「创建唯一索引并改用同名列」
+
+- FkOrphanReport 增加修复判断：引用表存在与子列同名列、且匹配率 ≥99%（sameNameMostlyMatches）时，孤儿警告弹窗增加第三按钮 key=er-orphan-fix-samename，文案「创建唯一索引并改用『学生名单.学号』」。
+- 点击：先查同名列唯一性（_checkColumnUniqueness）：
+  · 已有单列唯一索引/主键 → 不建索引，直接重开新建外键弹窗并把引用字段设为该列；
+  · 数据全唯一但无索引 → add_indexes unique（uniqueIndexNameFor）→ 刷新结构 → 重开弹窗；
+  · 有重复 → 只弹 erRefColumnDuplicateMessage（数量/示例），不发 DDL，原弹窗保留；
+  · 修复成功通过 FkRetryWithRefColumnException + _pendingCreateRefColumn 一次性状态重开弹窗（防递归）。
+- 索引名 1826 自动重试：_createUniqueIndex 首次 uk_<列>，错误含 1826/Duplicate key name/already exists 时换 uk_<列>_2 再试一次；第 62 轮「引用列非唯一一键索引」也复用同一 helper。
+
+### 19.2 零行命中原因区分（行不存在 / 值未变化）
+
+- core 新增 row_exists_sql（复用 dialect qualify/quote_ident/literal，NULL→IS NULL、多列 AND、空 keys 报错）+ DatabaseDriver 默认方法。
+- apply_row_changes 在 COMMIT 后仅对零行 UPDATE 逐条探测：存在→reason=unchanged、不存在→not_found、探测失败→unknown（不影响批次）；DELETE 零行直接 not_found；zero_row_results[] 追加 reason，新增汇总 zero_row_reasons{not_found,unchanged,unknown}。
+- Dart table_view：BatchApplyOutcome 增加 notFound/unchanged/unknown 与纯函数 batchApplyCopy/batchZeroRowCopy；提示「N 条未命中（目标行不存在）」「M 条值未变化（未写入）」或组合；unknown/旧后端沿用原「未命中任何行」文案。
+- 重要发现：sqlx-mysql 握手请求 CLIENT_FOUND_ROWS，MySQL 同值 UPDATE 的 affected rows 是 1（matched）而不是 0；PG/SQLite 同样计 matched → 当前驱动栈上零行 UPDATE 实际只代表行不存在，unchanged 为防御性分支（单测覆盖，未来驱动若回报 changed-rows 自然生效），不会误报。
+- 风险：每条零行 UPDATE 多 1 次点查（keys 通常主键/唯一键；无索引表会扫表）；探测在 COMMIT 后独立查询，并发窗口内 reason 可能与提交瞬间不一致（仅影响提示）。
+

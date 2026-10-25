@@ -1125,6 +1125,40 @@ pub(crate) fn change_row_sql<D: DatabaseDriver + ?Sized>(
     })
 }
 
+/// Build — but do not execute — the "does this row key still exist?" probe.
+///
+/// [change_row_sql] renders the UPDATE / DELETE, but a zero affected-row count
+/// can mean two different things: the key matched nothing, or (MySQL counts only
+/// rows whose values actually changed) the row was there with identical values.
+/// The batched apply path runs this probe after the transaction committed; it
+/// reuses the same dialect quoting/literals, so no user value is pasted into SQL.
+pub(crate) fn row_exists_sql<D: DatabaseDriver + ?Sized>(
+    driver: &D,
+    ns: &str,
+    table: &str,
+    keys: &Map<String, Value>,
+) -> AppResult<String> {
+    if keys.is_empty() {
+        return Err(AppError::bad("row existence check requires a row key"));
+    }
+    let dialect = driver.dialect();
+    let target = dialect.qualify(ns, table);
+    let wheres = keys
+        .iter()
+        .map(|(c, v)| {
+            if v.is_null() {
+                format!("{} IS NULL", dialect.quote_ident(c))
+            } else {
+                format!("{} = {}", dialect.quote_ident(c), dialect.literal(v))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    // LIMIT 1 is valid on MySQL, PostgreSQL and SQLite; the probe only needs to
+    // know whether at least one row still matches the key.
+    Ok(format!("SELECT 1 FROM {} WHERE {} LIMIT 1", target, wheres))
+}
+
 pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
     driver: &D,
     conn: &ConnectionHandle,

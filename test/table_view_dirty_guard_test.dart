@@ -406,6 +406,70 @@ void main() {
     expect(zero.message, contains('1 条改动'));
   });
 
+  test('BatchApplyOutcome 文案：按 reason 区分未命中与值未变化（第 63 轮）', () {
+    final notFound =
+        const BatchApplyOutcome(rowsAffected: 3, zeroRows: 2, notFound: 2);
+    expect(notFound.message, contains('2 条未命中（目标行不存在）'));
+    expect(notFound.message, isNot(contains('值未变化')));
+
+    final unchanged =
+        const BatchApplyOutcome(rowsAffected: 3, zeroRows: 1, unchanged: 1);
+    expect(unchanged.message, contains('1 条值未变化（未写入）'));
+    expect(unchanged.message, isNot(contains('未命中（目标行不存在）')));
+
+    // 两种原因同时存在 -> 按 not_found 再 unchanged 组合。
+    final both = const BatchApplyOutcome(
+      rowsAffected: 0,
+      zeroRows: 3,
+      notFound: 2,
+      unchanged: 1,
+    );
+    expect(both.message, contains('2 条未命中（目标行不存在）'));
+    expect(both.message, contains('1 条值未变化（未写入）'));
+
+    // 存在性检查失败 -> unknown，不臆测原因，沿用旧措辞。
+    final unknown =
+        const BatchApplyOutcome(rowsAffected: 0, zeroRows: 1, unknown: 1);
+    expect(unknown.message, contains('1 条改动未命中任何行（可能已被删除或键被修改）'));
+
+    // 旧后端只给条数 -> 仍按旧文案，向后兼容；切表提示复用同一后缀。
+    final legacy = const BatchApplyOutcome(rowsAffected: 1, zeroRows: 2);
+    expect(legacy.message, contains('2 条改动未命中任何行（可能已被删除或键被修改）'));
+    expect(legacy.zeroRowSuffix, contains('2 条改动未命中任何行'));
+  });
+
+  test('batchApplyCopy / batchZeroRowCopy：中英双语与组合顺序（第 63 轮）', () {
+    final saved = batchApplyCopy(rowsAffected: 5);
+    expect(saved.zh, '已保存 5 行');
+    expect(saved.en, 'Saved 5 row(s)');
+    expect(batchZeroRowCopy(zeroRows: 0), isNull);
+
+    final both = batchApplyCopy(
+      rowsAffected: 0,
+      zeroRows: 3,
+      notFound: 2,
+      unchanged: 1,
+    );
+    expect(
+      both.zh,
+      '已保存 0 行；2 条未命中（目标行不存在）；1 条值未变化（未写入）',
+    );
+    expect(
+      both.en,
+      contains('2 edit(s) matched no row (the target row no longer exists)'),
+    );
+    expect(
+      both.en,
+      contains('1 edit(s) had unchanged values (nothing was written)'),
+    );
+
+    final unknown = batchApplyCopy(rowsAffected: 0, zeroRows: 1, unknown: 1);
+    expect(
+      unknown.en,
+      contains('the row may have been deleted or its key changed'),
+    );
+  });
+
   testWidgets('无主键表：翻页仍弹离开确认（不做跨页保持）', (tester) async {
     size(tester);
     final notice = Notice();
@@ -485,7 +549,8 @@ void main() {
     );
     await tester.tap(find.byKey(const ValueKey('grid-apply-dirty')));
     await settle(tester, rounds: 26);
-    expect(find.textContaining('未命中任何行'), findsWidgets);
+    // 第 63 轮：Rust 会给出 reason=not_found（目标行已不存在），提示更具体。
+    expect(find.textContaining('未命中（目标行不存在）'), findsWidgets);
     expect(find.textContaining('未保存'), findsNothing);
     await tester.pump(const Duration(seconds: 4));
   });

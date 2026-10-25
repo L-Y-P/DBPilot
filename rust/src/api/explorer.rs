@@ -559,6 +559,72 @@ fn zero_row_results(changes: &[PlannedChange], row_counts: &[u64]) -> Vec<Value>
         .collect()
 }
 
+/// Aggregated reasons for the zero-row UPDATE / DELETE diagnostics.
+#[derive(Default)]
+struct ZeroRowReasons {
+    not_found: u64,
+    unchanged: u64,
+    unknown: u64,
+}
+
+impl ZeroRowReasons {
+    fn count(&mut self, reason: &str) {
+        match reason {
+            "not_found" => self.not_found += 1,
+            "unchanged" => self.unchanged += 1,
+            _ => self.unknown += 1,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "not_found": self.not_found,
+            "unchanged": self.unchanged,
+            "unknown": self.unknown,
+        })
+    }
+}
+
+/// Reason for one zero-row change.
+///
+/// DELETE always means the key matched nothing (there is no "value unchanged"
+/// for a delete). UPDATE needs the existence probe: the key still matching a row
+/// means the values were already identical (MySQL counts only real changes),
+/// otherwise the row is gone. A failed probe (permission/concurrency) must never
+/// fail the batch, so it becomes "unknown".
+fn zero_row_reason(action: &str, probe: Result<bool, ()>) -> &'static str {
+    if action.eq_ignore_ascii_case("delete") {
+        return "not_found";
+    }
+    match probe {
+        Ok(true) => "unchanged",
+        Ok(false) => "not_found",
+        Err(()) => "unknown",
+    }
+}
+
+/// Does the row key still match a row after the batch committed?
+///
+/// Uses the driver's quoting helper (SELECT 1 ... WHERE keys LIMIT 1), so no
+/// user value is pasted into SQL. The probe runs as a separate autocommit query
+/// after COMMIT: it can never affect the batch result, and a concurrent change
+/// between COMMIT and this read may make the answer approximate.
+async fn probe_row_exists(
+    driver: &dyn crate::core::DatabaseDriver,
+    conn: &crate::core::ConnectionHandle,
+    namespace: &str,
+    table: &str,
+    keys: &serde_json::Map<String, Value>,
+) -> Result<bool, ()> {
+    let sql = driver
+        .row_exists_sql(namespace, table, keys)
+        .map_err(|_| ())?;
+    match conn.fetch_named(sql).await {
+        Ok(rows) => Ok(!rows.is_empty()),
+        Err(_) => Err(()),
+    }
+}
+
 /// Apply several row changes (INSERT / UPDATE / DELETE) in **one transaction**.
 ///
 /// The semantic of every item is exactly [change_row]'s: the same key/value
@@ -579,6 +645,11 @@ fn zero_row_results(changes: &[PlannedChange], row_counts: &[u64]) -> Vec<Value>
 /// meaning. [zero_row_results] (added in round 60) lists the UPDATE / DELETE
 /// items whose driver row count was 0; since MySQL counts only rows whose values
 /// changed, that means "the key matched nothing, or the value did not change".
+/// Round 63 resolves that ambiguity after COMMIT: each zero-row UPDATE gets one
+/// existence probe (SELECT 1 ... WHERE keys LIMIT 1), so every item carries
+/// reason = not_found | unchanged | unknown, and zero_row_reasons aggregates the
+/// counts. The probe is diagnostics only — a failed probe becomes "unknown" and
+/// never fails the batch. DELETE zero rows are always not_found.
 ///
 pub async fn apply_row_changes(
     database: String,
@@ -611,6 +682,7 @@ pub async fn apply_row_changes(
             "results": [],
             "rows_affected": 0,
             "zero_row_results": [],
+            "zero_row_reasons": { "not_found": 0, "unchanged": 0, "unknown": 0 },
         }));
     }
     // One transaction on one pooled connection. The driver issues BEGIN/COMMIT
@@ -638,7 +710,24 @@ pub async fn apply_row_changes(
     // MySQL, changed no value). Never changes ok or the transaction outcome.
     // Passing only the row counts keeps ResultSet out of the FRB-facing module.
     let row_counts: Vec<u64> = executed.iter().map(|result| result.row_count).collect();
-    let zero_rows = zero_row_results(&planned, &row_counts);
+    let mut zero_rows = zero_row_results(&planned, &row_counts);
+    // Round 63: resolve "row not found" vs "values unchanged". UPDATE needs the
+    // existence probe; DELETE can only mean the row is gone. A failed probe is
+    // reported as unknown and never fails the batch.
+    let mut zero_row_reasons = ZeroRowReasons::default();
+    for item in zero_rows.iter_mut() {
+        let action = item["action"].as_str().unwrap_or_default().to_string();
+        let reason = if action.eq_ignore_ascii_case("delete") {
+            "not_found"
+        } else {
+            let keys = item["keys"].as_object().cloned().unwrap_or_default();
+            let probe =
+                probe_row_exists(driver.as_ref(), &conn, &database, &table, &keys).await;
+            zero_row_reason(&action, probe)
+        };
+        zero_row_reasons.count(reason);
+        item["reason"] = json!(reason);
+    }
     Ok(json!({
         "ok": true,
         "database": database,
@@ -646,6 +735,7 @@ pub async fn apply_row_changes(
         "results": results,
         "rows_affected": rows_affected,
         "zero_row_results": zero_rows,
+        "zero_row_reasons": zero_row_reasons.to_json(),
     }))
 }
 
@@ -934,5 +1024,93 @@ mod tests {
         assert_eq!(zero[0]["index"], json!(1));
         assert_eq!(zero[1]["index"], json!(2));
         assert_eq!(zero[0]["keys"], json!({ "id": 9 }));
+    }
+
+    #[test]
+    fn zero_row_reason_splits_not_found_unchanged_and_unknown() {
+        // DELETE has no "value unchanged" case: 0 rows means the row is gone.
+        assert_eq!(zero_row_reason("delete", Ok(true)), "not_found");
+        assert_eq!(zero_row_reason("DELETE", Ok(false)), "not_found");
+        // UPDATE: the key still matches -> the values were already identical
+        // (MySQL only counts rows whose values actually changed).
+        assert_eq!(zero_row_reason("update", Ok(true)), "unchanged");
+        assert_eq!(zero_row_reason("update", Ok(false)), "not_found");
+        // Probe failed (permission / concurrency): never claim a cause.
+        assert_eq!(zero_row_reason("update", Err(())), "unknown");
+    }
+
+    #[test]
+    fn zero_row_reasons_count_and_serialize() {
+        let mut reasons = ZeroRowReasons::default();
+        for reason in ["not_found", "unchanged", "unchanged", "unknown"] {
+            reasons.count(reason);
+        }
+        assert_eq!(
+            reasons.to_json(),
+            json!({ "not_found": 1, "unchanged": 2, "unknown": 1 })
+        );
+        assert_eq!(
+            ZeroRowReasons::default().to_json(),
+            json!({ "not_found": 0, "unchanged": 0, "unknown": 0 })
+        );
+    }
+
+    #[test]
+    fn row_exists_probe_quotes_identifiers_and_literals() {
+        use crate::core::DriverKind;
+        use crate::drivers::builtin::driver_for;
+
+        let keys = |value: Value| {
+            let Value::Object(keys) = value else {
+                panic!("keys must be an object");
+            };
+            keys
+        };
+        let sqlite = driver_for(DriverKind::Sqlite);
+        assert_eq!(
+            sqlite
+                .row_exists_sql("main", "items", &keys(json!({ "id": 1 })))
+                .unwrap(),
+            r#"SELECT 1 FROM "main"."items" WHERE "id" = 1 LIMIT 1"#
+        );
+        let postgres = driver_for(DriverKind::Postgres);
+        assert_eq!(
+            postgres
+                .row_exists_sql("public", "items", &keys(json!({ "id": 1 })))
+                .unwrap(),
+            r#"SELECT 1 FROM "public"."items" WHERE "id" = 1 LIMIT 1"#
+        );
+        let mysql = driver_for(DriverKind::Mysql);
+        assert_eq!(
+            mysql
+                .row_exists_sql("db", "items", &keys(json!({ "id": 1 })))
+                .unwrap(),
+            r#"SELECT 1 FROM `db`.`items` WHERE `id` = 1 LIMIT 1"#
+        );
+        // Values are dialect literals, never pasted raw (quote doubling here).
+        assert_eq!(
+            postgres
+                .row_exists_sql("public", "items", &keys(json!({ "name": "O'Brien" })))
+                .unwrap(),
+            r#"SELECT 1 FROM "public"."items" WHERE "name" = 'O''Brien' LIMIT 1"#
+        );
+        // NULL uses IS NULL; multiple keys are ANDed.
+        let multi = postgres
+            .row_exists_sql(
+                "public",
+                "items",
+                &keys(json!({ "id": 1, "name": null })),
+            )
+            .unwrap();
+        assert!(multi.contains(r#""id" = 1"#), "{multi}");
+        assert!(multi.contains(r#""name" IS NULL"#), "{multi}");
+        assert!(
+            multi.starts_with(r#"SELECT 1 FROM "public"."items" WHERE "#),
+            "{multi}"
+        );
+        // A missing key is rejected instead of producing "WHERE  LIMIT 1".
+        assert!(sqlite
+            .row_exists_sql("main", "items", &keys(json!({})))
+            .is_err());
     }
 }

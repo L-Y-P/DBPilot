@@ -321,6 +321,9 @@ class RelationDesignerState extends State<RelationDesigner> {
   final ScrollController _canvasVertical = ScrollController();
   bool _panningCanvas = false;
 
+  /// 第 63 轮：孤儿警告里选择「改用同名列」成功后，待重新打开弹窗的引用列。
+  String? _pendingCreateRefColumn;
+
   /// 关系列表搜索框：过滤表名 / 列名 / 展示文本。
   final TextEditingController _relationListFilter = TextEditingController();
 
@@ -1199,35 +1202,138 @@ class RelationDesignerState extends State<RelationDesigner> {
       ],
     );
     if (!mounted || accepted != true) return false;
-    final existing = erIndexNamesOf(_schemaRows[refTable.name]?['indexes']);
-    final indexName = uniqueIndexNameFor(refColumn, existing.toSet());
-    try {
-      await _alterTable(
-        refTable.name,
-        <String, dynamic>{
-          'add_indexes': <Map<String, dynamic>>[
-            <String, dynamic>{
-              'name': indexName,
-              'unique': true,
-              'columns': <String>[refColumn],
-            },
-          ],
-        },
-      );
-    } catch (error) {
-      if (!mounted) return false;
+    final created = await _createUniqueIndex(
+      table: refTable.name,
+      column: refColumn,
+      existingNames:
+          erIndexNamesOf(_schemaRows[refTable.name]?['indexes']).toSet(),
+    );
+    if (!created) return false;
+    await _reloadTable(refTable.name);
+    return true;
+  }
+
+  /// 建 UNIQUE 索引；索引名撞名（1826 / Duplicate key name / already exists）
+  /// 时自动换序号名（uk_x_2）重试一次，仍失败弹友好错误（第 63 轮）。
+  Future<bool> _createUniqueIndex({
+    required String table,
+    required String column,
+    required Set<String> existingNames,
+  }) async {
+    final names = <String>{...existingNames};
+    var indexName = uniqueIndexNameFor(column, names);
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        await _alterTable(
+          table,
+          <String, dynamic>{
+            'add_indexes': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'name': indexName,
+                'unique': true,
+                'columns': <String>[column],
+              },
+            ],
+          },
+        );
+        return true;
+      } catch (error) {
+        if (attempt == 0 && _isDuplicateIndexNameError(error)) {
+          // 第 63 轮：并发/缓存导致索引名已存在 → 自动换序号名再试一次。
+          names.add(indexName);
+          indexName = uniqueIndexNameFor(column, names);
+          continue;
+        }
+        if (!mounted) return false;
+        await showForeignKeyBlockedDialog(
+          context,
+          message: fkConstraintFailureMessage(
+            error,
+            refTable: table,
+            refColumn: column,
+          ),
+          onRequestEditFields: widget.onRequestEditFields,
+        );
+        return false;
+      }
+    }
+    return false;
+  }
+
+  bool _isDuplicateIndexNameError(Object? error) {
+    final text = error?.toString().toLowerCase() ?? '';
+    return text.contains('1826') ||
+        text.contains('duplicate key name') ||
+        text.contains('duplicate index') ||
+        text.contains('already exists') ||
+        text.contains('重复');
+  }
+
+  /// 第 63 轮：孤儿警告里「创建唯一索引并改用同名列」。
+  ///
+  /// 返回 true = 同名列现在可被引用（已唯一 / 已成功建 UNIQUE 索引），调用方
+  /// 应关闭当前弹窗并用该列重新打开；false = 查询失败 / 有重复 / 建索引失败，
+  /// 调用方保持弹窗与原警告（不自动建索引）。
+  Future<bool> _fixBySameNameColumn({
+    required String localTable,
+    required String localColumn,
+    required String refTable,
+    required String sameNameColumn,
+  }) async {
+    final uniqueness = await _checkColumnUniqueness(refTable, sameNameColumn);
+    if (!mounted) return false;
+    if (uniqueness == null) {
       await showForeignKeyBlockedDialog(
         context,
-        message: fkConstraintFailureMessage(
-          error,
-          refTable: refTable.name,
-          refColumn: refColumn,
+        message: pickText(
+          '无法读取引用表「$refTable.$sameNameColumn」的唯一性（查询失败）。'
+              '请手动确认该列数据后再试。',
+          'Could not check uniqueness of "$refTable.$sameNameColumn" '
+              '(the query failed). Verify the column data manually and retry.',
         ),
         onRequestEditFields: widget.onRequestEditFields,
       );
       return false;
     }
-    await _reloadTable(refTable.name);
+    if (uniqueness.hasDuplicates) {
+      // 有重复：只说明数量/示例，不做自动 DDL。
+      await showAppModal<void>(
+        context: context,
+        title: pickText('目标列不是唯一键', 'The referenced column is not unique'),
+        builder: (context) => ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 720),
+          child: AlertBox(
+            erRefColumnDuplicateMessage(
+              uniqueness,
+              refTable: refTable,
+              refColumn: sameNameColumn,
+            ),
+            tone: AlertTone.warn,
+          ),
+        ),
+        actions: <Widget>[
+          Builder(
+            builder: (context) => Btn(
+              pickText('关闭', 'Close'),
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+          ),
+        ],
+      );
+      return false;
+    }
+    final known = _uniqueColumns[refTable];
+    if (known != null && known.contains(sameNameColumn)) {
+      // 已有单列唯一索引/主键：不重复建，直接重开弹窗即可。
+      return true;
+    }
+    final created = await _createUniqueIndex(
+      table: refTable,
+      column: sameNameColumn,
+      existingNames: erIndexNamesOf(_schemaRows[refTable]?['indexes']).toSet(),
+    );
+    if (!created) return false;
+    await _reloadTable(refTable);
     return true;
   }
 
@@ -1451,6 +1557,20 @@ class RelationDesignerState extends State<RelationDesigner> {
       ],
     );
     if (created == true && mounted) await widget.onChanged?.call();
+    // 第 63 轮：孤儿警告里选择「建唯一索引并改用同名列」→ 用新引用列重开弹窗。
+    // 只在 _createForeignKey 成功修好同名列后设置；重开后引用列已是同名列，
+    // 不会再进入同一修复分支（防递归）。
+    final retryRefColumn = _pendingCreateRefColumn;
+    if (retryRefColumn == null || !mounted) return;
+    _pendingCreateRefColumn = null;
+    final refreshed = _tableNamed(refTable.name) ?? refTable;
+    if (refreshed.columnNamed(retryRefColumn) == null) return;
+    await _beginCreateForeignKey(
+      localTable: localTable,
+      localColumn: localColumn,
+      refTable: refreshed,
+      refColumn: retryRefColumn,
+    );
   }
 
   /// 某张表的某个字段是否单列唯一（structure 读取失败时用单列主键兜底）。
@@ -1520,19 +1640,46 @@ class RelationDesignerState extends State<RelationDesigner> {
     }
     if (!mounted) return;
     if (report != null && report.hasOrphans) {
-      final sameName = _lookupTable(refTable)?.columnNamed(localColumn)?.name;
+      final sameNameFromSchema =
+          _lookupTable(refTable)?.columnNamed(localColumn)?.name;
+      final sameName = report.sameNameColumn ??
+          (sameNameFromSchema != null && sameNameFromSchema != refColumn
+              ? sameNameFromSchema
+              : null);
+      // 第 63 轮：同名列与本地列基本完全匹配时，提供「建唯一索引并改用它」。
+      final fixable = sameName != null &&
+          sameName != refColumn &&
+          report.sameNameMostlyMatches;
       final warning = fkOrphanWarningMessage(
         report,
         localTable: localTable,
         localColumn: localColumn,
         refTable: refTable,
         refColumn: refColumn,
-        sameNameColumnInRefTable:
-            (sameName != null && sameName != refColumn) ? sameName : null,
+        sameNameColumnInRefTable: sameName,
       );
-      final proceed = await _confirmCreateDespiteOrphans(warning);
+      final choice = await _confirmCreateDespiteOrphans(
+        warning,
+        fixSameNameColumn: fixable ? sameName : null,
+      );
       if (!mounted) return;
-      if (!proceed) {
+      if (choice == _OrphanWarningChoice.fixSameName && fixable) {
+        final fixed = await _fixBySameNameColumn(
+          localTable: localTable,
+          localColumn: localColumn,
+          refTable: refTable,
+          sameNameColumn: sameName,
+        );
+        if (!mounted) return;
+        if (fixed) {
+          // 关闭当前弹窗，由 _beginCreateForeignKey 用同名列重新打开。
+          _pendingCreateRefColumn = sameName;
+          throw FkRetryWithRefColumnException(sameName);
+        }
+        // 查询失败 / 有重复 / 建索引失败：保持弹窗与可读警告。
+        throw FkPrecheckWarningException(warning);
+      }
+      if (choice != _OrphanWarningChoice.proceed) {
         // 不关新建外键弹窗：把可读警告写回弹窗的 _error（不加「失败」前缀）。
         throw FkPrecheckWarningException(warning);
       }
@@ -1654,9 +1801,12 @@ class RelationDesignerState extends State<RelationDesigner> {
     return null;
   }
 
-  /// 预检发现孤儿行时的警告：取消 / 仍然尝试创建。
-  Future<bool> _confirmCreateDespiteOrphans(String warning) async {
-    final result = await showAppModal<bool>(
+  /// 预检发现孤儿行时的警告：取消 / 仍然尝试创建 /（可修复时）改用同名列。
+  Future<_OrphanWarningChoice> _confirmCreateDespiteOrphans(
+    String warning, {
+    String? fixSameNameColumn,
+  }) async {
+    final result = await showAppModal<_OrphanWarningChoice>(
       context: context,
       title: pickText('外键数据不匹配', 'Foreign-key data does not match'),
       builder: (context) => ConstrainedBox(
@@ -1668,13 +1818,23 @@ class RelationDesignerState extends State<RelationDesigner> {
             AlertBox(warning, tone: AlertTone.warn),
             const SizedBox(height: 8),
             Text(
-              pickText(
-                '现在创建外键会被数据库拒绝。可以先修正数据；也可以仍然尝试，'
-                    '确认数据库的最终报错。',
-                'Creating the foreign key now will be rejected by the database. '
-                    'Fix the data first, or try anyway to see the final database '
-                    'error.',
-              ),
+              fixSameNameColumn == null
+                  ? pickText(
+                      '现在创建外键会被数据库拒绝。可以先修正数据；也可以仍然尝试，'
+                          '确认数据库的最终报错。',
+                      'Creating the foreign key now will be rejected by the database. '
+                          'Fix the data first, or try anyway to see the final database '
+                          'error.',
+                    )
+                  : pickText(
+                      '现在创建外键会被数据库拒绝。可以先修正数据、仍然尝试，或按'
+                          '建议改为引用「$fixSameNameColumn」列（该列数据与本地'
+                          '列基本完全匹配，若全唯一会先补 UNIQUE 索引）。',
+                      'Creating the foreign key now will be rejected. Fix the data, '
+                          'try anyway, or reference the "$fixSameNameColumn" column '
+                          'instead (its values almost perfectly match this table; a '
+                          'UNIQUE index is added first if needed).',
+                    ),
               style: kSmallMuted,
             ),
           ],
@@ -1685,7 +1845,7 @@ class RelationDesignerState extends State<RelationDesigner> {
           builder: (context) => Btn(
             pickText('取消', 'Cancel'),
             key: const ValueKey<String>('fk-precheck-cancel'),
-            onPressed: () => Navigator.of(context).pop(false),
+            onPressed: () => Navigator.of(context).pop(_OrphanWarningChoice.cancel),
           ),
         ),
         Builder(
@@ -1693,12 +1853,26 @@ class RelationDesignerState extends State<RelationDesigner> {
             pickText('仍然尝试创建', 'Try creating anyway'),
             key: const ValueKey<String>('fk-precheck-proceed'),
             danger: true,
-            onPressed: () => Navigator.of(context).pop(true),
+            onPressed: () =>
+                Navigator.of(context).pop(_OrphanWarningChoice.proceed),
           ),
         ),
+        if (fixSameNameColumn != null)
+          Builder(
+            builder: (context) => Btn(
+              pickText(
+                '创建唯一索引并改用「$fixSameNameColumn」',
+                'Create a UNIQUE index and use "$fixSameNameColumn"',
+              ),
+              key: const ValueKey<String>('er-orphan-fix-samename'),
+              primary: true,
+              onPressed: () =>
+                  Navigator.of(context).pop(_OrphanWarningChoice.fixSameName),
+            ),
+          ),
       ],
     );
-    return result == true;
+    return result ?? _OrphanWarningChoice.cancel;
   }
 
   /// 测试入口：模拟「当前数据库还没有外键」的自动带入提示（真实环境由
@@ -3418,6 +3592,9 @@ enum _JunctionChoice { junction, direct, cancel }
 enum _JunctionReason { existingRelation, notUnique }
 
 /// 一次建议外键建立操作里单条失败的记录（用于工具栏下方的汇总提示）。
+/// 孤儿预检警告的选择（第 63 轮新增「建唯一索引并改用同名列」）。
+enum _OrphanWarningChoice { cancel, proceed, fixSameName }
+
 class _SuggestionFailure {
   const _SuggestionFailure(this.relation, this.detail);
 
@@ -4108,6 +4285,11 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
       );
       if (!mounted) return;
       Navigator.of(context).pop(true);
+    } on FkRetryWithRefColumnException {
+      // 第 63 轮：同名列已唯一 / 已建好 UNIQUE 索引 → 关闭本弹窗，由
+      // _beginCreateForeignKey 用新的引用列重新打开（不显示错误）。
+      if (!mounted) return;
+      Navigator.of(context).pop(false);
     } catch (error) {
       if (!mounted) return;
       setState(() {

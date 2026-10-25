@@ -265,36 +265,121 @@ Json tableDesignColumnAlterPayload(Json column, List<Json> renameColumns) {
   };
 }
 
-/// 批量保存（applyRowChanges）的结果（第 60 轮）。
+/// 一次批量保存的纯文案（第 63 轮）：中英文成对返回，便于单测同时断言。
+class BatchApplyCopy {
+  const BatchApplyCopy({required this.zh, required this.en});
+
+  final String zh;
+  final String en;
+}
+
+/// 批量保存（applyRowChanges）的结果（第 60 轮，第 63 轮细分原因）。
 ///
-/// [zeroRows] 来自 Rust 新增的 `zero_row_results`：某条 UPDATE 的 keys 没有
-/// 命中任何行（行已被删除或键被改）时，Rust 逐条列在返回里；这里只关心条数，
-/// 用于在「已保存 N 行」后追加一句诊断，其余按已保存处理。
+/// [zeroRows] 来自 Rust 的 `zero_row_results`（UPDATE/DELETE 影响 0 行）；
+/// 第 63 轮起 Rust 还会返回 `zero_row_reasons` 与每条的 `reason`：
+///   * not_found：目标行不存在（DELETE 的 0 行一定是这个）；
+///   * unchanged：行还在、值本来就没变（MySQL 统计真正改变的行时才会出现）；
+///   * unknown：存在性检查失败（权限/并发等），不臆测原因。
+/// 老后端只有条数，[notFound]/[unchanged]/[unknown] 全为 0，提示退回旧文案。
 class BatchApplyOutcome {
   const BatchApplyOutcome({
     required this.rowsAffected,
     required this.zeroRows,
+    this.notFound = 0,
+    this.unchanged = 0,
+    this.unknown = 0,
   });
 
   final int rowsAffected;
   final int zeroRows;
+  final int notFound;
+  final int unchanged;
+  final int unknown;
 
   bool get hasZeroRows => zeroRows > 0;
 
-  /// 保存成功后的用户提示（零行命中时追加诊断）。
-  String get message {
-    if (zeroRows == 0) {
-      return pickText(
-        '已保存 $rowsAffected 行',
-        'Saved $rowsAffected row(s)',
+  BatchApplyCopy get copy => batchApplyCopy(
+        rowsAffected: rowsAffected,
+        zeroRows: zeroRows,
+        notFound: notFound,
+        unchanged: unchanged,
+        unknown: unknown,
       );
-    }
-    return pickText(
-      '已保存 $rowsAffected 行；$zeroRows 条改动未命中任何行（可能已被删除或键被修改）',
-      'Saved $rowsAffected row(s); $zeroRows edit(s) matched no row (the row may '
-          'have been deleted or its key changed)',
+
+  /// 保存成功后的用户提示（零行命中时追加按原因细分的诊断）。
+  String get message => pickText(copy.zh, copy.en);
+
+  /// 自定义提示（如「保存到原表」）复用的零行诊断后缀（含前导分隔符）。
+  String get zeroRowSuffix {
+    final zero = batchZeroRowCopy(
+      zeroRows: zeroRows,
+      notFound: notFound,
+      unchanged: unchanged,
+      unknown: unknown,
     );
+    if (zero == null) return '';
+    return pickText('；${zero.zh}', '; ${zero.en}');
   }
+}
+
+/// 零行诊断（不含「已保存 N 行」前缀）；没有零行改动时返回 null。
+///
+/// 未知条数按「总数 - 已解释条数」推断，这样老后端（只有 zeroRows）与新后端
+/// 漏传某个计数时都不会丢提示；unknown 单独计数时也走旧的「可能已被删除或键
+/// 被修改」措辞，绝不臆测成 not_found/unchanged。
+BatchApplyCopy? batchZeroRowCopy({
+  required int zeroRows,
+  int notFound = 0,
+  int unchanged = 0,
+  int unknown = 0,
+}) {
+  if (zeroRows <= 0 && notFound <= 0 && unchanged <= 0 && unknown <= 0) {
+    return null;
+  }
+  final rest = zeroRows - notFound - unchanged;
+  final derivedUnknown = rest < 0 ? 0 : rest;
+  final unknownCount = unknown > derivedUnknown ? unknown : derivedUnknown;
+  final zhParts = <String>[
+    if (notFound > 0) '$notFound 条未命中（目标行不存在）',
+    if (unchanged > 0) '$unchanged 条值未变化（未写入）',
+    if (unknownCount > 0)
+      '$unknownCount 条改动未命中任何行（可能已被删除或键被修改）',
+  ];
+  final enParts = <String>[
+    if (notFound > 0)
+      '$notFound edit(s) matched no row (the target row no longer exists)',
+    if (unchanged > 0)
+      '$unchanged edit(s) had unchanged values (nothing was written)',
+    if (unknownCount > 0)
+      '$unknownCount edit(s) matched no row (the row may have been deleted or '
+          'its key changed)',
+  ];
+  return BatchApplyCopy(zh: zhParts.join('；'), en: enParts.join('; '));
+}
+
+/// 批量保存成功提示的纯函数版本（便于单测中英双语；UI 用 BatchApplyOutcome.message）。
+BatchApplyCopy batchApplyCopy({
+  required int rowsAffected,
+  int zeroRows = 0,
+  int notFound = 0,
+  int unchanged = 0,
+  int unknown = 0,
+}) {
+  final saved = BatchApplyCopy(
+    zh: '已保存 $rowsAffected 行',
+    en: 'Saved $rowsAffected row(s)',
+  );
+  final zero = batchZeroRowCopy(
+    zeroRows: zeroRows,
+    notFound: notFound,
+    unchanged: unchanged,
+    unknown: unknown,
+  );
+  if (zero == null) return saved;
+  return BatchApplyCopy(
+    zh: '${saved.zh}；${zero.zh}',
+    en: '${saved.en}; ${zero.en}',
+  );
 }
 
 /// Single-table workbench with tabs: Browse, Structure, Design, DDL, Insert,
@@ -566,10 +651,9 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       if (outcome != null) {
         widget.notice.show(
           pickText(
-            '已保存 ${outcome.rowsAffected} 行到原表 $oldTable'
-            '${outcome.hasZeroRows ? '；${outcome.zeroRows} 条改动未命中任何行（可能已被删除或键被修改）' : ''}',
-            'Saved ${outcome.rowsAffected} row(s) to the previous table $oldTable'
-            '${outcome.hasZeroRows ? '; ${outcome.zeroRows} edit(s) matched no row' : ''}',
+            '已保存 ${outcome.rowsAffected} 行到原表 $oldTable${outcome.zeroRowSuffix}',
+            'Saved ${outcome.rowsAffected} row(s) to the previous table '
+                '$oldTable${outcome.zeroRowSuffix}',
           ),
         );
       } else {
@@ -1420,10 +1504,39 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     );
     try {
       final result = await Api.instance.applyRowChanges(db, table, changes);
-      final zeroRows = result['zero_row_results'];
+      // 第 63 轮：优先读汇总 zero_row_reasons；没有时退回逐条 reason；再没有
+      // （旧后端）就只按条数，提示沿用旧文案。
+      final zeroItems = result['zero_row_results'];
+      final reasons = result['zero_row_reasons'];
+      var notFound = 0;
+      var unchanged = 0;
+      var unknown = 0;
+      if (reasons is Map) {
+        notFound = (reasons['not_found'] as num?)?.toInt() ?? 0;
+        unchanged = (reasons['unchanged'] as num?)?.toInt() ?? 0;
+        unknown = (reasons['unknown'] as num?)?.toInt() ?? 0;
+      } else if (zeroItems is List) {
+        for (final item in zeroItems) {
+          final reason = item is Map ? item['reason']?.toString() : null;
+          switch (reason) {
+            case 'not_found':
+              notFound++;
+            case 'unchanged':
+              unchanged++;
+            default:
+              unknown++;
+          }
+        }
+      }
+      final zeroRows = reasons is Map
+          ? notFound + unchanged + unknown
+          : (zeroItems is List ? zeroItems.length : 0);
       return BatchApplyOutcome(
         rowsAffected: (result['rows_affected'] as num?)?.toInt() ?? 0,
-        zeroRows: zeroRows is List ? zeroRows.length : 0,
+        zeroRows: zeroRows,
+        notFound: notFound,
+        unchanged: unchanged,
+        unknown: unknown,
       );
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());

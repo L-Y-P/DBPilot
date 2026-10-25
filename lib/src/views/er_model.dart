@@ -2711,6 +2711,17 @@ class FkCreationFailureException implements Exception {
   String toString() => message;
 }
 
+/// 孤儿警告里点「创建唯一索引并改用同名列」成功后的控制信号：关闭当前新建
+/// 外键弹窗，并用 [refColumn] 作为引用列重新打开（第 63 轮）。
+class FkRetryWithRefColumnException implements Exception {
+  const FkRetryWithRefColumnException(this.refColumn);
+
+  final String refColumn;
+
+  @override
+  String toString() => 'retry foreign key with referenced column: §refColumn';
+}
+
 // ------------------------------------------- 引用列唯一性 / 一键建唯一索引
 // 第 62 轮：MySQL 8.4 要求被引用列必须有 UNIQUE 键（Missing unique key 6125），
 // MariaDB/旧版只要求普通索引。用户真实场景：学生名单.学号 30 个值全唯一但没有

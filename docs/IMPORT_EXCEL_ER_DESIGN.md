@@ -378,3 +378,37 @@ Future<void> showRelationDesigner(
 - **Rust 端到端**（importer.rs cfg(test)）：5 个走公开 `import_inspect` 的用例——PermissionDenied 中文错误（chmod 000 + guard 恢复，root 环境显式跳过）、ODS / SpreadsheetML 隐藏表端到端 warning 与选表、HTML 伪装 .xls、加密 CFB 的 inspect 中文错误。
 - **E-R 标签几何**：补充标签矩形与连线的关系断言。注意 axis-aligned 210×18 文本盒在垂直/斜线场景必然与连线横向相交（第 53 轮 18px 法线偏移只保证水平连线不被盖住）；测试对水平场景验证矩形与线段不相交/9px 净空，对垂直/斜线验证锚点在中点法线上且净空 18>半高 9。若要求垂直/斜线也完全不遮挡，需要改标签尺寸/旋转/布局策略（UX 决策，未做）。
 
+
+## 11. 第 55 轮修订（标签自适应避让 / 关系列表打磨 / 表设计器撤销 / 稀疏文件测试）
+
+### 11.1 多对多标签自适应避让
+
+- 第 54 轮遗留：轴对齐 210×18 文本盒在垂直/斜线时仍会压住连线横向长边。第 55 轮改为按标签尺寸与连线方向计算净空：
+  `m2mLabelClearance` 取单位法线分量，净空 = |nx|·halfW + |ny|·halfH + padding，再与 minOffset(18) 取大。
+  水平 = 18px（不回归）、垂直 ≈ 111px、斜线 ≈ 86.6px。`m2mLabelAnchorFor` 使用该净空（offset 参数保留为下限）。
+- relation_designer 的画布适配：优先偏上法线 → 越界换另一侧（垂直即左右换边）→ 两侧都越界时沿**连线方向**平移
+  （净空不变、不会重新压线）→ 极端窄画布才 clamp 兜底（注释说明）。标签盒按 210×18 + 4px 边距判定。
+- 几何回归：水平/垂直/斜线三种方向用投影距离 + Liang–Barsky 断言 210×18 轴对齐标签矩形与卡片中心连线**不相交**
+  （水平净空 9px、垂直/斜线 6px），水平锚点距离仍为 18。
+
+### 11.2 关系列表打磨
+
+- filter 增加外键约束名匹配（ErRelationListItem.constraintName 进入 searchKey，大小写不敏感）。
+- 每行加 Tooltip：完整 displayLabel + 约束名，解决 260/220px 面板里长关系名省略后看不到全名。
+- 抽取 `relationListCanDelete({driver, constraintName})`：SQLite 或空约束名不可删；侧栏删除图标与删除动作统一用它。
+- 补 widget 测试：点击「建议关系」行会弹出 SQLite ALTER 说明（与画布虚线同一路径）。
+
+### 11.3 表设计器「撤销未应用的修改」
+
+- 顶层纯函数 `tableDesignBodyEmpty` / `tableDesignHasPendingChanges` / `currentTableComment`（与 Rust AlterTableSpec::is_empty 对齐）；
+  预览/应用也改用同一判断。
+- 设计 tab「表选项」卡片右上新增按钮（key table-design-reset）：有未应用改动时可用，点击确认后从当前 structure 重建字段、
+  清空新增/删除的索引与外键、重命名/注释、SQL 预览/结果/错误；只丢待应用改动，不触碰数据库。
+- 基线修正：表注释只在和当前 TABLE_COMMENT 不同时才写入 ALTER 载荷（避免一打开设计器就 dirty / 重复 SET COMMENT）。
+
+### 11.4 5 GiB 护栏稀疏文件端到端测试
+
+- 用稀疏文件（File::create + set_len，物理 0 字节）构造 >5 GiB 与恰好 5 GiB 的 CSV，走公开 import_inspect：
+  >5 GiB 断言 GiB 口径 warning 且耗时 < 10s（抓「整文件读取」跑偏，实测 0.00s）；恰好 5 GiB 不提示；Drop guard 清理临时文件。
+  平台不支持稀疏文件时显式跳过（unix 校验物理占用）。
+

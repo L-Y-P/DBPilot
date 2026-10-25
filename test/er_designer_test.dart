@@ -487,6 +487,19 @@ void main() {
       ),
       findsOneWidget,
     );
+    // 第 55 轮：260px 面板里长关系名会被省略号截断，行 tooltip 必须给全名。
+    final rowTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .ancestor(
+            of: find.descendant(
+              of: panel,
+              matching: find.text('books.author_id → authors.id'),
+            ),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(rowTooltip.message, contains('books.author_id → authors.id'));
 
     // 搜索大小写不敏感：AUTHORS 只命中「books.author_id → authors.id」。
     await tester.enterText(
@@ -550,6 +563,39 @@ void main() {
     await settle(tester);
     expect(find.byKey(const ValueKey('er-relation-list-panel')), findsNothing);
     expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('关系列表：点击建议行弹出 SQLite ALTER 说明（第 55 轮）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['members', 'shops'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final panel = find.byKey(const ValueKey('er-relation-list-panel'));
+    expect(panel, findsOneWidget);
+    expect(find.text('关系列表（1 条）'), findsOneWidget);
+    // 侧栏里的建议行与画布虚线共用「点击即建立」路径。
+    expect(find.descendant(of: panel, matching: find.text('建议')), findsOneWidget);
+    await tester.tap(
+      find.descendant(
+        of: panel,
+        matching: find.text('members.shop_id → shops.id'),
+      ),
+    );
+    await settle(tester, rounds: 6);
+    // SQLite 不能 ALTER 加外键：必须弹明确说明，而不是无反应。
+    expect(find.text('SQLite 不支持用 ALTER 新增外键'), findsWidgets);
+    await tester.tap(find.byKey(const ValueKey('dialog-close')));
+    await settle(tester, rounds: 4);
     expect(tester.takeException(), isNull);
   });
 
@@ -1367,6 +1413,34 @@ void main() {
     expect(find.text('Suggested'), findsOneWidget);
     expect(find.text('Create suggested FKs (1)'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
+
+    // 第 55 轮：侧栏建议行的徽标与行 tooltip 也必须是英文。
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final suggestionPanel = find.byKey(
+      const ValueKey('er-relation-list-panel'),
+    );
+    expect(
+      find.descendant(of: suggestionPanel, matching: find.text('Suggested')),
+      findsOneWidget,
+    );
+    final suggestionRowTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .ancestor(
+            of: find.descendant(
+              of: suggestionPanel,
+              matching: find.text('members.shop_id → shops.id'),
+            ),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(
+      suggestionRowTooltip.message,
+      contains('members.shop_id → shops.id'),
+    );
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-close')));
+    await settle(tester);
     expect(tester.takeException(), isNull);
   });
 

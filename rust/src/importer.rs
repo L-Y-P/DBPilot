@@ -6574,4 +6574,117 @@ mod excel_tests {
         assert!(error.contains("密码"), "{error}");
         assert!(error.contains("另存为未加密的 .xlsx/.xlsb"), "{error}");
     }
+
+    // ------------------------------ 第 55 轮：5 GiB 护栏稀疏文件端到端
+
+    /// 稀疏大文件目录：Drop 时删除文件与目录。
+    ///
+    /// 断言失败 / panic / 提前 return 都不会留下 5 GiB 逻辑大小的临时文件
+    /// （APFS、ext4、xfs 上它是 0 物理占用，删除也是瞬间的）。
+    struct SparseCsvGuard {
+        path: std::path::PathBuf,
+        dir: std::path::PathBuf,
+    }
+
+    impl SparseCsvGuard {
+        /// 创建「逻辑大小 = bytes、几乎不占物理磁盘」的稀疏 CSV。
+        ///
+        /// 返回 None 表示当前平台/文件系统不支持稀疏文件（或物理占用与逻辑大小
+        /// 相当，继续跑会真的写满磁盘）：调用方打印说明后跳过，绝不硬写 5 GiB。
+        fn create(bytes: u64) -> Option<(Self, String)> {
+            let dir = std::env::temp_dir().join(format!("rma-sparse-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).ok()?;
+            let path = dir.join("big.csv");
+            let guard = SparseCsvGuard {
+                path: path.clone(),
+                dir,
+            };
+            let file = std::fs::File::create(&path).ok()?;
+            file.set_len(bytes).ok()?;
+            drop(file);
+            let meta = std::fs::metadata(&path).ok()?;
+            if meta.len() != bytes {
+                return None;
+            }
+            // 物理占用必须远小于逻辑大小，否则说明文件系统真的分配了 5 GiB。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let allocated = meta.blocks().saturating_mul(512);
+                if allocated.saturating_mul(2) > bytes {
+                    return None;
+                }
+            }
+            let shown = path.to_string_lossy().to_string();
+            Some((guard, shown))
+        }
+    }
+
+    impl Drop for SparseCsvGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_csv_over_five_gib_warns_without_reading_the_whole_file() {
+        let Some((_guard, path)) = SparseCsvGuard::create(MAX_NON_STREAMING_BYTES + 1) else {
+            eprintln!(
+                "跳过 5 GiB 稀疏文件用例：当前平台/文件系统不支持 set_len 稀疏文件（本机 APFS 支持）"
+            );
+            return;
+        };
+
+        let started = std::time::Instant::now();
+        let info = inspect_via_api(&path)
+            .await
+            .expect("超过 5 GiB 的 CSV 是流式格式：护栏必须放行，且不得为了判定而预解析");
+        let elapsed = started.elapsed();
+
+        assert_eq!(info["format"], json!("delimited"), "{info}");
+        assert_eq!(info["size"], json!(MAX_NON_STREAMING_BYTES + 1), "{info}");
+
+        let warnings = info["warnings"].to_string();
+        assert!(warnings.contains("超过 5 GiB"), "{warnings}");
+        assert!(warnings.contains("5.0 GiB"), "{warnings}");
+        assert!(warnings.contains("GiB"), "护栏文案要统一 GiB 口径: {warnings}");
+        // 旧文案的自相矛盾说法不能回来。
+        assert!(!warnings.contains("5.0 GB（超过 5 GB）"), "{warnings}");
+
+        // 稀疏文件只读 16 KiB 头 + 8 KiB 尾就瞬间 EOF；若护栏（或 inspect）去预解析/
+        // 整表读取，5 GiB 至少是秒级甚至几十秒。10 秒是宽松上界，专门抓「把整个文件
+        // 读一遍」这种跑偏，不是性能基准。
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "inspect 用了 {elapsed:?}，说明护栏可能在读取整个文件"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_csv_at_exactly_five_gib_has_no_large_file_warning() {
+        let Some((_guard, path)) = SparseCsvGuard::create(MAX_NON_STREAMING_BYTES) else {
+            eprintln!(
+                "跳过 5 GiB 稀疏文件用例：当前平台/文件系统不支持 set_len 稀疏文件（本机 APFS 支持）"
+            );
+            return;
+        };
+
+        let info = inspect_via_api(&path)
+            .await
+            .expect("恰好 5 GiB 的 CSV 必须正常 Ok");
+        assert_eq!(info["format"], json!("delimited"), "{info}");
+        assert_eq!(info["size"], json!(MAX_NON_STREAMING_BYTES), "{info}");
+
+        // 阈值是「超过」5 GiB（MAX_NON_STREAMING_BYTES 本身不提示）。
+        let warnings = info["warnings"].to_string();
+        assert!(
+            !warnings.contains("超过 5 GiB"),
+            "恰好 5 GiB 不该有大文件 warning: {warnings}"
+        );
+        assert!(
+            !warnings.contains("GiB"),
+            "恰好 5 GiB 不该出现 GiB 口径的大文件 warning: {warnings}"
+        );
+    }
 }

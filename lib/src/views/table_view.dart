@@ -19,6 +19,80 @@ import 'data_import_wizard.dart';
 import '../widgets.dart';
 import 'result_table.dart';
 
+/// ALTER 载荷里「非空列表才代表修改」的字段（与 Rust AlterTableSpec 的
+/// `is_empty` 对齐）。
+const List<String> _tableDesignListKeys = <String>[
+  'add_columns',
+  'modify_columns',
+  'drop_columns',
+  'rename_columns',
+  'add_indexes',
+  'drop_indexes',
+  'add_foreign_keys',
+  'drop_foreign_keys',
+];
+
+/// ALTER 载荷里「空串 = 没改」的字符串选项。
+const List<String> _tableDesignStringKeys = <String>[
+  'rename_to',
+  'engine',
+  'row_format',
+  'charset',
+  'collation',
+  'tablespace',
+];
+
+/// ALTER 载荷里「null = 没改」的 Option 字段。
+///
+/// `comment` 用的是 Rust 的 `Option<String>`：null 表示不改，**空串表示清空
+/// 注释**（是一种真实修改）；`set_primary_key` 同理（Some([]) 也算修改）。
+const List<String> _tableDesignOptionKeys = <String>[
+  'comment',
+  'auto_increment',
+  'set_primary_key',
+  'unlogged',
+  'without_rowid',
+  'strict',
+];
+
+/// 设计 tab 的 ALTER 载荷是否为空（= 没有任何未应用的修改）。
+///
+/// 纯函数，便于单测：判断规则与 Rust 的 `AlterTableSpec::is_empty` 保持一致，
+/// 覆盖字段（add/modify/drop/rename）、索引、外键、表名/注释以及
+/// engine/row_format/auto_increment/charset/collation 等表选项。
+///
+/// 注意：未知字段（例如预览时附加的 `dry_run`）不参与判断，避免把内部参数
+/// 误当成用户修改。
+bool tableDesignBodyEmpty(Json body) {
+  for (final key in _tableDesignListKeys) {
+    final value = body[key];
+    if (value == null) continue;
+    if (value is! List) return false;
+    if (value.isNotEmpty) return false;
+  }
+  for (final key in _tableDesignStringKeys) {
+    final value = body[key];
+    if (value != null && value.toString().trim().isNotEmpty) return false;
+  }
+  for (final key in _tableDesignOptionKeys) {
+    if (body[key] != null) return false;
+  }
+  return true;
+}
+
+/// 设计器里是否存在需要「应用」或「撤销」的修改。
+bool tableDesignHasPendingChanges(Json body) => !tableDesignBodyEmpty(body);
+
+/// 从 structure 结果里取当前表注释（没有 info / 没有注释时为空串）。
+///
+/// 设计器的「表注释」只有在和这个基线值不同时才算未应用的修改，否则表本来
+/// 就带注释时打开设计 tab 会一直显示 dirty。
+String currentTableComment(Json structure) {
+  final info = structure['info'];
+  if (info is! Map) return '';
+  return (info['TABLE_COMMENT'] ?? '').toString().trim();
+}
+
 /// Single-table workbench with tabs: Browse, Structure, Design, DDL, Insert,
 /// SQL, Export, Import and Operations.
 ///
@@ -139,6 +213,12 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   final _renameTo = TextEditingController();
   final _tableComment = TextEditingController();
 
+  /// 设计器的文本输入（重命名/注释/字段名…）不会重建整页（TextField 自己维护
+  /// 光标），所以「撤销未应用的修改」按钮额外监听这个 notifier：用户第一次
+  /// 输入时置 true，让按钮的可用态刷新一次。真正是否可撤销仍由
+  /// [tableDesignBodyEmpty] 对 ALTER 载荷的判断决定。
+  final ValueNotifier<bool> _designEdited = ValueNotifier<bool>(false);
+
   @override
   void initState() {
     super.initState();
@@ -159,6 +239,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       controller.dispose();
     }
     _tableComment.dispose();
+    _designEdited.dispose();
     super.dispose();
   }
 
@@ -377,10 +458,16 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
         'original': (column['name'] ?? '').toString(),
       });
     }
+    // 重新播种 = 回到数据库里的基线：清掉「用户动过设计器」的标记。
+    _designEdited.value = false;
     final info = _structure['info'];
     if (info is Map) {
       _renameTo.clear();
       _tableComment.text = (info['TABLE_COMMENT'] ?? '').toString();
+    } else {
+      // 驱动没有 info（或结构尚未加载）时也要清空，避免上一张表的输入残留。
+      _renameTo.clear();
+      _tableComment.clear();
     }
   }
 
@@ -1103,17 +1190,38 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       children: [
         CardBox(
           title: (I18n.current == AppLang.en ? 'Table options' : '表选项'),
+          actions: [
+            // 第 55 轮（ROUND51 P3-7）：设计器没有撤销时的兜底出口。只有真的
+            // 有未应用的修改才可点；文本输入类改动通过 _designEdited 通知刷新。
+            ValueListenableBuilder<bool>(
+              valueListenable: _designEdited,
+              builder: (context, edited, _) {
+                // 结构/数据加载中不要点亮：此时 _designColumns 可能还是空的，
+                // 算出来的 drop_columns 会是整张表，用户误点会重置成旧快照。
+                final dirty = !_loading &&
+                    (edited || !tableDesignBodyEmpty(_buildAlter()));
+                return Btn(
+                  pickText('撤销未应用的修改', 'Discard pending changes'),
+                  key: const ValueKey<String>('table-design-reset'),
+                  small: true,
+                  onPressed: dirty ? _resetDesign : null,
+                );
+              },
+            ),
+          ],
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               FormRow(
                 label: (I18n.current == AppLang.en ? 'Rename to' : '重命名为'),
                 child: Field(label: '', controller: _renameTo,
-                  hint: I18n.current == AppLang.en ? 'New table name (leave blank to keep)' : '新表名（留空不改）'),
+                  hint: I18n.current == AppLang.en ? 'New table name (leave blank to keep)' : '新表名（留空不改）',
+                  onChanged: (_) => _designEdited.value = true),
               ),
               FormRow(
                 label: t('table_comment'),
-                child: Field(label: '', controller: _tableComment),
+                child: Field(label: '', controller: _tableComment,
+                  onChanged: (_) => _designEdited.value = true),
               ),
             ],
           ),
@@ -1342,7 +1450,12 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
         child: TextField(
           controller: controller,
           style: mono ? monoStyle(size: 12) : const TextStyle(fontSize: 12),
-          onChanged: onChanged,
+          onChanged: (value) {
+            onChanged(value);
+            // 文本编辑不触发整页重建（TextField 自己维护光标）：这里通知
+            // 「撤销未应用的修改」按钮重新计算可用态。
+            _designEdited.value = true;
+          },
           decoration: const InputDecoration(
             isDense: true,
             border: OutlineInputBorder(),
@@ -1662,30 +1775,57 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     if (renameTo.isNotEmpty && renameTo != widget.table) {
       body['rename_to'] = renameTo;
     }
+    // 注释只有和数据库里的当前值不同才算修改：否则表本来就有注释时设计器
+    // 一打开就 dirty（撤销按钮常亮），应用时也会重复 SET COMMENT。
     final comment = _tableComment.text.trim();
-    if (comment.isNotEmpty) body['comment'] = comment;
+    if (comment != currentTableComment(_structure)) body['comment'] = comment;
     return body;
   }
 
-  bool _designEmpty(Map<String, dynamic> body) {
-    for (final key in [
-      'add_columns',
-      'modify_columns',
-      'drop_columns',
-      'add_indexes',
-      'drop_indexes',
-      'add_foreign_keys',
-      'drop_foreign_keys',
-    ]) {
-      final value = body[key];
-      if (value is List && value.isNotEmpty) return false;
-    }
-    return body['rename_to'] == null && body['comment'] == null;
+  /// 放弃所有尚未应用的修改（第 55 轮：ROUND51 P3-7 的「撤销」）。
+  ///
+  /// 只把设计器重置回当前 _structure 的基线：重新播种 _designColumns、清空
+  /// 新增/删除的索引与外键、重命名/注释、SQL 预览与结果/错误。**不调用数据库、
+  /// 不删除已应用的修改**；因此必须是带确认的显式动作（数据本身不会丢）。
+  Future<void> _resetDesign() async {
+    final ok = await confirmDialog(
+      context,
+      message: pickText(
+        '放弃所有尚未应用的修改吗？',
+        'Discard all pending changes?',
+      ),
+      detail: pickText(
+        '只重置设计器里还没应用的改动（新增/修改/删除的字段、索引、外键、表名与'
+            '注释、SQL 预览与结果），不会修改数据库；已经应用的修改保持不变。',
+        'This only resets changes that have not been applied yet (added, modified '
+            'or dropped columns, indexes, foreign keys, table name/comment, SQL '
+            'preview and results). The database is not touched, and changes that '
+            'were already applied are kept.',
+      ),
+      confirmLabel: pickText('放弃修改', 'Discard'),
+      danger: true,
+    );
+    if (!ok || !mounted) return;
+    setState(() {
+      // 从当前结构重新生成字段快照，并复位重命名/注释输入。
+      _seedDesigner();
+      _designNewIndexes.clear();
+      _designNewFks.clear();
+      _designDropIndexes.clear();
+      _designDropFks.clear();
+      _designSql = null;
+      _designResults = <Json>[];
+      _designError = null;
+      _designEdited.value = false;
+    });
+    widget.notice.show(
+      pickText('已撤销未应用的修改', 'Pending changes discarded'),
+    );
   }
 
   Future<void> _previewDesign() async {
     final body = _buildAlter();
-    if (_designEmpty(body)) {
+    if (tableDesignBodyEmpty(body)) {
       setState(() => _designError = '没有需要应用的修改');
       return;
     }
@@ -1709,7 +1849,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
 
   Future<void> _applyDesign() async {
     final body = _buildAlter();
-    if (_designEmpty(body)) {
+    if (tableDesignBodyEmpty(body)) {
       setState(() => _designError = '没有需要应用的修改');
       return;
     }

@@ -3,6 +3,7 @@
 // 这里不需要 dylib，也不需要数据库：er_model.dart 不 import Flutter widget 层，
 // 只依赖 dart:ui 的几何类型。
 
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -814,30 +815,53 @@ void main() {
       );
     });
 
-    test('垂直连线：向上没有意义时横向偏移，y 不变', () {
+    test('垂直连线：按标签宽度自适应净空（105 + padding），y 不变', () {
       const a = Offset(300, 100);
       const b = Offset(300, 500);
       final midpoint = midpointOf(a, b);
       final anchor = m2mLabelAnchorFor(start: a, end: b);
       expect(anchor.dy, closeTo(midpoint.dy, 0.0001));
       expect(anchor.dx, lessThan(midpoint.dx));
-      expect((anchor - midpoint).distance, closeTo(18, 0.0001));
+      // 第 55 轮：法线是水平的，必须让开半个标签宽度（105）+ padding（6）。
+      expect((anchor - midpoint).distance, closeTo(111, 0.0001));
+      expect(m2mLabelClearance(start: a, end: b), closeTo(111, 0.0001));
     });
 
-    test('斜线：法线偏移并优先选 y 更小的一侧；offset 可调', () {
+    test('斜线：净空介于水平与垂直之间；offset 只是下限', () {
       const a = Offset(0, 0);
       const b = Offset(400, 400);
       final midpoint = midpointOf(a, b);
       final anchor = m2mLabelAnchorFor(start: a, end: b);
       expect(anchor.dy, lessThan(midpoint.dy), reason: '优先偏向上方空白侧');
-      expect((anchor - midpoint).distance, closeTo(18, 0.0001));
-      final far = m2mLabelAnchorFor(start: a, end: b, offset: 36);
-      expect((far - midpoint).distance, closeTo(36, 0.0001));
-      final delta = far - midpoint;
+      final clearance = m2mLabelClearance(start: a, end: b);
+      expect(clearance, greaterThan(18));
+      expect(clearance, lessThan(111));
+      expect((anchor - midpoint).distance, closeTo(clearance, 0.0001));
+      final delta = anchor - midpoint;
       final direction = b - a;
       expect(
         delta.dx * direction.dx + delta.dy * direction.dy,
         closeTo(0, 0.0001),
+      );
+      // offset 比自适应净空小 → 不起作用；比它大 → 抬升到 offset。
+      expect(
+        (m2mLabelAnchorFor(start: a, end: b, offset: 36) - midpoint).distance,
+        closeTo(clearance, 0.0001),
+      );
+      expect(
+        (m2mLabelAnchorFor(start: a, end: b, offset: 400) - midpoint).distance,
+        closeTo(400, 0.0001),
+      );
+      // 水平连线时 offset 仍然生效（兼容旧行为）。
+      expect(
+        (m2mLabelAnchorFor(
+                  start: const Offset(0, 0),
+                  end: const Offset(400, 0),
+                  offset: 36,
+                ) -
+                const Offset(200, 0))
+            .distance,
+        closeTo(36, 0.0001),
       );
     });
 
@@ -888,6 +912,78 @@ void main() {
       // 两卡片同高时，连线中点 y 与卡片中心一致；标签上移 18px 后离开连线。
       expect(anchor.dy, closeTo(a.dy - 18, 0.0001));
       expect(anchor.dx, closeTo((a.dx + b.dx) / 2, 0.0001));
+    });
+  });
+
+  group('多对多标签自适应净空（第 55 轮）', () {
+    test('水平 18 / 垂直 111 / 斜线 86.6，方向决定净空', () {
+      expect(
+        m2mLabelClearance(
+          start: const Offset(0, 0),
+          end: const Offset(100, 0),
+        ),
+        closeTo(18, 0.0001),
+      );
+      expect(
+        m2mLabelClearance(
+          start: const Offset(0, 0),
+          end: const Offset(0, 100),
+        ),
+        closeTo(111, 0.0001),
+      );
+      final diagonal = m2mLabelClearance(
+        start: const Offset(0, 0),
+        end: const Offset(100, 100),
+      );
+      expect(diagonal, greaterThan(18));
+      expect(diagonal, lessThan(111));
+      // |nx| = |ny| = 1/sqrt(2)：0.7071 * (105 + 9) + 6 ≈ 86.61
+      expect(diagonal, closeTo(math.sqrt(0.5) * 114 + 6, 0.001));
+    });
+
+    test('padding / minOffset / labelSize 可调', () {
+      // 水平：15（半高 9 + padding 6）低于 minOffset → 由 18 兜底。
+      expect(
+        m2mLabelClearance(
+          start: const Offset(0, 0),
+          end: const Offset(100, 0),
+          padding: 0,
+        ),
+        closeTo(18, 0.0001),
+      );
+      // 标签变窄：垂直净空 = 半宽 30 + padding 6。
+      expect(
+        m2mLabelClearance(
+          start: const Offset(0, 0),
+          end: const Offset(0, 100),
+          labelSize: const Size(60, 18),
+        ),
+        closeTo(36, 0.0001),
+      );
+      // 显式抬高下限。
+      expect(
+        m2mLabelClearance(
+          start: const Offset(0, 0),
+          end: const Offset(0, 100),
+          minOffset: 200,
+        ),
+        closeTo(200, 0.0001),
+      );
+    });
+
+    test('两点重合返回 minOffset', () {
+      expect(
+        m2mLabelClearance(start: const Offset(5, 5), end: const Offset(5, 5)),
+        18,
+      );
+      expect(
+        m2mLabelClearance(
+          start: const Offset(5, 5),
+          end: const Offset(5, 5),
+          minOffset: 40,
+        ),
+        40,
+      );
     });
   });
 
@@ -972,6 +1068,82 @@ void main() {
       expect(query('nope'), isEmpty);
     });
 
+    test('filter 也匹配外键约束名；显示仍以 a.b → c.d 为主', () {
+      final items = query('');
+      expect(items[0].constraintName, 'fk_books_author');
+      // 展示文本保持「表.列 → 表.列」，不把约束名塞进 displayLabel。
+      expect(items[0].displayLabel, 'books.author_id → authors.id');
+      expect(items[0].searchKey, contains('fk_books_author'));
+      expect(query('FK_BOOKS_AUTHOR').single.constraintName, 'fk_books_author');
+      expect(query('fk_books_author').single.localTable, 'books');
+      // SQLite 风格的无名外键：constraintName 为空串，不影响展示 / 搜索。
+      expect(items[1].constraintName, '');
+      expect(query('reviews').single.constraintName, '');
+    });
+
+    test('行 tooltip：完整展示文本 +（有约束名时）约束名，英文同步', () {
+      final items = query('');
+      final fkItem = items[0];
+      final withName = relationListItemTooltip(fkItem);
+      expect(withName, contains('books.author_id → authors.id'));
+      expect(withName, contains('约束名：fk_books_author'));
+      // 无名约束（SQLite）只显示关系本身。
+      expect(relationListItemTooltip(items[1]), 'reviews.book_id → books.id');
+      expect(relationListItemTooltip(items[3]), '多对多 · order_items');
+
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final english = relationListItemTooltip(fkItem);
+      expect(english, contains('books.author_id → authors.id'));
+      expect(english, contains('Constraint: fk_books_author'));
+      expect(RegExp(r'[\u4e00-\u9fff]').hasMatch(english), isFalse);
+    });
+
+    test('可删判定：SQLite / 无名约束不可删，MySQL/PG 有名约束可删', () {
+      expect(
+        relationListCanDelete(
+          driver: 'sqlite',
+          constraintName: 'fk_books_author',
+        ),
+        isFalse,
+      );
+      expect(
+        relationListCanDelete(
+          driver: 'SQLite',
+          constraintName: 'fk_books_author',
+        ),
+        isFalse,
+        reason: '驱动名大小写不敏感',
+      );
+      expect(
+        relationListCanDelete(
+          driver: 'mysql',
+          constraintName: 'fk_books_author',
+        ),
+        isTrue,
+      );
+      expect(
+        relationListCanDelete(
+          driver: 'postgres',
+          constraintName: 'fk_books_author',
+        ),
+        isTrue,
+      );
+      expect(
+        relationListCanDelete(driver: 'mysql', constraintName: ''),
+        isFalse,
+      );
+      expect(
+        relationListCanDelete(driver: 'mysql', constraintName: '   '),
+        isFalse,
+      );
+      // 无约束名时即使驱动支持 ALTER 也不能按名字删。
+      expect(
+        relationListCanDelete(driver: 'sqlite', constraintName: ''),
+        isFalse,
+      );
+    });
+
     test('排序：类型优先，其次本地表 / 本地列（大小写不敏感）', () {
       const fkZeta = ErRelation(
         localTable: 'zeta',
@@ -1016,52 +1188,31 @@ void main() {
     });
   });
 
-  group('多对多标签矩形与连线不相交（第 54 轮几何回归）', () {
+  group('多对多标签矩形与连线不相交（第 54/55 轮几何回归）', () {
     const labelWidth = 210.0;
     const labelHeight = 18.0;
 
     Offset midpointOf(Offset a, Offset b) =>
         Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
 
-    Offset unitVector(Offset vector) {
-      final length = vector.distance;
-      return length == 0 ? Offset.zero : vector / length;
-    }
-
-    /// 标签按连线方向摆放时的四个角：210 长 × 18 高，中心在 m2mLabelAnchorFor。
-    ///
-    /// 画布上的标签是轴对齐文本盒；这里用「长边沿连线方向」的矩形描述它相对
-    /// 连线的避让关系（210 是 Container 的 maxWidth，18 是标签行高）。
-    List<Offset> labelBandCorners(Offset start, Offset end) {
-      final anchor = m2mLabelAnchorFor(start: start, end: end);
-      final direction = unitVector(end - start);
-      final normal = Offset(-direction.dy, direction.dx);
-      return <Offset>[
-        anchor + direction * (labelWidth / 2) + normal * (labelHeight / 2),
-        anchor + direction * (labelWidth / 2) - normal * (labelHeight / 2),
-        anchor - direction * (labelWidth / 2) - normal * (labelHeight / 2),
-        anchor - direction * (labelWidth / 2) + normal * (labelHeight / 2),
-      ];
-    }
-
     /// 点到**直线**（不是线段）的垂直距离。
     double distanceToLine(Offset point, Offset start, Offset end) {
-      final direction = unitVector(end - start);
-      final normal = Offset(-direction.dy, direction.dx);
+      final delta = end - start;
+      final length = delta.distance;
+      if (length == 0) return (point - start).distance;
+      final normal = Offset(-delta.dy / length, delta.dx / length);
       final offset = point - start;
       return (offset.dx * normal.dx + offset.dy * normal.dy).abs();
     }
 
-    /// 标签矩形带（沿连线方向的长方形）不能跨到连线另一侧：四个角的垂直距离
-    /// 都大于 0，说明标签整块在线的上方，连线中段不会被它盖住。
-    void expectBandClearsLine(Offset start, Offset end) {
-      for (final corner in labelBandCorners(start, end)) {
-        expect(
-          distanceToLine(corner, start, end),
-          greaterThan(0),
-          reason: '标签矩形跨过了连线（角点 $corner）',
-        );
-      }
+    /// 轴对齐标签矩形在连线法线方向上的「半径」：|nx|*半宽 + |ny|*半高。
+    double rectNormalSupport(Offset start, Offset end) {
+      final delta = end - start;
+      final length = delta.distance;
+      if (length == 0) return labelWidth / 2;
+      final nx = (-delta.dy / length).abs();
+      final ny = (delta.dx / length).abs();
+      return nx * (labelWidth / 2) + ny * (labelHeight / 2);
     }
 
     /// 轴对齐矩形与线段是否相交（Liang–Barsky 参数裁剪）。
@@ -1089,43 +1240,48 @@ void main() {
           clip(dy, rect.bottom - start.dy);
     }
 
-    test('水平连线：轴对齐标签矩形（210×18）与连线段不相交', () {
+    Rect labelRect(Offset start, Offset end) => Rect.fromCenter(
+      center: m2mLabelAnchorFor(start: start, end: end),
+      width: labelWidth,
+      height: labelHeight,
+    );
+
+    test('水平连线：轴对齐标签矩形（210×18）与连线段不相交，净空 9px', () {
       const a = Offset(100, 300);
       const b = Offset(600, 300);
-      final rect = Rect.fromCenter(
-        center: m2mLabelAnchorFor(start: a, end: b),
-        width: labelWidth,
-        height: labelHeight,
-      );
-      expect(rect.contains(midpointOf(a, b)), isFalse);
+      final rect = labelRect(a, b);
       expect(rectIntersectsSegment(rect, a, b), isFalse);
-      expectBandClearsLine(a, b);
-      // 18px 偏移 - 9px 半高 = 9px 净空。
+      expect(rect.contains(midpointOf(a, b)), isFalse);
+      // 锚点距离仍是 18px（第 53 轮行为不回归）；减去半高 9px = 9px 净空。
+      expect(distanceToLine(rect.center, a, b), closeTo(18, 0.0001));
       expect(
         distanceToLine(rect.center, a, b) - labelHeight / 2,
         closeTo(9, 0.0001),
       );
     });
 
-    test('垂直连线：标签矩形带整块在连线一侧（净空 18 > 半高 9）', () {
+    test('垂直连线：自适应净空 111px，轴对齐矩形与连线段不相交', () {
       const a = Offset(300, 100);
       const b = Offset(300, 600);
-      final anchor = m2mLabelAnchorFor(start: a, end: b);
-      expect(distanceToLine(anchor, a, b), closeTo(18, 0.0001));
-      // 沿连线方向的矩形带四个角都在线的同一侧，不与连线相交。
-      expectBandClearsLine(a, b);
-      // 注：轴对齐的 210px 文本盒比 18px 偏移宽得多，垂直连线会擦过它的横向
-      // 长边；真正保证「线中段露出来」的是上面的矩形带净空。
+      final rect = labelRect(a, b);
+      final clearance = m2mLabelClearance(start: a, end: b);
+      expect(clearance, closeTo(111, 0.0001));
+      expect(distanceToLine(rect.center, a, b), closeTo(clearance, 0.0001));
+      expect(rectIntersectsSegment(rect, a, b), isFalse);
+      // 矩形朝向连线的一边到连线 = padding（6px），线不会被横向长边擦到。
+      expect(clearance - rectNormalSupport(a, b), closeTo(6, 0.0001));
     });
 
-    test('斜线：标签矩形带与连线不相交，锚点在中点的法线上', () {
+    test('斜线：自适应净空介于 18~111，轴对齐矩形与连线段不相交', () {
       const a = Offset(100, 100);
       const b = Offset(500, 420);
-      final anchor = m2mLabelAnchorFor(start: a, end: b);
-      final midpoint = midpointOf(a, b);
-      expect(distanceToLine(anchor, a, b), closeTo(18, 0.0001));
-      expect((anchor - midpoint).distance, closeTo(18, 0.0001));
-      expectBandClearsLine(a, b);
+      final rect = labelRect(a, b);
+      final clearance = m2mLabelClearance(start: a, end: b);
+      expect(clearance, greaterThan(18));
+      expect(clearance, lessThan(111));
+      expect(distanceToLine(rect.center, a, b), closeTo(clearance, 0.0001));
+      expect(rectIntersectsSegment(rect, a, b), isFalse);
+      expect(clearance - rectNormalSupport(a, b), closeTo(6, 0.0001));
     });
   });
 

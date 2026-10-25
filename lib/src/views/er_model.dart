@@ -1491,12 +1491,41 @@ ErRelationCurve? manyToManyCurve(ErCanvasLayout layout, ErManyToManyLink link) {
   );
 }
 
-/// 多对多标签的锚点：两端卡片中心连线的中点，沿连线的垂直方向偏移 [offset]。
+/// 多对多标签相对卡片中心连线需要的**法线净空**（锚点到连线的距离）。
+///
+/// 标签是 210×18 的文本盒（与画布上 _edgeLabel 的 maxWidth / 行高一致）：
+/// 水平连线的法线是竖直的，只要让开半个标签高度（9px）+ padding；垂直连线的
+/// 法线是水平的，必须让开半个标签宽度（105px）；斜线介于两者之间。
+///
+/// 净空 = |nx| * halfW + |ny| * halfH + [padding]，再与 [minOffset] 取较大值。
+/// [minOffset] 默认 18px，保证水平连线的既有避让距离（第 53 轮 P2-6）不回归。
+double m2mLabelClearance({
+  required Offset start,
+  required Offset end,
+  Size labelSize = const Size(210, 18),
+  double padding = 6,
+  double minOffset = 18,
+}) {
+  final delta = end - start;
+  final length = delta.distance;
+  if (length <= 0.0001) return minOffset;
+  // 单位法线的两个分量；左右/上下哪一侧由调用方决定，这里只看绝对值。
+  final nx = (-delta.dy / length).abs();
+  final ny = (delta.dx / length).abs();
+  final clearance =
+      nx * (labelSize.width / 2) + ny * (labelSize.height / 2) + padding;
+  return math.max(minOffset, clearance);
+}
+
+/// 多对多标签的锚点：两端卡片中心连线的中点，沿连线法线偏移。
 ///
 /// 第 53 轮 P2-6：标签原来正好压在橙色「多对多」连线的中段上，把线挡得看不出
 /// 走向。这里把锚点沿法线挪开，并固定选 y 更小的一侧（屏幕上偏上），让标签落在
-/// 连线上方的空白处，连线中段保持可见；[offset] 大于标签半高（约 8px）即可，
-/// 默认 18px。
+/// 连线上方的空白处，连线中段保持可见。
+///
+/// 第 55 轮：偏移量不再固定 18px，而是按 [m2mLabelClearance] 用标签尺寸与连线
+/// 方向自适应——水平仍在 18px（不回归），垂直约 111px，斜线介于两者之间。
+/// [offset] 保留为**下限**（默认 18），[labelSize] / [padding] 可覆盖。
 ///
 /// [start] / [end] 是两张卡片中心（与 [manyToManyCurve] 的曲线中点重合）。
 /// 两点重合或 [offset] 为 0 时退回中点。
@@ -1504,6 +1533,8 @@ Offset m2mLabelAnchorFor({
   required Offset start,
   required Offset end,
   double offset = 18,
+  Size labelSize = const Size(210, 18),
+  double padding = 6,
 }) {
   final midpoint = Offset((start.dx + end.dx) / 2, (start.dy + end.dy) / 2);
   final delta = end - start;
@@ -1514,7 +1545,14 @@ Offset m2mLabelAnchorFor({
   if (normal.dy > 0 || (normal.dy == 0 && normal.dx > 0)) {
     normal = Offset(-normal.dx, -normal.dy);
   }
-  return midpoint + normal * offset;
+  final clearance = m2mLabelClearance(
+    start: start,
+    end: end,
+    labelSize: labelSize,
+    padding: padding,
+    minOffset: offset,
+  );
+  return midpoint + normal * clearance;
 }
 
 // -------------------------------------------------- 关系列表（侧栏，第 54 轮 P2-5）
@@ -1559,6 +1597,10 @@ class ErRelationListItem {
   /// 多对多条目的中间表名；其它类型为 null。
   String? get junctionTable => link?.junctionTable;
 
+  /// 外键约束名（SQLite / 未命名外键为空串）；搜索会匹配它，显示仍以
+  /// [displayLabel] 为主。
+  String get constraintName => relation.name;
+
   /// 列表展示文本：外键 / 建议用「a.b → c.d」，多对多用「多对多 · 中间表」
   /// （与画布上的标签格式保持一致）。
   String get displayLabel => kind == ErRelationListItemKind.manyToMany
@@ -1569,7 +1611,8 @@ class ErRelationListItem {
       : '${relation.localTable}.${relation.localColumn} → '
             '${relation.refTable}.${relation.refColumn}';
 
-  /// 搜索键：表名 / 列名 / 展示文本，统一小写后做子串匹配。
+  /// 搜索键：表名 / 列名 / 展示文本 / 中间表名 / 外键约束名，统一小写后
+  /// 做子串匹配（第 55 轮：约束名也能搜到，解决 MySQL 长约束名找不到的问题）。
   String get searchKey => <String>[
     localTable,
     localColumn,
@@ -1577,6 +1620,7 @@ class ErRelationListItem {
     refColumn,
     ?junctionTable,
     displayLabel,
+    constraintName,
   ].join('\n').toLowerCase();
 
   /// 唯一键（侧栏 widget key / 去重）：多对多用中间表，其它用关系 key。
@@ -1647,6 +1691,31 @@ List<ErRelationListItem> relationListItems({
     return 0;
   });
   return picked;
+}
+
+/// 关系列表行的悬浮提示：完整展示文本 +（有约束名时）约束名。
+///
+/// 260 / 220px 的侧栏里长表名 / 约束名会被省略号截断，tooltip 是唯一能看到
+/// 完整关系的地方（第 55 轮）。
+String relationListItemTooltip(ErRelationListItem item) {
+  final label = item.displayLabel;
+  if (item.constraintName.isEmpty) return label;
+  return pickText(
+    '$label\n约束名：${item.constraintName}',
+    '$label\nConstraint: ${item.constraintName}',
+  );
+}
+
+/// 关系列表行能否删除：SQLite 不能用 ALTER 删外键，无名约束也无法按名字删。
+///
+/// 第 55 轮抽成纯函数：画布关系详情对话框与侧栏删除图标共用同一判定，避免两处
+/// 各自写一套字符串判断。
+bool relationListCanDelete({
+  required String driver,
+  required String constraintName,
+}) {
+  if (driver.trim().toLowerCase() == 'sqlite') return false;
+  return constraintName.trim().isNotEmpty;
 }
 
 // -------------------------------------------------- 自动带入关联表

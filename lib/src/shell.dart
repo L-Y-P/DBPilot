@@ -589,9 +589,6 @@ class _SidebarState extends State<_Sidebar> {
   bool _loading = false;
   String? _error;
 
-  /// Active database whose tree level was opened automatically.
-  String? _autoOpened;
-
   /// Namespaces whose table list is already being fetched.
   final Set<String> _loadingTables = <String>{};
 
@@ -622,19 +619,6 @@ class _SidebarState extends State<_Sidebar> {
             }
           });
         }
-      }
-    }
-
-    // After connecting / switching databases, expand the active database and
-    // its default schema so the tree reflects the page the app landed on.
-    if (state.connected && !state.isSqlite) {
-      final database = state.activeDatabase;
-      final autoKey = '${state.connection?['id']}|$database';
-      if (database != null && _autoOpened != autoKey) {
-        _autoOpened = autoKey;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _autoOpenActive(state);
-        });
       }
     }
 
@@ -991,38 +975,6 @@ class _SidebarState extends State<_Sidebar> {
         !nav.schemasByDb.containsKey(name) &&
         !nav.loadingSchemas.contains(name)) {
       await _loadSchemas(name);
-    }
-  }
-
-  /// Open the active database (and a sensible schema) once per database.
-  Future<void> _autoOpenActive(AppState state) async {
-    final nav = Navigation.instance;
-    final database = state.activeDatabase;
-    if (database == null || database.isEmpty) return;
-    if (state.isPostgres) {
-      nav.expandDatabase(database);
-      if (!nav.schemasByDb.containsKey(database) &&
-          !nav.loadingSchemas.contains(database)) {
-        await _loadSchemas(database);
-      }
-      if (!mounted || state.activeDatabase != database) return;
-      final schemas = nav.schemasByDb[database];
-      if (schemas == null) return;
-      final names = schemas
-          .map((s) => (s['name'] ?? '').toString())
-          .where((n) => n.isNotEmpty && !state.isSystemNamespace(n))
-          .toList();
-      if (names.isEmpty) return;
-      // A schema is already open (the user clicked one while this post-frame
-      // callback was pending): do not add a second table list.
-      if (nav.expanded.isNotEmpty) return;
-      final fallback = state.searchPathDefaultSchema ?? state.defaultDatabase;
-      final schema = names.contains(fallback) ? fallback! : names.first;
-      nav.expandNamespace(schema);
-      await _loadTables(schema);
-    } else if (state.isMysql) {
-      nav.expandNamespace(database);
-      await _loadTables(database);
     }
   }
 

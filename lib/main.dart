@@ -93,6 +93,8 @@ Future<void> main() async {
       await windowManager.setPosition(Offset(x, y));
     }
     if (maximized) await windowManager.maximize();
+    // 窗口底色已在 MainFlutterWindow.swift 里换成系统窗口底色（窗口 +
+    // FlutterView 一起设），首帧前不会闪黑，这里直接显示即可。
     await windowManager.show();
     await windowManager.focus();
   });

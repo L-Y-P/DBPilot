@@ -509,23 +509,27 @@ class _ConnectionsViewState extends State<ConnectionsView> {
         // PostgreSQL connects to the instance, then selects a database. Open
         // its default schema (normally public) rather than a database name.
         final schema = state.defaultDatabase;
+        // expandTree:false — 连接成功后侧边栏保持收起，不再默认展开第一个
+        // 数据库的表列表；用户点数据库 / schema 节点时才展开。
         if (schema != null) {
-          Navigation.instance.go(AppRoute.database(schema));
+          Navigation.instance.go(AppRoute.database(schema), expandTree: false);
         } else {
           Navigation.instance.go(AppRoute.sql);
         }
       } else if (state.isMysql) {
         final active = state.activeDatabase;
         if (active != null && active.isNotEmpty) {
-          Navigation.instance.go(AppRoute.database(active));
+          Navigation.instance
+              .go(AppRoute.database(active), expandTree: false);
         } else {
           Navigation.instance.go(AppRoute.sql);
         }
       } else if (database is String && database.isNotEmpty) {
         // A SQLite connection is addressed by its primary file; the database
         // page resolves that path to the namespace the driver reports.
-        Navigation.instance.go(AppRoute.database(
-            state.databaseNameForPath(database)));
+        Navigation.instance.go(
+            AppRoute.database(state.databaseNameForPath(database)),
+            expandTree: false);
       } else {
         Navigation.instance.go(AppRoute.sql);
       }

@@ -86,12 +86,20 @@ class Navigation extends ChangeNotifier {
   String? _lastDb;
   String? get lastDatabase => _lastDb;
 
-  void go(AppRoute route) {
-    if (_route == route) return;
+  /// Switch route.
+  ///
+  /// [expandTree] 保留旧行为「打开路由时顺手展开侧边栏对应节点」（点击 schema
+  /// 行、切换数据库时需要）。连接成功后的首个路由必须传 false，否则侧边栏会
+  /// 默认展开第一个数据库的表列表。
+  void go(AppRoute route, {bool expandTree = true}) {
+    if (_route == route) {
+      if (expandTree && route.db != null) expanded.add(route.db!);
+      return;
+    }
     _route = route;
     if (route.db != null) {
       _lastDb = route.db;
-      expanded.add(route.db!);
+      if (expandTree) expanded.add(route.db!);
     }
     notifyListeners();
   }

@@ -265,6 +265,38 @@ Json tableDesignColumnAlterPayload(Json column, List<Json> renameColumns) {
   };
 }
 
+/// 批量保存（applyRowChanges）的结果（第 60 轮）。
+///
+/// [zeroRows] 来自 Rust 新增的 `zero_row_results`：某条 UPDATE 的 keys 没有
+/// 命中任何行（行已被删除或键被改）时，Rust 逐条列在返回里；这里只关心条数，
+/// 用于在「已保存 N 行」后追加一句诊断，其余按已保存处理。
+class BatchApplyOutcome {
+  const BatchApplyOutcome({
+    required this.rowsAffected,
+    required this.zeroRows,
+  });
+
+  final int rowsAffected;
+  final int zeroRows;
+
+  bool get hasZeroRows => zeroRows > 0;
+
+  /// 保存成功后的用户提示（零行命中时追加诊断）。
+  String get message {
+    if (zeroRows == 0) {
+      return pickText(
+        '已保存 $rowsAffected 行',
+        'Saved $rowsAffected row(s)',
+      );
+    }
+    return pickText(
+      '已保存 $rowsAffected 行；$zeroRows 条改动未命中任何行（可能已被删除或键被修改）',
+      'Saved $rowsAffected row(s); $zeroRows edit(s) matched no row (the row may '
+          'have been deleted or its key changed)',
+    );
+  }
+}
+
 /// Single-table workbench with tabs: Browse, Structure, Design, DDL, Insert,
 /// SQL, Export, Import and Operations.
 ///
@@ -321,6 +353,13 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// 事务。切页签 / 切表仍然要确认（跨表暂存不安全），刷新也保留确认。
   final Map<String, Map<String, DirtyCell>> _stagedEditsByKey =
       <String, Map<String, DirtyCell>>{};
+
+  /// 是否启用第 59 轮的行键跨页保持。
+  ///
+  /// 第 60 轮：**无主键表禁用**。无主键表的行键是整行旧值，外部并发改动后
+  /// applyRowChanges 可能命中 0 行；这类表退回第 57 轮行为（翻页/排序/筛选
+  /// 先确认，暂存只保留当前页）。有主键表保持跨页保持。
+  bool get _crossPageRetentionEnabled => _primaryKey.isNotEmpty;
 
   /// 所有页加起来的暂存编辑数（表格工具栏 /「未保存 N 处」用）。
   int get _stagedEditCount => _stagedEditsByKey.values.fold<int>(
@@ -516,7 +555,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     if (!mounted) return;
     var saveFailed = false;
     if (choice == 2) {
-      final applied = await _saveBatchEdits(
+      final outcome = await _saveBatchEdits(
         oldDb,
         oldTable,
         oldColumns,
@@ -524,11 +563,13 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
         edits,
       );
       if (!mounted) return;
-      if (applied != null) {
+      if (outcome != null) {
         widget.notice.show(
           pickText(
-            '已保存 $applied 行到原表 $oldTable',
-            'Saved $applied row(s) to the previous table $oldTable',
+            '已保存 ${outcome.rowsAffected} 行到原表 $oldTable'
+            '${outcome.hasZeroRows ? '；${outcome.zeroRows} 条改动未命中任何行（可能已被删除或键被修改）' : ''}',
+            'Saved ${outcome.rowsAffected} row(s) to the previous table $oldTable'
+            '${outcome.hasZeroRows ? '; ${outcome.zeroRows} edit(s) matched no row' : ''}',
           ),
         );
       } else {
@@ -756,6 +797,13 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// 跨页 map 中移除，再并入上报的编辑。其它页的编辑原样保留。
   void _onDirtyChanges(List<DirtyCell> edits) {
     if (!mounted) return;
+    if (!_crossPageRetentionEnabled) {
+      // 第 60 轮：无主键表不做跨页保持，DataGrid 上报的就是当前页全部编辑。
+      _stagedEditsByKey.clear();
+      _mergeStagedEdits(edits);
+      setState(() {});
+      return;
+    }
     final pageKeys = <String>{
       for (final row in _rows)
         rowChangeKey(
@@ -852,11 +900,21 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     }
   }
 
-  // ---- 第 59 轮：翻页/排序/筛选只换数据、不丢暂存编辑（按行键跨页保留） ----
-  // 只有「切页签 / 切表」（跨表暂存不安全）和「刷新」（外部数据可能已变）
-  // 仍然过 _confirmLeaveDirty。
+  // ---- 第 59/60 轮：翻页/排序/筛选只换数据、不丢暂存编辑（按行键跨页保留） ----
+  // 有主键表直接放行；无主键表退回第 57 轮离开确认。切页签 / 切表 / 刷新
+  // 无论是否有主键都仍然确认。
+
+  /// 换页/排序/筛选等会换掉当前页数据的入口。
+  ///
+  /// 有主键 → 第 59 轮跨页保持，直接放行；无主键 → 第 57 轮确认（行键是整行
+  /// 旧值，跨页保存可能命中 0 行，不做跨页保持）。
+  Future<bool> _allowPageReload() async {
+    if (_crossPageRetentionEnabled) return true;
+    return _confirmLeaveDirty();
+  }
 
   Future<void> _goToPage(int target) async {
+    if (!await _allowPageReload()) return;
     if (!mounted) return;
     setState(() => _page = target);
     await _loadData();
@@ -871,6 +929,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   }
 
   Future<void> _applyWhere() async {
+    if (!await _allowPageReload()) return;
     if (!mounted) return;
     setState(() => _page = 1);
     await _loadData();
@@ -878,6 +937,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
 
   Future<void> _clearWhere() async {
     if (_where.text.isEmpty) return;
+    if (!await _allowPageReload()) return;
     if (!mounted) return;
     _where.text = '';
     setState(() => _page = 1);
@@ -985,7 +1045,8 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   }
 
   Future<void> _onSort(String column, bool additive) async {
-    // 第 59 轮：排序只换页面数据，暂存编辑按行键保留，不再要求丢弃。
+    // 第 59/60 轮：有主键表排序不丢编辑；无主键表先离开确认。
+    if (!await _allowPageReload()) return;
     if (!mounted) return;
     setState(() {
       final existing = _sorts.indexWhere((s) => s.column == column);
@@ -1009,7 +1070,8 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// Build a WHERE clause from the DataGrid filter row, quoting identifiers
   /// for the active driver exactly like the web filtersToWhere().
   Future<void> _onFilters(List<GridFilter> filters) async {
-    // 第 59 轮：筛选同排序，编辑按行键保留。
+    // 第 59/60 轮：筛选同排序——有主键表保留编辑，无主键表先确认。
+    if (!await _allowPageReload()) return;
     if (!mounted) return;
     final q = AppState.instance.quoteIdent;
     final conditions = <String>[];
@@ -1219,6 +1281,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                     onChanged: (v) async {
                       final next = v ?? 25;
                       if (next == _perPage) return;
+                      if (!await _allowPageReload()) return;
                       if (!mounted) return;
                       setState(() {
                         _perPage = next;
@@ -1275,8 +1338,12 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           onSaveCell: _saveCell,
           onApplyEdits: _applyDirtyEdits,
           onDirtyChanges: _onDirtyChanges,
-          initialDirtyByKey: _initialDirtyByKey,
-          totalDirtyCount: _stagedEditCount,
+          // 第 60 轮：无主键表不做跨页保持（退回第 57 轮单页行为）。
+          initialDirtyByKey:
+              _crossPageRetentionEnabled ? _initialDirtyByKey : null,
+          totalDirtyCount:
+              _crossPageRetentionEnabled ? _stagedEditCount : null,
+          maxDirtyCells: kMaxStagedCells,
         ),
         const SizedBox(height: 8),
         _pager(),
@@ -1337,9 +1404,9 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// 把一批带行键的单元格编辑写到显式的 db/table（切表保存到原表也复用它）。
   ///
   /// 第 59 轮改用 [buildRowChangesFromKeys]：编辑可能来自多个页，行键在暂存时
-  /// 已捕获，不再依赖当前页的 rows。返回实际影响的行数；失败返回 null，并在
-  /// 页面错误横幅里显示原因。
-  Future<int?> _saveBatchEdits(
+  /// 已捕获，不再依赖当前页的 rows。第 60 轮额外读取 `zero_row_results`（键
+  /// 命中 0 行的改动），失败返回 null，并在页面错误横幅里显示原因。
+  Future<BatchApplyOutcome?> _saveBatchEdits(
     String db,
     String table,
     List<Json> columns,
@@ -1353,7 +1420,11 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     );
     try {
       final result = await Api.instance.applyRowChanges(db, table, changes);
-      return (result['rows_affected'] as num?)?.toInt() ?? 0;
+      final zeroRows = result['zero_row_results'];
+      return BatchApplyOutcome(
+        rowsAffected: (result['rows_affected'] as num?)?.toInt() ?? 0,
+        zeroRows: zeroRows is List ? zeroRows.length : 0,
+      );
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
       return null;
@@ -1374,15 +1445,15 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       for (final row in _stagedEditsByKey.values) ...row.values,
     ];
     if (all.isEmpty) return true;
-    final applied = await _saveBatchEdits(
+    final outcome = await _saveBatchEdits(
       widget.db,
       widget.table,
       _columns,
       _primaryKey,
       all,
     );
-    if (applied == null) return false;
-    widget.notice.show('已保存 $applied 行');
+    if (outcome == null) return false;
+    widget.notice.show(outcome.message);
     _stagedEditsByKey.clear();
     await _reloadAfterWrite();
     return true;

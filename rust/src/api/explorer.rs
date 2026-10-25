@@ -521,6 +521,44 @@ fn parse_row_changes(changes: Value) -> anyhow::Result<Vec<RowChange>> {
         .collect()
 }
 
+/// One row change after SQL validation/rendering: everything the response needs
+/// to report a zero-row match without re-parsing the request.
+struct PlannedChange {
+    index: usize,
+    action: String,
+    sql: String,
+    keys: serde_json::Map<String, Value>,
+}
+
+/// UPDATE / DELETE items whose driver affected-row count is 0.
+///
+/// Diagnostics only: the batch is not a failure, the transaction commits and
+/// ok / rows_affected keep their meaning. MySQL counts only rows whose values
+/// actually changed, so a same-value UPDATE also reports 0 there — the list
+/// means "the key matched no row, or the row's values did not change" (the Dart
+/// page words it that way). INSERT is excluded because 0 rows affected is its
+/// normal count.
+fn zero_row_results(changes: &[PlannedChange], row_counts: &[u64]) -> Vec<Value> {
+    changes
+        .iter()
+        .zip(row_counts)
+        .filter(|(change, count)| {
+            **count == 0
+                && matches!(
+                    change.action.to_ascii_lowercase().as_str(),
+                    "update" | "delete"
+                )
+        })
+        .map(|(change, _)| {
+            json!({
+                "index": change.index,
+                "action": change.action,
+                "keys": Value::Object(change.keys.clone()),
+            })
+        })
+        .collect()
+}
+
 /// Apply several row changes (INSERT / UPDATE / DELETE) in **one transaction**.
 ///
 /// The semantic of every item is exactly [change_row]'s: the same key/value
@@ -536,7 +574,12 @@ fn parse_row_changes(changes: Value) -> anyhow::Result<Vec<RowChange>> {
 /// the error names the failing item.
 ///
 /// Returns per-item results plus the total affected rows, so the table page can
-/// show "已保存 N 行" and flag the item that contained a zero-row match.
+/// show "已保存 N 行" and flag the item that matched no row. Matching no row is
+/// **not** a failure: the batch still commits and ok/rows_affected keep their
+/// meaning. [zero_row_results] (added in round 60) lists the UPDATE / DELETE
+/// items whose driver row count was 0; since MySQL counts only rows whose values
+/// changed, that means "the key matched nothing, or the value did not change".
+///
 pub async fn apply_row_changes(
     database: String,
     table: String,
@@ -546,54 +589,63 @@ pub async fn apply_row_changes(
     let driver = state.driver_for_active().await?;
     let parsed = parse_row_changes(changes)?;
     // Build first: validation errors must fail before BEGIN (no rollback needed).
-    let mut statements: Vec<(usize, String, String)> = Vec::with_capacity(parsed.len());
+    let mut planned: Vec<PlannedChange> = Vec::with_capacity(parsed.len());
     for (index, change) in parsed.iter().enumerate() {
         let keys = change.keys.clone().unwrap_or_default();
         let values = change.values.clone().unwrap_or_default();
         let sql = driver
             .change_row_sql(&database, &table, &change.action, &keys, &values, change.limit_one)
             .map_err(anyhow::Error::from)?;
-        statements.push((index, change.action.clone(), sql));
+        planned.push(PlannedChange {
+            index,
+            action: change.action.clone(),
+            sql,
+            keys,
+        });
     }
-    if statements.is_empty() {
+    if planned.is_empty() {
         return Ok(json!({
             "ok": true,
             "database": database,
             "table": table,
             "results": [],
             "rows_affected": 0,
+            "zero_row_results": [],
         }));
     }
     // One transaction on one pooled connection. The driver issues BEGIN/COMMIT
     // through sqlx's transaction manager (a prepared `BEGIN` is rejected by
     // MySQL, error 1295) and rolls the whole batch back when a statement fails.
     let conn = state.connection_for(Some(&database)).await?;
-    let sqls: Vec<String> = statements
-        .iter()
-        .map(|(_, _, sql)| sql.clone())
-        .collect();
+    let sqls: Vec<String> = planned.iter().map(|change| change.sql.clone()).collect();
     let executed = conn
         .execute_transaction(sqls)
         .await
         .map_err(anyhow::Error::from)?;
     let mut results: Vec<Value> = Vec::with_capacity(executed.len());
     let mut rows_affected = 0u64;
-    for ((index, action, _sql), result) in statements.into_iter().zip(executed) {
+    for (change, result) in planned.iter().zip(executed.iter()) {
         rows_affected += result.row_count;
         results.push(json!({
             "ok": true,
-            "index": index,
-            "action": action,
+            "index": change.index,
+            "action": change.action,
             "rows_affected": result.row_count,
             "last_insert_id": result.last_insert_id,
         }));
     }
+    // Additive diagnostics only: which UPDATE / DELETE matched no row (or, on
+    // MySQL, changed no value). Never changes ok or the transaction outcome.
+    // Passing only the row counts keeps ResultSet out of the FRB-facing module.
+    let row_counts: Vec<u64> = executed.iter().map(|result| result.row_count).collect();
+    let zero_rows = zero_row_results(&planned, &row_counts);
     Ok(json!({
         "ok": true,
         "database": database,
         "table": table,
         "results": results,
         "rows_affected": rows_affected,
+        "zero_row_results": zero_rows,
     }))
 }
 
@@ -813,4 +865,74 @@ pub async fn alter_table(database: String, table: String, body: Value) -> anyhow
         "results": results,
         "failed": failed,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn change(index: usize, action: &str, keys: Value) -> PlannedChange {
+        let Value::Object(keys) = keys else {
+            panic!("keys must be an object");
+        };
+        PlannedChange {
+            index,
+            action: action.to_string(),
+            sql: String::new(),
+            keys,
+        }
+    }
+
+    #[test]
+    fn zero_row_results_flag_only_zero_row_update_and_delete() {
+        let changes = vec![
+            change(0, "update", json!({ "id": 1 })),
+            change(1, "update", json!({ "id": 2 })),
+            change(2, "delete", json!({ "id": 3 })),
+            change(3, "insert", json!({})),
+            change(4, "delete", json!({ "id": 4 })),
+        ];
+        let row_counts = vec![
+            0u64, // update matched nothing
+            1,    // update hit one row
+            0,    // delete matched nothing
+            1,    // insert is never reported
+            2,    // delete hit two rows, not zero
+        ];
+        assert_eq!(
+            zero_row_results(&changes, &row_counts),
+            vec![
+                json!({ "index": 0, "action": "update", "keys": { "id": 1 } }),
+                json!({ "index": 2, "action": "delete", "keys": { "id": 3 } }),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_row_results_are_empty_when_everything_matched() {
+        let changes = vec![
+            change(0, "update", json!({ "id": 1 })),
+            change(1, "delete", json!({ "id": 2 })),
+        ];
+        let row_counts = vec![1u64, 1];
+        assert!(zero_row_results(&changes, &row_counts).is_empty());
+    }
+
+    #[test]
+    fn zero_row_results_keep_the_incoming_change_index() {
+        // The reported index must line up with the incoming changes array, not
+        // with the position inside the filtered diagnostics list.
+        let changes = vec![
+            change(0, "insert", json!({})),
+            change(1, "update", json!({ "id": 9 })),
+            change(2, "update", json!({ "id": 8 })),
+        ];
+        let row_counts = vec![1u64, 0, 0];
+        let zero = zero_row_results(&changes, &row_counts);
+        assert_eq!(zero.len(), 2);
+        assert_eq!(zero[0]["index"], json!(1));
+        assert_eq!(zero[1]["index"], json!(2));
+        assert_eq!(zero[0]["keys"], json!({ "id": 9 }));
+    }
 }

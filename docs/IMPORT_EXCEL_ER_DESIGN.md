@@ -488,3 +488,12 @@ Future<void> showRelationDesigner(
 - Dart describeRestoreOutcome 在成功/部分失败/兜底失败文案后追加「已自动改用分组提交：<原因>」；无原因时文案不变。
 - 测试：core +6（各关键短语、注释/大小写/多语句去重、字符串内词不误伤、256 MiB 边界、原子路径回退）；Dart +3；PG live 正常 dump 不被误降级。
 
+
+## 16. 第 60 轮修订（无主键跨页安全 / 暂存上限 / 零行命中诊断）
+
+- 无主键表禁用跨页保持：第 59 轮的跨页 row-key 在无主键时只能取整行旧值，外部并发改动后可能保存 0 行；table_view 现按 _primaryKey.isNotEmpty 决定是否启用跨页暂存，无主键表翻页/排序/筛选/每页条数回到第 57 轮离开确认，有主键表行为不变。
+- 暂存上限：DataGrid 新增 kMaxStagedCells=2000 与 maxDirtyCells，暂存新单元格会超限时拒绝并提示「暂存改动过多…请先保存全部改动」；工具栏标签显示 (N/2000)；重新编辑已暂存格不受限。
+- 零行命中诊断：apply_row_changes 返回 zero_row_results: [{index, action, keys}]（仅 UPDATE/DELETE 且 rows_affected==0，纯诊断，不改 ok/事务）；api 侧只把 row_count 传给纯函数 zero_row_results(changes, row_counts)，避免 ResultSet 类型进入 FRB api 模块（api-surface guard 通过）。Dart 保存成功 notice 追加「M 条改动未命中任何行（可能已被删除或键被修改）」；MySQL 的 0 行也代表「值未变化」，文案按此表达。
+- restore allowlist 扩展：PG 新增 ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY（要求前 12 词内同时出现三个关键词，非并发 DETACH 仍允许）；补 CREATE [UNIQUE] INDEX CONCURRENTLY [IF NOT EXISTS]、DROP INDEX CONCURRENTLY [IF EXISTS]、REINDEX (CONCURRENTLY) 等变体；statement_head_words 遇行内注释即停止扫描，避免尾注释 -- CONCURRENTLY 误判；CREATE INDEX 判定收紧为前缀 CREATE [UNIQUE] INDEX，防列名/字符串误伤。
+- 测试：core 41（扩展正反例）、app 271（+3 zero_row_results 单测）、SQLite 集成断言、Dart DataGrid 上限 widget、live SQLite 无主键翻页确认/零行提示（9/9）。
+

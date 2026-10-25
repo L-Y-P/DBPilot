@@ -36,6 +36,19 @@ Future<void> editCell(WidgetTester tester, String cell, String text) async {
   await tester.pumpAndSettle();
 }
 
+/// Like [editCell] but does not wait out the 1.5s flash timer, so a rejection
+/// flash can still be asserted.
+Future<void> tryEditCell(WidgetTester tester, String cell, String text) async {
+  await tester.tap(find.text(cell));
+  await tester.pump(const Duration(milliseconds: 60));
+  await tester.tap(find.text(cell));
+  await tester.pumpAndSettle();
+  await tester.enterText(find.byType(TextField), text);
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('保存'));
+  await tester.pumpAndSettle();
+}
+
 void main() {
   testWidgets('cell edits are staged and applied together on 保存全部改动',
       (tester) async {
@@ -335,6 +348,48 @@ void main() {
     await tester.pumpAndSettle();
     expect(applied, isNotNull);
     expect(applied, isEmpty);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+  });
+
+  // =====================================================================
+  // 第 60 轮：暂存上限
+  // =====================================================================
+
+  testWidgets('maxDirtyCells refuses new cells past the cap and shows N/limit',
+      (tester) async {
+    List<DirtyCell>? applied;
+    await tester.pumpWidget(host(DataGrid(
+      columns: _columns,
+      rows: _rows,
+      primaryKey: const <String>['id'],
+      rowOps: true,
+      editable: true,
+      maxDirtyCells: 1,
+      onApplyEdits: (edits) async {
+        applied = List<DirtyCell>.of(edits);
+        return true;
+      },
+    )));
+    await tester.pumpAndSettle();
+
+    await editCell(tester, 'one', 'ONE');
+    expect(find.text('保存全部改动 (1/1)'), findsOneWidget);
+
+    // 第二个单元格超过上限：拒绝暂存并 flash 提示。
+    await tryEditCell(tester, 'two', 'TWO');
+    expect(find.textContaining('暂存改动过多'), findsOneWidget);
+    expect(find.textContaining('上限 1'), findsOneWidget);
+    expect(find.text('保存全部改动 (1/1)'), findsOneWidget);
+
+    // 已暂存的单元格再次编辑不受限（计数不变）。
+    await tryEditCell(tester, 'one', 'ONE2');
+    expect(find.text('保存全部改动 (1/1)'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('grid-apply-dirty')));
+    await tester.pumpAndSettle();
+    expect(applied, hasLength(1));
+    expect(applied!.single.value, 'ONE2');
     await tester.pump(const Duration(seconds: 2));
     await tester.pumpAndSettle();
   });

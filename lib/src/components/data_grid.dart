@@ -20,6 +20,13 @@ const int kLazyBigFieldThreshold = 200;
 /// Characters shown by the preview; the rest is summarised by a badge.
 const int kLazyBigFieldPreview = 120;
 
+/// Default cap for staged batch edits (cells across the whole table, 第 60 轮).
+///
+/// Each staged cell keeps its value and row keys in memory; without a cap a user
+/// could stage edits across hundreds of pages and the batch payload / memory
+/// would grow unbounded. Hosts pass this through [DataGrid.maxDirtyCells].
+const int kMaxStagedCells = 2000;
+
 /// One column filter in the DataGrid filter row, mirroring the web operators.
 class GridFilter {
   GridFilter({this.op = 'LIKE', this.value = ''});
@@ -80,6 +87,7 @@ class DataGrid extends StatefulWidget {
     this.onDirtyChanges,
     this.initialDirtyByKey,
     this.totalDirtyCount,
+    this.maxDirtyCells,
     this.exportActions,
   });
 
@@ -130,6 +138,13 @@ class DataGrid extends StatefulWidget {
   /// 「保存全部改动」, labelled with this count, so a batch staged on another
   /// page can be saved from here.
   final int? totalDirtyCount;
+
+  /// Cap on the number of staged cells (host passes [kMaxStagedCells]).
+  ///
+  /// Staging another cell when the current page + [totalDirtyCount] would exceed
+  /// this cap is refused with a flash message instead of growing the batch
+  /// without bound. Editing a cell that is already staged is always allowed.
+  final int? maxDirtyCells;
 
   /// Optional replacement for the built-in "导出 CSV / 导出 JSON" buttons.
   ///
@@ -315,6 +330,17 @@ class _DataGridState extends State<DataGrid> {
         for (final row in _dirtyCells.values) ...row.values,
       ];
 
+  /// Staged cells across the whole table (host count wins when provided).
+  int get _totalDirtyCount => widget.totalDirtyCount ?? _dirtyEdits.length;
+
+  /// Toolbar label for the save button. Shows `N/limit` when a cap is set.
+  String get _applyDirtyLabel {
+    final limit = widget.maxDirtyCells;
+    return limit == null
+        ? '保存全部改动 ($_totalDirtyCount)'
+        : '保存全部改动 ($_totalDirtyCount/$limit)';
+  }
+
   /// Report the current staged edits to [DataGrid.onDirtyChanges].
   ///
   /// Use [postFrame] from didUpdateWidget: the host's callback usually calls
@@ -433,7 +459,7 @@ class _DataGridState extends State<DataGrid> {
           if (widget.onApplyEdits != null &&
               (_dirtyCells.isNotEmpty || (widget.totalDirtyCount ?? 0) > 0)) ...[
             Btn(
-                '保存全部改动 (${widget.totalDirtyCount ?? _dirtyEdits.length})',
+                _applyDirtyLabel,
                 key: const ValueKey('grid-apply-dirty'),
                 small: true,
                 primary: true,
@@ -1236,6 +1262,15 @@ class _DataGridState extends State<DataGrid> {
     if (result == true && canEdit) {
       if (widget.onApplyEdits != null) {
         // Batch mode: keep the edit in the grid until "保存全部改动".
+        final alreadyStaged =
+            _dirtyCells[rowIndex]?.containsKey(column) ?? false;
+        final limit = widget.maxDirtyCells;
+        if (limit != null && !alreadyStaged && _totalDirtyCount + 1 > limit) {
+          // 第 60 轮：超过宿主给的暂存上限时拒绝新增（重新编辑已暂存的单元
+          // 格不受限），提示先保存全部改动。
+          _flashMessage('暂存改动过多（上限 $limit 个单元格），请先保存全部改动');
+          return;
+        }
         setState(() {
           final row = _dirtyCells[rowIndex] ??= <String, DirtyCell>{};
           final existing = row[column];

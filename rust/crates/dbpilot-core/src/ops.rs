@@ -341,16 +341,26 @@ fn strip_leading_sql_noise(mut statement: &str) -> &str {
 ///
 /// Only the first few words are examined, which is enough for the multi-word
 /// forms below and keeps a word inside a long string literal from matching.
+/// The scan stops at an inline comment marker, so a trailing
+/// "ALTER TABLE t DETACH PARTITION p -- CONCURRENTLY" comment cannot turn the
+/// statement into a blocker.
 fn statement_head_words(statement: &str, max_words: usize) -> Vec<String> {
-    strip_leading_sql_noise(statement)
-        .split_whitespace()
-        .take(max_words)
-        .map(|word| {
-            word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
-                .to_ascii_uppercase()
-        })
-        .filter(|word| !word.is_empty())
-        .collect()
+    let mut words: Vec<String> = Vec::new();
+    for word in strip_leading_sql_noise(statement).split_whitespace() {
+        if word.starts_with("--") || word.starts_with("/*") {
+            break;
+        }
+        let cleaned = word
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .to_ascii_uppercase();
+        if !cleaned.is_empty() {
+            words.push(cleaned);
+        }
+        if words.len() >= max_words {
+            break;
+        }
+    }
+    words
 }
 
 /// One statement form that cannot run inside a transaction, or None.
@@ -384,7 +394,12 @@ fn statement_atomic_blocker(statement: &str, driver_id: &str) -> Option<&'static
             if first == "DROP" && second == "TABLESPACE" {
                 return Some("DROP TABLESPACE");
             }
-            if first == "CREATE" && has("INDEX") && has("CONCURRENTLY") {
+            // CREATE [UNIQUE] INDEX ... CONCURRENTLY (with or without IF NOT EXISTS).
+            let creates_index = first == "CREATE"
+                && (second == "INDEX"
+                    || (second == "UNIQUE"
+                        && words.get(2).map(String::as_str) == Some("INDEX")));
+            if creates_index && has("CONCURRENTLY") {
                 return Some("CREATE INDEX CONCURRENTLY");
             }
             if first == "DROP" && second == "INDEX" && has("CONCURRENTLY") {
@@ -395,6 +410,16 @@ fn statement_atomic_blocker(statement: &str, driver_id: &str) -> Option<&'static
             }
             if first == "REFRESH" && second == "MATERIALIZED" && has("CONCURRENTLY") {
                 return Some("REFRESH MATERIALIZED VIEW CONCURRENTLY");
+            }
+            // ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY (the plain
+            // non-concurrent form is transactional and must not be blocked).
+            if first == "ALTER"
+                && second == "TABLE"
+                && has("DETACH")
+                && has("PARTITION")
+                && has("CONCURRENTLY")
+            {
+                return Some("ALTER TABLE DETACH PARTITION CONCURRENTLY");
             }
             None
         }
@@ -1500,8 +1525,27 @@ mod tests {
             ("ALTER SYSTEM SET work_mem = '1GB'", "ALTER SYSTEM"),
             ("CREATE INDEX CONCURRENTLY idx ON t (c)", "CREATE INDEX CONCURRENTLY"),
             ("CREATE UNIQUE INDEX CONCURRENTLY idx ON t (c)", "CREATE INDEX CONCURRENTLY"),
+            (
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON t (c)",
+                "CREATE INDEX CONCURRENTLY",
+            ),
+            (
+                "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx ON t (c)",
+                "CREATE INDEX CONCURRENTLY",
+            ),
             ("DROP INDEX CONCURRENTLY idx", "DROP INDEX CONCURRENTLY"),
+            ("DROP INDEX CONCURRENTLY IF EXISTS idx", "DROP INDEX CONCURRENTLY"),
             ("REINDEX TABLE CONCURRENTLY t", "REINDEX CONCURRENTLY"),
+            ("REINDEX (CONCURRENTLY) TABLE t", "REINDEX CONCURRENTLY"),
+            ("REINDEX (VERBOSE, CONCURRENTLY) INDEX idx", "REINDEX CONCURRENTLY"),
+            (
+                "ALTER TABLE ONLY app.tbl DETACH PARTITION app.p CONCURRENTLY",
+                "ALTER TABLE DETACH PARTITION CONCURRENTLY",
+            ),
+            (
+                "alter table if exists t detach partition p concurrently",
+                "ALTER TABLE DETACH PARTITION CONCURRENTLY",
+            ),
             (
                 "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
                 "REFRESH MATERIALIZED VIEW CONCURRENTLY",
@@ -1567,6 +1611,15 @@ CREATE TABLE t (id int);
             "COMMENT ON INDEX idx IS 'concurrently'",
             "CREATE TABLE t (vacuum text, concurrently int)",
             "CREATE TABLE t (id int); -- VACUUM inside a trailing comment\n SELECT 1",
+            // The non-concurrent DETACH PARTITION form is transactional, and a
+            // trailing comment mentioning CONCURRENTLY must not change that.
+            "ALTER TABLE t DETACH PARTITION p",
+            "ALTER TABLE t DETACH PARTITION p -- CONCURRENTLY",
+            "INSERT INTO t VALUES ('ALTER TABLE x DETACH PARTITION y CONCURRENTLY')",
+            // A column named index plus a string containing CONCURRENTLY is not
+            // CREATE INDEX CONCURRENTLY (the prefix must be CREATE [UNIQUE] INDEX).
+            "CREATE TABLE t (index text, note text DEFAULT 'CONCURRENTLY')",
+            "SELECT 'CREATE UNIQUE INDEX CONCURRENTLY'",
         ] {
             assert!(blockers_for("postgres", sql).is_empty(), "{sql}");
         }

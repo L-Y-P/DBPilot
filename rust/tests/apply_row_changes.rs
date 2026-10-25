@@ -161,6 +161,11 @@ async fn sqlite_batch_edits_are_atomic() {
     .await;
     assert_eq!(result["ok"], json!(true), "{result}");
     assert_eq!(result["rows_affected"], json!(4), "{result}");
+    assert_eq!(
+        result["zero_row_results"],
+        json!([]),
+        "every change matched a row: {result}"
+    );
     let results = result["results"].as_array().expect("per-row results");
     assert_eq!(results.len(), 4, "{result}");
     assert_eq!(results[0]["action"], json!("update"));
@@ -216,6 +221,40 @@ async fn sqlite_batch_edits_are_atomic() {
         "the first update must have been rolled back: {rows}"
     );
 
+    // -------- zero-row diagnostics: a key matching nothing is reported, but the
+    // batch still succeeds (not a failure, transaction unchanged). index stays
+    // aligned with the incoming changes array and keys are echoed verbatim.
+    let result = ok(api::explorer::apply_row_changes(
+        "main".into(),
+        "items".into(),
+        json!([
+            { "action": "update", "keys": { "id": 999 }, "values": { "qty": 0 } },
+            { "action": "delete", "keys": { "id": 999 } },
+            { "action": "update", "keys": { "id": 2 }, "values": { "qty": 21 } },
+            { "action": "insert", "values": { "id": 5, "name": "five", "qty": 5 } },
+        ]),
+    ))
+    .await;
+    assert_eq!(result["ok"], json!(true), "{result}");
+    assert_eq!(result["rows_affected"], json!(2), "{result}");
+    let zero_rows = result["zero_row_results"]
+        .as_array()
+        .expect("zero_row_results array");
+    assert_eq!(zero_rows.len(), 2, "{result}");
+    assert_eq!(
+        zero_rows[0],
+        json!({ "index": 0, "action": "update", "keys": { "id": 999 } }),
+        "{result}"
+    );
+    assert_eq!(
+        zero_rows[1],
+        json!({ "index": 1, "action": "delete", "keys": { "id": 999 } }),
+        "{result}"
+    );
+    // The matched update committed; the zero-row items changed nothing.
+    let rows = run("SELECT id, qty FROM items WHERE id IN (2, 999) ORDER BY id").await;
+    assert_eq!(rows["rows"], json!([[2, 21]]), "{rows}");
+
     // -------- validation happens before BEGIN: a bad item changes nothing
     let invalid = api::explorer::apply_row_changes(
         "main".into(),
@@ -240,6 +279,7 @@ async fn sqlite_batch_edits_are_atomic() {
     .await;
     assert_eq!(empty["rows_affected"], json!(0), "{empty}");
     assert_eq!(empty["results"], json!([]), "{empty}");
+    assert_eq!(empty["zero_row_results"], json!([]), "{empty}");
 
     // -------- limit_one: a key made of every column touches a single row
     run("CREATE TABLE dup (name TEXT, qty INTEGER)").await;
@@ -256,6 +296,7 @@ async fn sqlite_batch_edits_are_atomic() {
     ))
     .await;
     assert_eq!(result["rows_affected"], json!(1), "{result}");
+    assert_eq!(result["zero_row_results"], json!([]), "{result}");
     let rows = run("SELECT qty FROM dup ORDER BY qty").await;
     assert_eq!(rows["rows"], json!([[1], [9]]), "{rows}");
 

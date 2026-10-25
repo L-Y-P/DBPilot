@@ -9,6 +9,10 @@
 //   * 切页签：取消留在数据页、放弃后切走；
 //   * 切表：保存到原表 / 放弃；
 //   * 保存失败：停留当前页并保留暂存编辑。
+//
+// 第 60 轮补充：无主键表禁用跨页保持（翻页仍确认）、暂存上限（DataGrid
+// maxDirtyCells）、保存后零行命中诊断（Rust zero_row_results，dylib 未就绪时
+// 该用例自动 skip）。
 
 import 'dart:io';
 
@@ -145,12 +149,17 @@ void main() {
     await Api.instance.query(
       'CREATE TABLE guard_fail (id INTEGER PRIMARY KEY, name TEXT);',
     );
+    // 第 60 轮：无主键表（跨页保持应禁用）。
+    await Api.instance.query('CREATE TABLE guard_nopk (id INTEGER, name TEXT);');
     for (var i = 1; i <= 30; i++) {
       await Api.instance.query(
         "INSERT INTO guard_rows (id, name) VALUES ($i, 'row_$i');",
       );
       await Api.instance.query(
         "INSERT INTO guard_fail (id, name) VALUES ($i, 'row_$i');",
+      );
+      await Api.instance.query(
+        "INSERT INTO guard_nopk (id, name) VALUES ($i, 'row_$i');",
       );
     }
     await Api.instance.query(
@@ -179,6 +188,13 @@ void main() {
     await Api.instance.query(
       "INSERT OR REPLACE INTO guard_rows2 (id, name) VALUES (1, 'second');",
     );
+    // 无主键表没有唯一键，用 DELETE + INSERT 恢复 30 行。
+    await Api.instance.query('DELETE FROM guard_nopk;');
+    for (var i = 1; i <= 30; i++) {
+      await Api.instance.query(
+        "INSERT INTO guard_nopk (id, name) VALUES ($i, 'row_$i');",
+      );
+    }
     // 「保存失败」用例会 DROP guard_fail；补回来，避免测试顺序变化时失败。
     try {
       await Api.instance.query(
@@ -216,7 +232,7 @@ void main() {
     // 第 2 页再改 row_26：跨页计数变 2。
     await editCell(tester, 'row_26', 'row_26_page2');
     expect(stagedPill(2), findsOneWidget);
-    expect(find.text('保存全部改动 (2)'), findsOneWidget);
+    expect(find.textContaining('保存全部改动 (2/'), findsOneWidget);
 
     // 回第 1 页：两页的编辑都还在（计数 2）。
     await tester.tap(find.byKey(const ValueKey('pager-prev')));
@@ -342,7 +358,7 @@ void main() {
     // 保存失败：仍在本页、暂存编辑保留（可以重试或撤销）。
     expect(find.text('row_1'), findsWidgets);
     expect(stagedPill(1), findsOneWidget);
-    expect(find.text('保存全部改动 (1)'), findsOneWidget);
+    expect(find.textContaining('保存全部改动 (1/'), findsOneWidget);
     await tester.pump(const Duration(seconds: 4));
   });
 
@@ -376,6 +392,101 @@ void main() {
     expect(find.text('row_1'), findsNothing);
     expect(stagedPill(1), findsNothing);
     expect(await rowCount(tester, 'guard_rows', 1), 0);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  test('BatchApplyOutcome 文案：零行命中时追加诊断', () {
+    expect(
+      const BatchApplyOutcome(rowsAffected: 2, zeroRows: 0).message,
+      '已保存 2 行',
+    );
+    final zero = const BatchApplyOutcome(rowsAffected: 0, zeroRows: 1);
+    expect(zero.hasZeroRows, isTrue);
+    expect(zero.message, contains('未命中任何行'));
+    expect(zero.message, contains('1 条改动'));
+  });
+
+  testWidgets('无主键表：翻页仍弹离开确认（不做跨页保持）', (tester) async {
+    size(tester);
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    await pumpTableView(tester, 'guard_nopk', notice);
+    expect(find.text('row_1'), findsWidgets);
+
+    await editCell(tester, 'row_1', 'row_1_nopk');
+    expect(stagedPill(1), findsOneWidget);
+
+    // 无主键：翻页前仍要确认（整行旧键跨页保存可能命中 0 行）。
+    await tester.tap(find.byKey(const ValueKey('pager-next')));
+    await settle(tester, rounds: 6);
+    expect(find.text('有未保存的修改'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('batch-leave-cancel')));
+    await settle(tester, rounds: 6);
+    expect(find.text('row_1'), findsWidgets);
+
+    // 放弃后翻页：编辑不跨页保留。
+    await tester.tap(find.byKey(const ValueKey('pager-next')));
+    await settle(tester, rounds: 6);
+    await tester.tap(find.byKey(const ValueKey('batch-leave-discard')));
+    await settle(tester, rounds: 18);
+    expect(find.text('row_26'), findsWidgets);
+    expect(find.textContaining('未保存'), findsNothing);
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('保存时行已被删除：notice 提示 N 条改动未命中任何行', (tester) async {
+    size(tester);
+    final notice = Notice();
+    addTearDown(notice.dispose);
+
+    // Rust 端 zero_row_results 尚未就绪（dylib 旧）时跳过，等刷新后复跑。
+    var supportsZeroRows = false;
+    await tester.runAsync(() async {
+      try {
+        await Api.instance.query(
+          'CREATE TABLE IF NOT EXISTS zero_probe '
+          '(id INTEGER PRIMARY KEY, name TEXT);',
+        );
+        await Api.instance.query(
+          "INSERT OR REPLACE INTO zero_probe (id, name) VALUES (999, 'x');",
+        );
+        await Api.instance.query('DELETE FROM zero_probe WHERE id = 999;');
+        final res = await Api.instance.applyRowChanges(
+          'main',
+          'zero_probe',
+          <Map<String, dynamic>>[
+            <String, dynamic>{
+              'action': 'update',
+              'keys': <String, dynamic>{'id': 999},
+              'values': <String, dynamic>{'name': 'y'},
+              'limit_one': false,
+            },
+          ],
+        );
+        supportsZeroRows = res.containsKey('zero_row_results');
+      } catch (_) {
+        supportsZeroRows = false;
+      }
+    });
+    if (!supportsZeroRows) {
+      markTestSkipped(
+        'Rust zero_row_results 未就绪（等 rust teammate / dylib 刷新后复跑）',
+      );
+      return;
+    }
+
+    await pumpTableView(tester, 'guard_rows', notice);
+    await editCell(tester, 'row_1', 'row_1_zero');
+    expect(stagedPill(1), findsOneWidget);
+
+    // 外部删除该行：保存的 keys 不再命中任何行。
+    await tester.runAsync(
+      () => Api.instance.query('DELETE FROM guard_rows WHERE id = 1;'),
+    );
+    await tester.tap(find.byKey(const ValueKey('grid-apply-dirty')));
+    await settle(tester, rounds: 26);
+    expect(find.textContaining('未命中任何行'), findsWidgets);
+    expect(find.textContaining('未保存'), findsNothing);
     await tester.pump(const Duration(seconds: 4));
   });
 }

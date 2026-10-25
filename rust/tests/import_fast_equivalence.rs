@@ -574,6 +574,15 @@ async fn fast_csv_path_matches_legacy_rows_and_errors() {
             "pipeline skip key {key}: fast={fast_dup_skip} legacy={legacy_dup_skip}"
         );
     }
+    // Issue order must also match the serial event order (table name differs
+    // between the two target tables, so normalise it first).
+    let fast_issues = fast_dup_skip["result"]["issues"]
+        .to_string()
+        .replace("ps_fast", "t");
+    let legacy_issues = legacy_dup_skip["result"]["issues"]
+        .to_string()
+        .replace("ps_legacy", "t");
+    assert_eq!(fast_issues, legacy_issues, "pipeline skip issues order");
     assert_eq!(
         table_rows("ps_fast", "id, name, age").await,
         table_rows("ps_legacy", "id, name, age").await

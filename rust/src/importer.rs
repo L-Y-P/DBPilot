@@ -4002,7 +4002,9 @@ struct PipelineBatchOutcome {
 struct PipelineShared {
     rows_inserted: u64,
     rows_failed_consumer: u64,
-    consumer_issues: Vec<Value>,
+    /// (batch sequence, issue) so the final list can be merged in the serial
+    /// path's event order rather than the consumer's completion order.
+    consumer_issues: Vec<(u64, Value)>,
     db_ns: u128,
     batches_done: u64,
     failure: Option<PipelineFailure>,
@@ -4038,7 +4040,15 @@ async fn pipeline_consumer_task(
             }
             guard.rows_inserted += outcome.inserted;
             guard.rows_failed_consumer += outcome.failed;
-            guard.consumer_issues.extend(outcome.issues);
+            let seq = outcome.batch.seq;
+            if guard.consumer_issues.len() < max_issues {
+                for issue in outcome.issues {
+                    if guard.consumer_issues.len() >= max_issues {
+                        break;
+                    }
+                    guard.consumer_issues.push((seq, issue));
+                }
+            }
             guard.batches_done += 1;
         }
         let mut batch = outcome.batch;
@@ -4747,8 +4757,40 @@ async fn execute_delimited_fast(
             pipeline_db_failure = true;
         } else {
             rows_failed += rows_failed_consumer;
-            issues.extend(consumer_issues);
-            issues.truncate(max_issues);
+            // Merge producer issues and consumer issues in the serial path's
+            // event order: for each batch, parsing/conversion issues up to that
+            // batch's checkpoint come first, then the DB issues produced when
+            // that batch was executed.  Trailing producer issues belong to the
+            // current partial batch.
+            let mut merged: Vec<Value> = Vec::with_capacity(
+                (issues.len() + consumer_issues.len()).min(max_issues),
+            );
+            let mut producer_pos = 0usize;
+            let mut consumer_pos = 0usize;
+            for (seq, checkpoint) in pipeline_checkpoints.iter().enumerate() {
+                let end = checkpoint.issues_len.min(issues.len());
+                while producer_pos < end && merged.len() < max_issues {
+                    merged.push(issues[producer_pos].clone());
+                    producer_pos += 1;
+                }
+                while consumer_pos < consumer_issues.len()
+                    && consumer_issues[consumer_pos].0 == seq as u64
+                {
+                    if merged.len() < max_issues {
+                        merged.push(consumer_issues[consumer_pos].1.clone());
+                    }
+                    consumer_pos += 1;
+                }
+            }
+            while producer_pos < issues.len() && merged.len() < max_issues {
+                merged.push(issues[producer_pos].clone());
+                producer_pos += 1;
+            }
+            while consumer_pos < consumer_issues.len() && merged.len() < max_issues {
+                merged.push(consumer_issues[consumer_pos].1.clone());
+                consumer_pos += 1;
+            }
+            issues = merged;
         }
     } else {
         // Complete batches already queued for a grouped transaction must still

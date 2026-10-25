@@ -21,33 +21,61 @@ import 'widgets.dart';
 /// 词汇。快速建表向导与新建表设计器共用这里，保证两个入口的说法一致。
 bool get _chinese => I18n.current != AppLang.en;
 
-/// 类型名（去掉长度/精度/枚举取值后的族名）。
+/// 是否带 MySQL 的 UNSIGNED 后缀（大小写不敏感，忽略前后空白）。
+bool _isUnsigned(String sqlType) =>
+    RegExp(r'\bUNSIGNED\b', caseSensitive: false).hasMatch(sqlType);
+
+/// 类型名（去掉长度/精度/枚举取值、UNSIGNED 后缀与多词别名后的族名）。
+///
+/// 数据库返回的写法很多：MySQL 的 `INT(11) UNSIGNED`、PostgreSQL 的
+/// `double precision` / `character varying(255)` / `timestamp with time zone`。
+/// 归一化后同一个「族」落到同一个 switch 分支，避免这些常见写法掉进
+/// `default` 原样显示英文（第 51 轮 P2-1）。
 String _typeFamily(String sqlType) {
   final upper = sqlType.trim().toUpperCase();
   if (upper.isEmpty) return '';
   // 带参数的写法：DECIMAL(18,2) / VARCHAR(255) / ENUM('a','b') / TIMESTAMP(3)。
   final paren = upper.indexOf('(');
-  final head = paren >= 0 ? upper.substring(0, paren).trim() : upper;
-  return head;
+  var head = (paren >= 0 ? upper.substring(0, paren) : upper).trim();
+  // MySQL 的 UNSIGNED / ZEROFILL 是列的属性，不是类型族名。
+  head = head.replaceAll(RegExp(r'\s+(UNSIGNED|ZEROFILL)\b'), '').trim();
+  switch (head) {
+    case 'DOUBLE PRECISION':
+      return 'DOUBLE';
+    case 'CHARACTER VARYING':
+      return 'VARCHAR';
+    case 'TIMESTAMP WITH TIME ZONE':
+      return 'TIMESTAMPTZ';
+    case 'TIMESTAMP WITHOUT TIME ZONE':
+      return 'TIMESTAMP';
+    case 'TIME WITH TIME ZONE':
+      return 'TIMETZ';
+    case 'TIME WITHOUT TIME ZONE':
+      return 'TIME';
+    default:
+      final first = head.split(RegExp(r'\s+')).first;
+      return first;
+  }
 }
 
 /// 中文模式下的一句话类型说明（用于菜单/悬停提示）。
 String _typeDescription(String sqlType) {
   final family = _typeFamily(sqlType);
+  final unsigned = _isUnsigned(sqlType);
   switch (family) {
     case 'TINYINT':
       // MySQL 的 TINYINT(1) 是布尔约定；其余 TINYINT 仍是整数。
       if (sqlType.toUpperCase().contains('(1)')) {
         return '只有「是 / 否」两种取值';
       }
-      return '很小的整数，适合状态、等级等';
+      return unsigned ? '很小的非负整数，适合状态、等级等' : '很小的整数，适合状态、等级等';
     case 'SMALLINT':
     case 'MEDIUMINT':
     case 'INT':
     case 'INTEGER':
-      return '整数，适合编号、数量等没有小数的值';
+      return unsigned ? '非负整数，适合编号、数量等' : '整数，适合编号、数量等没有小数的值';
     case 'BIGINT':
-      return '大整数，常用作自增主键';
+      return unsigned ? '非负大整数，常用作自增主键' : '大整数，常用作自增主键';
     case 'SERIAL':
     case 'BIGSERIAL':
     case 'SMALLSERIAL':
@@ -62,6 +90,7 @@ String _typeDescription(String sqlType) {
       return '近似小数，适合比率、科学计算等';
     case 'BOOLEAN':
     case 'BOOL':
+    case 'BIT':
       return '只有「是 / 否」两种取值';
     case 'DATE':
       return '只记录年月日';
@@ -82,6 +111,8 @@ String _typeDescription(String sqlType) {
     case 'CHAR':
     case 'CHARACTER':
       return '有长度上限的文本';
+    case 'CITEXT':
+      return '不区分大小写的文本，适合邮箱等';
     case 'JSON':
     case 'JSONB':
       return 'JSON 数据，适合结构不固定的内容';
@@ -89,6 +120,9 @@ String _typeDescription(String sqlType) {
     case 'SET':
       return '只能取列出的几个值之一';
     case 'BLOB':
+    case 'TINYBLOB':
+    case 'MEDIUMBLOB':
+    case 'LONGBLOB':
     case 'BINARY':
     case 'VARBINARY':
     case 'BYTEA':
@@ -97,8 +131,6 @@ String _typeDescription(String sqlType) {
       return '只有年份';
     case 'UUID':
       return '全局唯一标识符';
-    case 'BIT':
-      return '位值（0 / 1）';
     case 'XML':
       return 'XML 文本';
     case 'INTERVAL':
@@ -119,18 +151,21 @@ String _typeDescription(String sqlType) {
 /// 英文模式下的一句话类型说明（用于菜单/悬停提示）。
 String _typeDescriptionEn(String sqlType) {
   final family = _typeFamily(sqlType);
+  final unsigned = _isUnsigned(sqlType);
   switch (family) {
     case 'TINYINT':
       return sqlType.toUpperCase().contains('(1)')
           ? 'true / false'
-          : 'small integer';
+          : (unsigned ? 'small non-negative integer' : 'small integer');
     case 'SMALLINT':
     case 'MEDIUMINT':
     case 'INT':
     case 'INTEGER':
-      return 'whole numbers';
+      return unsigned ? 'non-negative whole numbers' : 'whole numbers';
     case 'BIGINT':
-      return 'large integers, common for auto-increment keys';
+      return unsigned
+          ? 'large non-negative integers, common for auto-increment keys'
+          : 'large integers, common for auto-increment keys';
     case 'SERIAL':
     case 'BIGSERIAL':
     case 'SMALLSERIAL':
@@ -145,6 +180,7 @@ String _typeDescriptionEn(String sqlType) {
       return 'approximate decimal numbers';
     case 'BOOLEAN':
     case 'BOOL':
+    case 'BIT':
       return 'true / false';
     case 'DATE':
       return 'calendar date';
@@ -165,6 +201,8 @@ String _typeDescriptionEn(String sqlType) {
     case 'CHAR':
     case 'CHARACTER':
       return 'text with a length limit';
+    case 'CITEXT':
+      return 'case-insensitive text';
     case 'JSON':
     case 'JSONB':
       return 'JSON document';
@@ -172,10 +210,17 @@ String _typeDescriptionEn(String sqlType) {
     case 'SET':
       return 'one of a fixed set of values';
     case 'BLOB':
+    case 'TINYBLOB':
+    case 'MEDIUMBLOB':
+    case 'LONGBLOB':
     case 'BINARY':
     case 'VARBINARY':
     case 'BYTEA':
       return 'binary data';
+    case 'UUID':
+      return 'globally unique identifier';
+    case 'XML':
+      return 'XML text';
     default:
       return '';
   }
@@ -185,16 +230,18 @@ String _typeDescriptionEn(String sqlType) {
 String columnTypeLabel(String sqlType) {
   if (!_chinese) return sqlType;
   final family = _typeFamily(sqlType);
+  final unsigned = _isUnsigned(sqlType);
   switch (family) {
     case 'TINYINT':
-      return sqlType.toUpperCase().contains('(1)') ? '布尔' : '整数';
+      if (sqlType.toUpperCase().contains('(1)')) return '布尔';
+      return unsigned ? '无符号小整数' : '整数';
     case 'SMALLINT':
     case 'MEDIUMINT':
     case 'INT':
     case 'INTEGER':
-      return '整数';
+      return unsigned ? '无符号整数' : '整数';
     case 'BIGINT':
-      return '大整数';
+      return unsigned ? '无符号大整数' : '大整数';
     case 'SERIAL':
     case 'SMALLSERIAL':
       return '自增整数';
@@ -231,6 +278,8 @@ String columnTypeLabel(String sqlType) {
     case 'CHARACTER':
       // 长度是用户需要看到的差异（TEXT 与 VARCHAR(255) 的约束不同）。
       return '文本（' + sqlType + '）';
+    case 'CITEXT':
+      return '不区分大小写的文本';
     case 'JSON':
     case 'JSONB':
       return 'JSON 数据';
@@ -238,6 +287,9 @@ String columnTypeLabel(String sqlType) {
     case 'SET':
       return '枚举';
     case 'BLOB':
+    case 'TINYBLOB':
+    case 'MEDIUMBLOB':
+    case 'LONGBLOB':
     case 'BINARY':
     case 'VARBINARY':
     case 'BYTEA':
@@ -265,14 +317,23 @@ String columnTypeLabel(String sqlType) {
   }
 }
 
+/// 「中文名（SQL token）」；label 自己已经带了 SQL token 时不再重复拼接。
+///
+/// 第 51 轮 P2-1：VARCHAR / CHAR 的 label 本身就是「文本（VARCHAR(255)）」，
+/// 早期这里又追加了一次 token，导致菜单里出现
+/// 「文本（VARCHAR(255)）（VARCHAR(255)）」。
+String _labelWithSqlType(String label, String sqlType) {
+  if (label == sqlType) return sqlType;
+  if (label.contains(sqlType)) return label;
+  return label + '（' + sqlType + '）';
+}
+
 /// 下拉菜单里的类型标签：中文名 + 括号 SQL token；英文模式只显示 SQL 类型。
 ///
 /// 未知类型（用户手输的自定义类型）直接返回原文，避免出现「FOO（FOO）」。
 String columnTypeMenuLabel(String sqlType) {
   if (!_chinese) return sqlType;
-  final label = columnTypeLabel(sqlType);
-  if (label == sqlType) return sqlType;
-  return label + '（' + sqlType + '）';
+  return _labelWithSqlType(columnTypeLabel(sqlType), sqlType);
 }
 
 /// 类型控件/菜单项的悬停说明：中文名（SQL token）：一句话解释。
@@ -284,8 +345,7 @@ String columnTypeTooltip(String sqlType) {
     return description.isEmpty ? sqlType : sqlType + ': ' + description;
   }
   final description = _typeDescription(sqlType);
-  final label = columnTypeLabel(sqlType);
-  final head = label == sqlType ? sqlType : label + '（' + sqlType + '）';
+  final head = _labelWithSqlType(columnTypeLabel(sqlType), sqlType);
   return description.isEmpty ? head : head + '：' + description;
 }
 
@@ -397,8 +457,7 @@ class ColumnTypePicker extends StatelessWidget {
 /// 英文模式返回原文 SQL 类型，不做任何翻译。
 String columnTypeSummary(String sqlType) {
   if (!_chinese) return sqlType;
-  final label = columnTypeLabel(sqlType);
-  return label == sqlType ? sqlType : label + '（' + sqlType + '）';
+  return _labelWithSqlType(columnTypeLabel(sqlType), sqlType);
 }
 
 /// 便于在无 BuildContext 的纯逻辑里按当前语言取文案（测试用）。

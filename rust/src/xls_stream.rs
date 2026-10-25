@@ -130,9 +130,13 @@ enum CellFormat {
 }
 
 /// 内建数字格式号 → 日期/时长（与 excel_stream 的 xlsx 路径同一张表）。
+///
+/// 27–36、50–58 是 ECMA-376 预留给区域设置的日期/时间内建格式（CJK 版 Excel、
+/// LibreOffice 常见）；漏掉会让日期按序列号读成整数。37–44 是会计/数值格式，
+/// 不要并进来。
 fn builtin_format(id: u16) -> CellFormat {
     match id {
-        14..=22 | 45 | 47 => CellFormat::DateTime,
+        14..=22 | 27..=36 | 45 | 47 | 50..=58 => CellFormat::DateTime,
         46 => CellFormat::TimeDelta,
         _ => CellFormat::Other,
     }
@@ -1972,6 +1976,17 @@ mod tests {
         assert_eq!(info.hidden_sheets, 1);
         assert_eq!(info.sheets.len(), 1);
         assert_eq!(info.sheets[0].name, "可见");
+        // hidden_sheets 必须穿过 excel_stream 的统一 InspectInfo（xls_inspect_info），
+        // importer::inspect_excel 才会追加「已忽略 N 个隐藏工作表」warning；
+        // 与 xlsx / xlsb 两条路径对齐。
+        // 注：仓库里的 excel_multi.xls fixture 只有 3 张可见表、没有隐藏表，
+        // 所以隐藏表场景只能用这里合成的 BIFF8 工作簿覆盖。
+        let unified =
+            crate::excel_stream::inspect_workbook(&path, crate::excel_import::ExcelKind::Xls)
+                .expect("inspect_workbook");
+        assert_eq!(unified.hidden_sheets, 1);
+        assert_eq!(unified.sheets.len(), 1);
+        assert_eq!(unified.sheet, "可见");
         let mut sheet = open_sheet(&path, None, 0).expect("open");
         assert_eq!(read_all(&mut sheet).len(), 2);
         // 隐藏表按名字选不到。
@@ -2044,6 +2059,41 @@ mod tests {
         let rows = read_all(&mut sheet);
         assert_eq!(rows[0], serde_json::json!(["36:00:00"]), "{rows:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn east_asian_builtin_formats_resolve_serial_to_date() {
+        // 27–36 / 50–58 是 CJK 等区域设置的日期时间内建格式；37–44 是会计/数值格式。
+        for id in [14u16, 22, 27, 28, 31, 36, 50, 55, 58] {
+            assert_eq!(builtin_format(id), CellFormat::DateTime, "ifmt={id}");
+        }
+        for id in [0u16, 37, 38, 39, 40, 41, 42, 43, 44, 49, 59] {
+            assert_eq!(builtin_format(id), CellFormat::Other, "ifmt={id}");
+        }
+        assert_eq!(builtin_format(46), CellFormat::TimeDelta);
+
+        // 45000 = 2023-03-15（1900 日期系统）；fmt 27/31/55 必须给出日期串而不是整数。
+        for ifmt in [27u16, 31, 55] {
+            let path = write_xls(&build(
+                vec![date_xf(ifmt)],
+                vec![TestSheet {
+                    name: "日期",
+                    hidden: false,
+                    records: vec![number_cell(0, 0, 0, 45_000.0)],
+                    dims: (0, 1, 0, 1),
+                }],
+                None,
+                Vec::new(),
+            ));
+            let mut sheet = open_sheet(&path, None, 0).expect("open");
+            let rows = read_all(&mut sheet);
+            assert_eq!(
+                rows[0],
+                serde_json::json!(["2023-03-15"]),
+                "ifmt={ifmt}: {rows:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

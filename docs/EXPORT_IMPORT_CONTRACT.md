@@ -115,8 +115,9 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
     "sample_count": 500,             // 实际扫描的数据行数（表头之后，最多 1000）
     "columns": [
       { "name": "id", "source": 0, "type": "integer", "nullable": false,
-        "max_length": 0, "primary_candidate": true, "samples": [1, 2, 3] },
-      { "name": "姓名", "source": 1, "type": "text", "nullable": true, "max_length": 2 },
+        "max_length": 0, "unique": true, "primary_candidate": true,
+        "primary_candidate_reason": "id", "samples": [1, 2, 3] },
+      { "name": "姓名", "source": 1, "type": "text", "nullable": true, "max_length": 255 },
       { "name": "评分", "source": 4, "type": "decimal", "nullable": false }
     ]
   }
@@ -130,10 +131,19 @@ Excel 的一行在引擎里就是一段 JSON 数组文本（`["a", 1, true, null
   `integer`，否则 `bigint`；有小数 → `decimal`；布尔（bool/true/false/是/否，含 0/1
   混合且 ≥90%）→ `boolean`；100% 匹配日期/日期时间/时间格式的字符串 → `date`/
   `datetime`/`time`；100% 可解析为数字的字符串列按数字类型；其余 `text`
-  （`max_length` 为最大字符数）。
+  （`max_length` 是**建表推荐长度**，不是样本最大字符数：样本 ≤127 字符时给 255
+  （至少 2 倍余量，避免文员之后录入稍长的姓名/班级就触发严格模式 1406 错误）；
+  超过 127 字符给 0，Dart 侧落 TEXT。非文本列为 0。）
 - `name`：表头名（保留中文），空白/引号/控制字符替换为 `_`，重复加 `_2`，空表头为
   `column_N`；DDL 侧负责 quote 标识符。
-- `primary_candidate`：列名 `id`（忽略大小写）或表头第一列且非空唯一。
+- `unique`：该列在样本内无重复非空值、无空值且至少一个非空值（第 52 轮新增）。
+- `primary_candidate` / `primary_candidate_reason`：每张表最多一个候选，按优先级
+  选一个（第 52 轮扩展；只影响建表建议，不改类型推断本身）：
+  1. 列名 `id`（忽略大小写）→ `id`；
+  2. 最早的样本内唯一整数列（学号/订单号/工号这类自然键）→ `unique_integer`；
+  3. 第一列且样本内唯一的短文本列（≤64 字符）→ `first_column`；
+  4. 没有候选时 `primary_candidate=false`，reason 为空串。
+  `unique_integer` / `first_column` 是「按样本猜的」，Dart 侧默认选中并提示用户可改。
 - `samples`：最多 3 个去重后的样本值（`1.0` 这类整数值会规范成 `1`）。
 - 非 Excel 格式同样返回 schema（CSV 数字列也能直接建表）。
 

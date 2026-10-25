@@ -26,6 +26,7 @@ import 'package:rust_myadmin_desktop/src/shell.dart';
 import 'package:rust_myadmin_desktop/src/text.dart';
 import 'package:rust_myadmin_desktop/src/theme.dart';
 import 'package:rust_myadmin_desktop/src/tooltip.dart';
+import 'package:rust_myadmin_desktop/src/views/relation_designer.dart';
 
 final RegExp _han = RegExp(r'[\u4e00-\u9fff]');
 
@@ -242,5 +243,50 @@ void main() {
     // through its header button rather than the shared dialog-close key.
     await tester.tap(find.byTooltip('Close').last);
     await _settle(tester, rounds: 2);
+
+    // The E-R relation designer (round 51 P2-12): empty state, add-table picker,
+    // canvas toolbar/legend, suggestion help and the blocked-FK dialog must all
+    // render English copy. It is not reachable through the route walk above, so
+    // mount it directly with the same SQLite connection.
+    await tester.pumpWidget(
+      MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: buildAppTheme(),
+        home: Scaffold(
+          body: RelationDesigner(database: 'main', height: 520),
+        ),
+      ),
+    );
+    await _settle(tester);
+    _expectNoChinese(tester, 'E-R designer (empty state)');
+    await tester.tap(find.byKey(const ValueKey('er-empty-add-table')));
+    await _settle(tester, rounds: 4);
+    _expectNoChinese(tester, 'E-R add-table picker');
+    await tester.tap(find.byKey(const ValueKey('er-picker-people')));
+    await _settle(tester, rounds: 2);
+    await tester.tap(find.byKey(const ValueKey('er-picker-join')));
+    await _settle(tester);
+    _expectNoChinese(tester, 'E-R designer canvas');
+    await tester.tap(find.byKey(const ValueKey('er-suggestion-help')));
+    await _settle(tester, rounds: 3);
+    _expectNoChinese(tester, 'E-R suggestion help');
+    await tester.tap(find.byKey(const ValueKey('dialog-close')));
+    await _settle(tester, rounds: 3);
+
+    // The local FK pre-check dialog ("Back to worksheets and fields").
+    var backCalled = false;
+    final blocked = showForeignKeyBlockedDialog(
+      tester.element(find.byType(RelationDesigner)),
+      message: 'Blocked by the local pre-check',
+      onRequestEditFields: () => backCalled = true,
+    );
+    await _settle(tester, rounds: 3);
+    expect(find.text('Cannot create the foreign key'), findsOneWidget);
+    _expectNoChinese(tester, 'blocked foreign-key dialog');
+    expect(find.text('Back to worksheets and fields'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-back-to-fields')));
+    await _settle(tester, rounds: 3);
+    await blocked;
+    expect(backCalled, isTrue);
   });
 }

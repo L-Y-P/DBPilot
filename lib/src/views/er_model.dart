@@ -1536,9 +1536,13 @@ String? suggestedForeignKeyBase(String column) {
 
 /// 按列名推导「建议关系」。
 ///
-/// 只对还没有外键的表推导；列名 `x_id` / `xId` 指向画布上表 x / xs / xes
-/// （y -> ies）的单列主键。返回的 ErRelation 带 [ErRelationOrigin.suggested]，
-/// 由画布画成虚线，用户点「建立建议外键」后才会真正写库。
+/// 只跳过「已经有外键的本地列」和「与已有外键完全相同的目标」；同一张表上
+/// 其它还没有外键的 `x_id` 列仍然会推导（第 51 轮 P2-7：应用第 1 条建议后
+/// 其余建议不能整批消失，允许逐步补齐）。
+///
+/// 列名 `x_id` / `xId` 指向画布上表 x / xs / xes（y -> ies）的单列主键。
+/// 返回的 ErRelation 带 [ErRelationOrigin.suggested]，由画布画成虚线，用户点
+/// 「建立建议外键」后才会真正写库。
 ///
 /// [maxResults] 限制虚线建议边数量（默认 20，支持 10 张表的批次）：一批宽表
 /// 可能推出几十条建议，全画出来会让画布拥挤、命中检测变慢；剩下的可以在应用
@@ -1556,16 +1560,31 @@ List<ErRelation> suggestRelations({
   for (final table in tables) {
     if (out.length >= limit) break;
     final existing = relationsByTable[table.name] ?? const <ErRelation>[];
-    if (existing.isNotEmpty) continue; // 已有外键的表不再建议
+    // 已有外键占用的本地列不再建议；已有外键的「目标列」也去重，避免对同一条
+    // 关系重复画出建议虚线。
+    final existingLocalColumns = <String>{
+      for (final relation in existing)
+        if (relation.localColumn.isNotEmpty) relation.localColumn,
+    };
+    final existingTargets = <String>{
+      for (final relation in existing)
+        if (relation.refTable.isNotEmpty && relation.refColumn.isNotEmpty)
+          '${relation.refTable}.${relation.refColumn}'.toLowerCase(),
+    };
     for (final column in table.columns) {
       if (out.length >= limit) break;
       if (column.primary) continue;
+      if (column.foreignKey || existingLocalColumns.contains(column.name)) {
+        continue;
+      }
       final base = suggestedForeignKeyBase(column.name);
       if (base == null) continue;
       final target = _suggestedTarget(base, table, byLowerName);
       if (target == null) continue;
       final primary = target.singlePrimaryColumn;
       if (primary == null) continue;
+      final targetKey = '${target.name}.${primary.name}'.toLowerCase();
+      if (existingTargets.contains(targetKey)) continue;
       out.add(
         ErRelation(
           localTable: table.name,
@@ -1727,6 +1746,9 @@ ErTypeFamily erTypeFamily(String rawType) {
 
 /// 粗粒度类型兼容性：只拦明显不兼容的组合（整数/小数 vs 文本/日期/二进制），
 /// 拿不准（空类型、自定义类型）返回 true，交给数据库给出精确错误。
+///
+/// 这是第一层过滤；外键前置校验还要再过 [erForeignKeyTypesCompatible] 的数值
+/// 精确比较（整数位宽 / UNSIGNED / DECIMAL 精度）。
 bool erTypesCompatible(String localType, String refType) {
   final a = erTypeFamily(localType);
   final b = erTypeFamily(refType);
@@ -1740,6 +1762,103 @@ bool erTypesCompatible(String localType, String refType) {
   return false;
 }
 
+/// 类型名（去掉括号参数、UNSIGNED / ZEROFILL 后缀后的大写族名）。
+String _erTypeHead(String rawType) {
+  final upper = rawType.trim().toUpperCase();
+  if (upper.isEmpty) return '';
+  final paren = upper.indexOf('(');
+  var head = (paren >= 0 ? upper.substring(0, paren) : upper).trim();
+  head = head.replaceAll(RegExp(r'\s+(UNSIGNED|ZEROFILL)\b'), '').trim();
+  final first = head.split(RegExp(r'\s+')).first;
+  // 多词别名（PostgreSQL 的 DOUBLE PRECISION）单独归一化。
+  if (head.startsWith('DOUBLE PRECISION')) return 'DOUBLE PRECISION';
+  return first;
+}
+
+/// 整数族的「精确身份」：位宽 + 是否有符号（例如 `32:u` / `64:s`）。
+///
+/// MySQL 外键要求两列的整数位宽与 UNSIGNED 完全一致（否则 ERROR 3780）；
+/// PostgreSQL 则要求类型相同。SERIAL 族按 PostgreSQL 语义归一到对应位宽
+/// （SMALLSERIAL=16、SERIAL=32、BIGSERIAL=64，均有符号；MySQL 的 SERIAL 是
+/// BIGINT UNSIGNED，但类型下拉不提供它，这里不特判）。
+///
+/// 不是整数族（含 BOOLEAN——它在 MySQL 是 TINYINT(1)，但语义上按粗粒度处理）
+/// 返回 null。
+String? erIntegerTypeSignature(String rawType) {
+  final head = _erTypeHead(rawType);
+  int? bits;
+  switch (head) {
+    case 'TINYINT':
+      bits = 8;
+    case 'SMALLINT':
+      bits = 16;
+    case 'MEDIUMINT':
+      bits = 24;
+    case 'INT':
+    case 'INTEGER':
+    case 'INT4':
+      bits = 32;
+    case 'BIGINT':
+    case 'INT8':
+      bits = 64;
+    case 'SMALLINT2':
+    case 'INT2':
+      bits = 16;
+    case 'SMALLSERIAL':
+      bits = 16;
+    case 'SERIAL':
+    case 'SERIAL4':
+      bits = 32;
+    case 'BIGSERIAL':
+    case 'SERIAL8':
+      bits = 64;
+    default:
+      return null;
+  }
+  final unsigned = RegExp(
+    r'\bUNSIGNED\b',
+    caseSensitive: false,
+  ).hasMatch(rawType);
+  return '$bits:${unsigned ? 'u' : 's'}';
+}
+
+/// DECIMAL / NUMERIC 的精确身份：`precision,scale`。
+///
+/// 没有显式写参数（数据库默认值各家不同，例如 MySQL DECIMAL 默认 (10,0)，
+/// PostgreSQL 的 NUMERIC 不限制精度）时返回 null，交给数据库判断。
+String? erDecimalTypeSignature(String rawType) {
+  final upper = rawType.trim().toUpperCase();
+  final head = _erTypeHead(upper);
+  if (head != 'DECIMAL' && head != 'NUMERIC' && head != 'DEC') return null;
+  final match = RegExp(
+    r'\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)',
+  ).firstMatch(upper);
+  if (match == null) return null;
+  final precision = match.group(1);
+  final scale = match.group(2) ?? '0';
+  return '$precision,$scale';
+}
+
+/// 外键类型兼容：粗粒度过滤 + 数值类型精确比较。
+///
+/// 1. 先过 [erTypesCompatible]（整数/文本/日期等明显不兼容的组合）；
+/// 2. 整数族比较「位宽 + 是否有符号」（INT vs BIGINT、INT vs INT UNSIGNED 都
+///    会被拦住，而不是等数据库报 ERROR 3780）；
+/// 3. DECIMAL / NUMERIC 比较 precision / scale；
+/// 4. 其余（浮点之间、拿不到信息的类型）保持粗粒度放行。
+bool erForeignKeyTypesCompatible(String localType, String refType) {
+  if (!erTypesCompatible(localType, refType)) return false;
+  final localInt = erIntegerTypeSignature(localType);
+  final refInt = erIntegerTypeSignature(refType);
+  if (localInt != null && refInt != null) return localInt == refInt;
+  final localDecimal = erDecimalTypeSignature(localType);
+  final refDecimal = erDecimalTypeSignature(refType);
+  if (localDecimal != null && refDecimal != null) {
+    return localDecimal == refDecimal;
+  }
+  return true;
+}
+
 /// 关系创建前的前置校验（纯逻辑，可无 FFI 单测）。
 ///
 /// 规则（按顺序，返回第一个问题）：
@@ -1747,7 +1866,8 @@ bool erTypesCompatible(String localType, String refType) {
 /// 2. 被引用表必须有主键；
 /// 3. 被引用列必须是主键或单列唯一键（[refUniqueColumns] 来自 structure 的
 ///    单列唯一索引；拿不到唯一信息时只认 primary）；
-/// 4. 本地列与目标列粗粒度类型必须兼容（拿不准交给数据库报错）。
+/// 4. 本地列与目标列类型必须兼容：粗粒度过滤 + 整数位宽 / UNSIGNED /
+///    DECIMAL 精度的精确比较（拿不准交给数据库报错）。
 ErFkIssue? validateForeignKeyCandidate({
   required ErTable localTable,
   required String localColumn,
@@ -1788,7 +1908,7 @@ ErFkIssue? validateForeignKeyCandidate({
   }
   final local = localTable.columnNamed(localColumn);
   final localType = local?.typeName ?? '';
-  if (!erTypesCompatible(localType, ref.typeName)) {
+  if (!erForeignKeyTypesCompatible(localType, ref.typeName)) {
     return ErFkIssue(
       kind: ErFkIssueKind.typeIncompatible,
       localTable: localTable.name,

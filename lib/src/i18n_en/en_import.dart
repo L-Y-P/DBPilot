@@ -180,18 +180,19 @@ const Map<String, String> enImport = <String, String>{
   '添加表并连接字段建立外键；关系修改会立即写入数据库。':
       'Add tables and connect fields to create foreign keys; relation changes are written '
       'to the database immediately.',
-  '工作表会整表载入内存后按批 INSERT 写入（超大工作簿请关注内存占用）；':
-      'Worksheets are loaded into memory and written with INSERT batches (watch memory '
-      'use for huge workbooks);',
+  '工作表按行流式读取、按批 INSERT 写入（共享字符串表仍需一次加载）；':
+      'Worksheets are streamed row by row and written with INSERT batches (the shared '
+      'string table is still loaded once);',
   '数字 / 日期 / 布尔 / 文本按原单元格类型识别；校验通过前不会写入任何数据。':
       'Numbers, dates, booleans and text are read as their cell types; nothing is '
       'written until validation passes.',
   '数据按批次生成多行 INSERT 写入；读取规则和字段规则在校验通过前不会写入任何数据。':
       'Rows are written with multi-row INSERT batches; no data is written until the '
       'read and field rules validate.',
-  '工作簿较大：读取时会整表载入内存后分批插入；界面保持响应，可随时取消。':
-      'Large workbook: the sheet is loaded into memory and inserted in batches; the UI '
-      'stays responsive and the import can be cancelled.',
+  '工作簿较大：按行流式读取并分批插入，内存占用与行数无关（共享字符串表仍需一次加载）；界面保持响应，可随时取消。':
+      'Large workbook: rows are streamed and inserted in batches, so memory use does not '
+      'grow with rows (the shared string table is still loaded once); the UI stays '
+      'responsive and the import can be cancelled.',
   'xlsx / Excel 工作簿': 'xlsx / Excel workbook',
   'xls / Excel 97-2003 工作簿': 'xls / Excel 97-2003 workbook',
   'xlsb / Excel 二进制工作簿': 'xlsb / Excel binary workbook',

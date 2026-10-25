@@ -184,16 +184,28 @@ void main() {
     expect(addButton.onPressed, isNull);
   });
 
-  testWidgets('空画布显示引导文案与 SQLite 提示', (tester) async {
+  testWidgets('空画布显示引导文案、主按钮与 SQLite 提示', (tester) async {
     await setSurface(tester);
     await tester.pumpWidget(
       host(RelationDesigner(database: 'main', height: 400)),
     );
     await settle(tester);
     expect(find.text('还没有添加表'), findsOneWidget);
-    expect(find.text('添加表后，从字段右侧的圆点拖到另一张表的字段即可创建外键'), findsOneWidget);
+    expect(
+      find.text('添加表后，从字段两端的圆点拖到另一张表的字段即可创建外键'),
+      findsOneWidget,
+    );
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
     expect(find.text('已加入 0/10'), findsOneWidget);
+    // 空状态必须有主行动按钮（P2-5：文员看到空画布会以为功能坏了）。
+    expect(find.byKey(const ValueKey('er-empty-add-table')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-empty-add-table')));
+    await settle(tester, rounds: 6);
+    expect(find.text('添加表'), findsWidgets);
+    expect(find.byKey(const ValueKey('er-picker-books')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('dialog-close')));
+    await settle(tester, rounds: 4);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('seed 表自动带入关联表；可撤销且不自动加回', (tester) async {
@@ -485,13 +497,24 @@ void main() {
       ),
     );
     await settle(tester);
+    // 中文界面：画布类型列说人话；完整 SQL 类型放进 Tooltip（P2-1）。
     final typeTexts = tester
         .widgetList<app_text.Text>(find.byType(app_text.Text))
-        .where((widget) => widget.data == 'VARCHAR(255)')
+        .where((widget) => widget.data == '文本（VARCHAR(255)）')
         .toList();
     expect(typeTexts.length, 1);
     expect(typeTexts.single.maxLines, 1);
     expect(typeTexts.single.softWrap, isFalse);
+    final typeTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .ancestor(
+            of: find.text('文本（VARCHAR(255)）'),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(typeTooltip.message, contains('VARCHAR(255)'));
+    expect(typeTooltip.message, contains('有长度上限的文本'));
     expect(tester.takeException(), isNull);
   });
 
@@ -949,5 +972,105 @@ void main() {
     expect(erFkActionLabel('CASCADE', onDelete: true), 'ON DELETE CASCADE');
     expect(erFkActionLabel('SET NULL', onDelete: false), 'ON UPDATE SET NULL');
     expect(erFkActionLabel('', onDelete: true), 'NO ACTION');
+  });
+
+  test('整数位宽不兼容的提示直接点名原因与两端列', () {
+    final local = ErTable(name: 'orders', columns: const <ErColumn>[
+      ErColumn(name: 'id', typeName: 'INT', primary: true),
+      ErColumn(name: 'user_id', typeName: 'INT'),
+    ]);
+    final ref = ErTable(name: 'users', columns: const <ErColumn>[
+      ErColumn(name: 'id', typeName: 'BIGINT', primary: true),
+    ]);
+    final issue = validateForeignKeyCandidate(
+      localTable: local,
+      localColumn: 'user_id',
+      refTable: ref,
+      refColumn: 'id',
+    );
+    expect(issue!.kind, ErFkIssueKind.typeIncompatible);
+    final message = erFkIssueMessage(issue);
+    expect(message, contains('orders.user_id'));
+    expect(message, contains('users.id'));
+    expect(message, contains('整数位宽或无符号不一致'));
+    expect(message, contains('同一类型'));
+  });
+
+  testWidgets('英文模式：返回字段按钮与建议帮助 tooltip 也是英文', (tester) async {
+    I18n.setLang(AppLang.en);
+    addTearDown(() => I18n.setLang(AppLang.zh));
+    await setSurface(tester);
+    var backCalled = false;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    // 帮助入口的 tooltip 不是 Text，english_ui_test 的文本扫描覆盖不到，
+    // 这里单独断言（P2-12：英文模式不能出现中文）。
+    final helpTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .descendant(
+            of: find.byKey(const ValueKey('er-suggestion-help')),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(helpTooltip.message, 'How are suggested relations derived?');
+
+    final context = tester.element(find.byType(RelationDesigner));
+    final dialog = showForeignKeyBlockedDialog(
+      context,
+      message: 'Blocked by the local check',
+      onRequestEditFields: () => backCalled = true,
+    );
+    await settle(tester, rounds: 6);
+    expect(find.text('Cannot create the foreign key'), findsOneWidget);
+    expect(find.text('Back to worksheets and fields'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-back-to-fields')));
+    await settle(tester, rounds: 8);
+    await dialog;
+    expect(backCalled, isTrue);
+    expect(tester.takeException(), isNull);
+  });
+
+  test('alterTableErrors：数据库失败不会被当成成功（P0-1 回归）', () {
+    expect(
+      alterTableErrors(<String, dynamic>{
+        'failed': 0,
+        'results': <dynamic>[
+          <String, dynamic>{'statement': 'ALTER ...', 'error': null},
+        ],
+      }),
+      isEmpty,
+    );
+    expect(
+      alterTableErrors(<String, dynamic>{
+        'failed': 1,
+        'results': <dynamic>[
+          <String, dynamic>{
+            'statement': 'ALTER ...',
+            'error': 'ERROR 3780 (HY000): Referencing column ... are incompatible.',
+          },
+        ],
+      }),
+      <String>[
+        'ERROR 3780 (HY000): Referencing column ... are incompatible.',
+      ],
+    );
+    // 只有 failed 计数、没有 error 文本时也要给出兜底错误，不能静默。
+    expect(
+      alterTableErrors(<String, dynamic>{
+        'failed': 2,
+        'results': <dynamic>[],
+      }),
+      hasLength(1),
+    );
+    expect(alterTableErrors(<String, dynamic>{}), isEmpty);
   });
 }

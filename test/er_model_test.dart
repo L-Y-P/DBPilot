@@ -922,7 +922,7 @@ void main() {
       expect(tighter.length, 2);
     });
 
-    test('已有外键的表不再建议；缺目标表 / 复合主键目标也跳过', () {
+    test('已有外键只跳过对应列/目标：同表其它 _id 列继续建议（P2-7）', () {
       final suggestions = suggestRelations(
         tables: batch(),
         relationsByTable: <String, List<ErRelation>>{
@@ -945,12 +945,59 @@ void main() {
           ],
         },
       );
-      // orders / products 已有外键；只剩 order_items 的两条。
-      expect(suggestions.length, 2);
-      expect(
-        suggestions.every((relation) => relation.localTable == 'order_items'),
-        isTrue,
+      final labels = <String>{
+        for (final relation in suggestions) erLabel(relation),
+      };
+      // 已有外键的本地列不再建议；没有外键的 order_items 两条仍然在。
+      expect(labels, <String>{
+        'order_items.order_id→orders.id',
+        'order_items.product_id→products.id',
+      });
+      expect(labels, isNot(contains('orders.user_id→users.id')));
+      expect(labels, isNot(contains('products.category_id→categories.id')));
+    });
+
+    test('应用 1 条建议后，同表剩余建议仍然在（可逐步补齐）', () {
+      final tables = batch();
+      // order_items 已建好 order_id → orders.id，另一列 product_id 还没建。
+      final remaining = suggestRelations(
+        tables: tables,
+        relationsByTable: <String, List<ErRelation>>{
+          'order_items': <ErRelation>[
+            const ErRelation(
+              localTable: 'order_items',
+              localColumn: 'order_id',
+              refTable: 'orders',
+              refColumn: 'id',
+              name: 'fk_items_order',
+            ),
+          ],
+        },
       );
+      expect(
+        <String>{for (final relation in remaining) erLabel(relation)},
+        <String>{
+          'products.category_id→categories.id',
+          'orders.user_id→users.id',
+          'order_items.product_id→products.id',
+        },
+      );
+    });
+
+    test('列模型已标记外键时即使没有 relationsByTable 也不再建议', () {
+      final flagged = suggestRelations(
+        tables: <ErTable>[
+          idTable('users'),
+          idTable('orders', <ErColumn>[
+            column('user_id', type: 'INTEGER', foreignKey: true),
+          ]),
+        ],
+        relationsByTable: <String, List<ErRelation>>{},
+      );
+      expect(flagged, isEmpty);
+    });
+
+    test('缺目标表 / 复合主键目标也跳过', () {
       // 缺目标表：只有 products.category_id 时没有 categories 表。
       final missing = suggestRelations(
         tables: <ErTable>[
@@ -1224,6 +1271,81 @@ void main() {
       expect(erTypesCompatible('TIMESTAMP', 'VARCHAR(32)'), isFalse);
       expect(erTypesCompatible('BLOB', 'VARCHAR(255)'), isFalse);
       expect(erTypesCompatible('POINT', 'INTEGER'), isTrue);
+    });
+
+    test('整数类型精确校验：位宽 / UNSIGNED 不一致一律不兼容（P0-1 前置）', () {
+      ErTable local(String type) => tableWith('child', <ErColumn>[
+        column('id', type: 'INTEGER', primary: true),
+        column('parent_id', type: type),
+      ]);
+      ErTable parent(String type) => tableWith('parent', <ErColumn>[
+        column('id', type: type, primary: true),
+      ]);
+      ErFkIssue? check(String childType, String parentType) =>
+          validateForeignKeyCandidate(
+            localTable: local(childType),
+            localColumn: 'parent_id',
+            refTable: parent(parentType),
+            refColumn: 'id',
+          );
+
+      for (final pair in <List<String>>[
+        <String>['INT', 'BIGINT'],
+        <String>['BIGINT', 'INT'],
+        <String>['INT', 'INT UNSIGNED'],
+        <String>['INT UNSIGNED', 'INT'],
+        <String>['TINYINT', 'INT'],
+        <String>['BIGINT', 'BIGINT UNSIGNED'],
+        <String>['DECIMAL(10,2)', 'DECIMAL(12,2)'],
+        <String>['DECIMAL(10,2)', 'DECIMAL(10,4)'],
+      ]) {
+        final issue = check(pair[0], pair[1]);
+        expect(
+          issue?.kind,
+          ErFkIssueKind.typeIncompatible,
+          reason: '${pair[0]} vs ${pair[1]} 应该被前置校验拦住',
+        );
+      }
+
+      for (final pair in <List<String>>[
+        <String>['INT', 'INT'],
+        <String>['INT', 'INTEGER'],
+        <String>['BIGINT', 'BIGINT'],
+        <String>['INT UNSIGNED', 'INT UNSIGNED'],
+        <String>['INT UNSIGNED', 'INT(10) UNSIGNED'],
+        <String>['TEXT', 'VARCHAR(255)'],
+        <String>['DOUBLE', 'DOUBLE PRECISION'],
+      ]) {
+        expect(
+          check(pair[0], pair[1]),
+          isNull,
+          reason: '${pair[0]} vs ${pair[1]} 应该保持兼容',
+        );
+      }
+    });
+
+    test('erIntegerTypeSignature 归一化：位宽 + 是否有符号', () {
+      expect(erIntegerTypeSignature('INT'), '32:s');
+      expect(erIntegerTypeSignature('integer'), '32:s');
+      expect(erIntegerTypeSignature('INT(11) UNSIGNED'), '32:u');
+      expect(erIntegerTypeSignature('TINYINT'), '8:s');
+      expect(erIntegerTypeSignature('MEDIUMINT'), '24:s');
+      expect(erIntegerTypeSignature('BIGINT UNSIGNED'), '64:u');
+      expect(erIntegerTypeSignature('SMALLSERIAL'), '16:s');
+      expect(erIntegerTypeSignature('SERIAL'), '32:s');
+      expect(erIntegerTypeSignature('BIGSERIAL'), '64:s');
+      // 非整数族交给粗粒度 / DECIMAL 精确比较。
+      expect(erIntegerTypeSignature('BOOLEAN'), isNull);
+      expect(erIntegerTypeSignature('DECIMAL(10,2)'), isNull);
+      expect(erIntegerTypeSignature('TEXT'), isNull);
+    });
+
+    test('erDecimalTypeSignature：precision / scale；缺参数时放行', () {
+      expect(erDecimalTypeSignature('DECIMAL(10,2)'), '10,2');
+      expect(erDecimalTypeSignature('numeric(20,6)'), '20,6');
+      expect(erDecimalTypeSignature('DECIMAL(10)'), '10,0');
+      expect(erDecimalTypeSignature('DECIMAL'), isNull);
+      expect(erDecimalTypeSignature('INT'), isNull);
     });
 
     test('按列名推导的建议关系全部能通过前置校验', () {

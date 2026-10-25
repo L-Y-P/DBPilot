@@ -139,6 +139,36 @@ bool isPermissionError(Object? error) {
   return markers.any(text.contains);
 }
 
+/// 从 ALTER TABLE 的原始返回里取出失败的语句错误。
+///
+/// Rust 的 `explorer.alter_table` 把 DDL 失败写在返回体里：
+/// `{failed: 1, results: [{statement, error, ...}]}`，并不抛异常。这里的规则：
+///
+///   * 优先用 `results[].error` 的原文（保留技术细节，供 UI / 日志排查）；
+///   * 只有 `failed` 计数、没有 error 文本时给出兜底消息，保证失败不会静默。
+List<String> alterTableErrors(Json result) {
+  final out = <String>[];
+  for (final row in _asList(result['results'])) {
+    final value = row['error'];
+    if (value == null) continue;
+    final text = value.toString().trim();
+    if (text.isEmpty || text == 'null') continue;
+    out.add(text);
+  }
+  if (out.isEmpty) {
+    final failed = result['failed'];
+    if (failed is num && failed > 0) {
+      final count = failed.toInt();
+      out.add(
+        count == 1
+            ? '语句执行失败（数据库未返回错误详情）'
+            : '$count 条语句执行失败（数据库未返回错误详情）',
+      );
+    }
+  }
+  return out;
+}
+
 /// Typed facade over the generated bindings, mirroring web/src/api.ts so the
 /// ported views read almost identically.
 class Api {
@@ -341,9 +371,29 @@ class Api {
   Future<Json> ddl(String db, String table) async =>
       _asMap(await _guard(() => rexplorer.tableDdl(database: db, table: table)));
 
+  /// Raw ALTER TABLE batch result.
+  ///
+  /// Rust deliberately returns failures **inside** the payload
+  /// (`{failed, results: [{statement, error, ...}]}`) instead of throwing, so
+  /// callers that render the per-statement result (the table designer) can show
+  /// what ran. Views where "did the DDL apply?" is a yes/no question must use
+  /// [alterTableChecked] instead — otherwise a failed ALTER looks successful
+  /// (round 51 P0-1: silent "create suggested foreign key").
   Future<Json> alterTable(String db, String table, Json body) async =>
       _asMap(await _guard(
           () => rexplorer.alterTable(database: db, table: table, body: body)));
+
+  /// [alterTable] but throws when any statement failed.
+  ///
+  /// The exception message starts with the database's own error text so the
+  /// technical detail is preserved; views add the localized prefix + the
+  /// actionable hint from [describeDbError] at the catch site.
+  Future<Json> alterTableChecked(String db, String table, Json body) async {
+    final result = await alterTable(db, table, body);
+    final errors = alterTableErrors(result);
+    if (errors.isEmpty) return result;
+    throw ApiException(errors.join('\n'));
+  }
 
   // -------------------------------------------------------------------- query
 

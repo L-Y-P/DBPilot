@@ -570,9 +570,15 @@ mod xlsx {
         TimeDelta,
     }
 
+    /// 内建数字格式号 → 日期/时长。
+    ///
+    /// 14–22 是常规日期/时间；27–36、50–58 是 ECMA-376 预留给区域设置的
+    /// 日期/时间内建格式（CJK 版 Excel、LibreOffice 常见），漏掉会让日期单元格
+    /// 按序列号（如 45000）读成整数、列被推断成 INT。37–44 是会计/数值格式
+    /// （不是日期），不要并进来；45/47 是时间格式。
     fn builtin_format(id: u32) -> CellFormat {
         match id {
-            14..=22 | 45 | 47 => CellFormat::DateTime,
+            14..=22 | 27..=36 | 45 | 47 | 50..=58 => CellFormat::DateTime,
             46 => CellFormat::TimeDelta,
             _ => CellFormat::Other,
         }
@@ -1366,6 +1372,66 @@ mod xlsx {
             warnings: Vec::new(),
             source: Box::new(ChannelSource::new(rx, total_bytes, handle)),
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        /// 只写 cellXfs（numFmtId 列表）的最小 styles.xml。
+        fn styles_with_xfs(ifmts: &[u32]) -> CellStyles {
+            let mut xml = String::from(
+                r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs>"#,
+            );
+            for id in ifmts {
+                xml.push_str(&format!(r#"<xf numFmtId="{id}" applyNumberFormat="1"/>"#));
+            }
+            xml.push_str("</cellXfs></styleSheet>");
+            parse_styles(xml.as_bytes())
+        }
+
+        #[test]
+        fn east_asian_builtin_formats_are_dates_not_accounting() {
+            // 27–36 / 50–58（CJK 等区域设置的日期时间内建格式）必须当日期/时间。
+            for id in [14u32, 22, 27, 28, 31, 36, 50, 55, 58] {
+                assert_eq!(builtin_format(id), CellFormat::DateTime, "numFmtId={id}");
+            }
+            // 37–44 是会计/数值格式，46 是时长，其余保持非日期。
+            for id in [0u32, 37, 38, 39, 40, 41, 42, 43, 44, 49, 59] {
+                assert_eq!(builtin_format(id), CellFormat::Other, "numFmtId={id}");
+            }
+            assert_eq!(builtin_format(46), CellFormat::TimeDelta);
+        }
+
+        #[test]
+        fn serial_45000_under_east_asian_formats_resolves_to_a_date() {
+            // styles.xml 里 cellXfs = [General, 27, 31, 55]：走 parse_styles →
+            // builtin_format → CellState::resolve，确认序列号 45000 变成日期串。
+            let styles = styles_with_xfs(&[0, 27, 31, 55]);
+            assert_eq!(
+                styles.formats,
+                vec![
+                    CellFormat::Other,
+                    CellFormat::DateTime,
+                    CellFormat::DateTime,
+                    CellFormat::DateTime,
+                ]
+            );
+            for style in [1usize, 2, 3] {
+                let mut cell = CellState::new(0, CellKind::Number, Some(style));
+                cell.raw = "45000".to_string();
+                assert_eq!(
+                    cell.resolve(&[], &styles, false),
+                    json!("2023-03-15"),
+                    "序列号 45000 在 numFmtId 27/31/55 下必须是日期而不是整数"
+                );
+            }
+            // 对照：同一序列号在 General 下仍是数字。
+            let mut cell = CellState::new(0, CellKind::Number, Some(0));
+            cell.raw = "45000".to_string();
+            assert_eq!(cell.resolve(&[], &styles, false), json!(45000));
+        }
     }
 }
 

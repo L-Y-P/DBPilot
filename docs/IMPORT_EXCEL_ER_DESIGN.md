@@ -85,9 +85,11 @@
 
 - 推断在 Rust 内做（Excel 有真实单元格类型，比 Dart 猜更准）；扫描最多 1000 条数据记录（header/skip 之后）。
 - `type` 取值（跨驱动中性名）：`integer` | `bigint` | `decimal` | `float` | `boolean` | `date` | `datetime` | `time` | `text`。
-- 规则：忽略空/NULL（为空的列不能否定类型）；整数列全部在 i32 → integer，否则 bigint；有小数 → decimal（超过 15 位或列名像比率再加 float 也行，简单第一版 decimal）；true/false、是/否、0/1 混合布尔列需 ≥90% 布尔值才判 boolean；字符串按样本模式识别 `YYYY-MM-DD`、`YYYY-MM-DD HH:MM[:SS]`、`HH:MM[:SS]`；数值字符串列若 100% 可解析为数字按数字类型；其余 text（`max_length` 为最大字符数）。
+- 规则：忽略空/NULL（为空的列不能否定类型）；整数列全部在 i32 → integer，否则 bigint；有小数 → decimal（超过 15 位或列名像比率再加 float 也行，简单第一版 decimal）；true/false、是/否、0/1 混合布尔列需 ≥90% 布尔值才判 boolean；字符串按样本模式识别 `YYYY-MM-DD`、`YYYY-MM-DD HH:MM[:SS]`、`HH:MM[:SS]`；数值字符串列若 100% 可解析为数字按数字类型；其余 text（`max_length` 为**建表推荐长度**：样本 ≤127 字符给 255，否则 0 → TEXT，见第 52 轮修订）。
 - `name` 用表头名（`header=true`）或 `column_1..N`；**保留中文**，仅把空白/引号/控制字符替换为 `_`，去重（`name`、`name_2`）。（DDL 会 quote 标识符。）
-- `primary_candidate`：列名 `id`（忽略大小写）/ 表头第一列且值唯一时给 true；Dart 侧默认勾选，用户可改。
+- `primary_candidate` / `primary_candidate_reason`（第 52 轮扩展）：每张表最多一个候选，优先级
+  「列名 id」→「最早的样本内唯一整数列（学号/订单号）」→「第一列且样本内唯一的短文本列」；
+  同时新增 `unique` 字段。Dart 侧默认勾选；非 id 来源的候选会提示「按样本猜的主键，可改」。
 - `preview` 请求参数增加可选 `infer: true`（Dart 快速建表用）；不传时也返回 schema（成本可控，1000 行），但 `limit` 语义不变。旧调用方只多一个字段，兼容。
 
 ### 2.4 实现建议（rust-excel 自行决定，但需满足契约）
@@ -197,9 +199,13 @@ Future<bool> showQuickCreateTableWizard(
 | date | DATE | DATE | TEXT |
 | datetime | DATETIME | TIMESTAMP | TEXT |
 | time | TIME | TIME | TEXT |
-| text | TEXT（max_length>0 且 ≤200 用 VARCHAR(n)） | TEXT（≤200 用 VARCHAR(n)） | TEXT |
+| text | TEXT（max_length>0 且 ≤4000 用 VARCHAR(n)；短文本推荐 255） | TEXT（≤4000 用 VARCHAR(n)） | TEXT |
 
-主键列：MySQL `BIGINT AUTO_INCREMENT`（仅整数类型列）/ PG `BIGSERIAL`（integer 主键用 SERIAL）/ SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`。非整数主键：createTable 的 `primary:true` 即可。
+主键列（第 52 轮修订）：MySQL `BIGINT` / PG `BIGINT` / SQLite `INTEGER`。**AUTO_INCREMENT / IDENTITY /
+AUTOINCREMENT 只对「添加自增 id 主键」生成的列或用户在字段页显式勾选「自增」的整数主键打开**；
+学号/订单号/工号这类业务编号默认不自增，漏填不会被数据库代填成伪编号。非整数主键：createTable
+的 `primary:true` 即可。同表的整数 `*_id`/`*Id` 外键列会同步成主键整数类型（BIGINT/INTEGER），
+避免 MySQL 外键 `ERROR 3780`（第 52 轮 P0-1）。
 
 ### 4.4 测试 `test/quick_create_table_test.dart`
 
@@ -301,13 +307,16 @@ Future<void> showRelationDesigner(
 ### 8.2 E-R 图（task-6 / er-designer）
 
 1. **箭头**：所有关系边（已有/新建/建议）在目标端画清晰箭头（按贝塞尔切线方向），hover/选中高亮，命中逻辑不变。
-2. **自动带入关联表**：加入一张表（含导入第 5 步 seed）时，自动把已有外键的父/子表加入画布到 5 张上限；顶部提示「已自动加入关联表：…」+「撤销自动加入」；避免循环、用户移除后不立即加回。
+2. **自动带入关联表**：加入一张表（含导入第 4 步 seed）时，自动把已有外键的父/子表加入画布到 10 张上限；顶部提示「已自动加入关联表：…」+「撤销自动加入」；避免循环、用户移除后不立即加回。
 3. **多对多推导**：
    - 中间表识别（恰好 2 个单列外键指向 2 张不同表）→ 节点徽标「中间表（多对多）」，并在两端实体表间画「多对多 · <中间表>」关系线（可折叠中间表节点）。
    - 新建外键对话框增加「关系类型：多对一（默认）/ 多对多（自动建中间表）」，后者走既有 junction `createTable`。
    - 再次在两表间建关系：已有中间表则提示不要重复；双方连接列都不唯一时默认建议中间表（保留直接添加）。
-   - 对同一批导入、尚无外键的表按列名推导「建议关系」：`<x>_id`/`<x>Id` → 表 `x`/`xs`/`xes` 单列主键；虚线建议边 + 工具栏「建立建议外键 (N)」批量应用。
-4. 测试文件：`desktop/rust/tests/fixtures/relational_multi.xlsx`（5 个工作表，≤5 限制）：
+   - 对画布内的表按列名推导「建议关系」：`<x>_id`/`<x>Id` → 表 `x`/`xs`/`xes` 单列主键；只跳过
+     「该本地列已有外键 / 与已有外键相同目标」，所以应用 1 条后其余建议仍保留（第 52 轮 P2-7），
+     可以逐步补齐；虚线建议边 + 工具栏「建立建议外键 (N)」批量应用。应用走 `alterTableChecked`，
+     失败会逐条显示中文原因，不再静默（第 52 轮 P0-1）。
+4. 测试文件：`desktop/rust/tests/fixtures/relational_multi.xlsx`（5 个工作表；画布上限 10）：
    - `users` / `categories` / `products(category_id)` / `orders(user_id)` / `order_items(order_id, product_id)`；
    - 预期建议：products.category_id→categories、orders.user_id→users、order_items.order_id→orders、order_items.product_id→products；
    - `order_items` 恰好两个单列外键 → 识别为中间表，orders↔products 显示多对多。

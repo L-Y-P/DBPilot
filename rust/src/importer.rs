@@ -5028,7 +5028,8 @@ mod excel_tests {
 
             assert_eq!(columns[1]["name"], json!("姓名"));
             assert_eq!(columns[1]["type"], json!("text"));
-            assert_eq!(columns[1]["max_length"], json!(2));
+            // 文本列给余量：样本 2 字符 → 推荐 255，而不是零余量的 VARCHAR(2)。
+            assert_eq!(columns[1]["max_length"], json!(255));
             assert_eq!(columns[1]["nullable"], json!(false));
 
             assert_eq!(columns[2]["name"], json!("入职日期"));
@@ -5061,7 +5062,7 @@ mod excel_tests {
         assert_eq!(columns[0]["type"], json!("integer"));
         assert_eq!(columns[1]["name"], json!("客户"));
         assert_eq!(columns[1]["type"], json!("text"));
-        assert_eq!(columns[1]["max_length"], json!(3));
+        assert_eq!(columns[1]["max_length"], json!(255));
         assert_eq!(columns[2]["name"], json!("金额"));
         assert_eq!(columns[2]["type"], json!("decimal"));
     }
@@ -5089,6 +5090,142 @@ mod excel_tests {
         assert_eq!(columns[4]["name"], json!("dup_2"));
         assert_eq!(columns[4]["type"], json!("boolean"));
         assert_eq!(schema["sample_count"], json!(2));
+    }
+
+    #[test]
+    fn schema_text_length_headroom_avoids_zero_margin_columns() {
+        // 短文本给 255 的推荐长度（样本只有 2 字符也不再生成 VARCHAR(2)）；
+        // 超过 127 字符的长文本返回 0，由向导落成 TEXT；非文本列不带长度。
+        let long_text = "长".repeat(128);
+        let boundary_text = "界".repeat(127);
+        let header = vec![
+            "姓名".to_string(),
+            "长备注".to_string(),
+            "边界".to_string(),
+            "id".to_string(),
+        ];
+        let rows = vec![
+            vec![
+                json!("张三"),
+                json!(long_text.clone()),
+                json!(boundary_text.clone()),
+                json!(1),
+            ],
+            vec![json!("李四"), json!(long_text), json!(boundary_text), json!(2)],
+        ];
+        let schema = crate::excel_import::infer_schema(Some(&header), &rows, 1000);
+        let columns = schema["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["type"], json!("text"));
+        assert_eq!(columns[0]["max_length"], json!(255), "{schema}");
+        assert_eq!(columns[1]["type"], json!("text"));
+        assert_eq!(columns[1]["max_length"], json!(0), "{schema}");
+        assert_eq!(columns[2]["type"], json!("text"));
+        assert_eq!(columns[2]["max_length"], json!(255), "{schema}");
+        assert_eq!(columns[3]["type"], json!("integer"));
+        assert_eq!(columns[3]["max_length"], json!(0), "{schema}");
+    }
+
+    #[test]
+    fn schema_suggests_unique_integer_natural_key_instead_of_demanding_an_id() {
+        // 学生名单：首列姓名（文本），学号是唯一整数自然键；应提议 学号 而不是逼用户加自增 id。
+        let header = vec!["姓名".to_string(), "学号".to_string(), "班级".to_string()];
+        let rows = vec![
+            vec![json!("张三"), json!(20260101), json!("高一(1)班")],
+            vec![json!("李四"), json!(20260102), json!("高一(1)班")],
+            vec![json!("王五"), json!(20260103), json!("高一(2)班")],
+        ];
+        let schema = crate::excel_import::infer_schema(Some(&header), &rows, 1000);
+        let columns = schema["columns"].as_array().unwrap();
+        // 姓名单看也是唯一文本，但优先级低于唯一的整数自然键。
+        assert_eq!(columns[0]["unique"], json!(true), "{schema}");
+        assert_eq!(columns[0]["primary_candidate"], json!(false), "{schema}");
+        assert_eq!(columns[1]["type"], json!("integer"), "{schema}");
+        assert_eq!(columns[1]["unique"], json!(true), "{schema}");
+        assert_eq!(columns[1]["primary_candidate"], json!(true), "{schema}");
+        assert_eq!(
+            columns[1]["primary_candidate_reason"],
+            json!("unique_integer"),
+            "{schema}"
+        );
+        assert_eq!(columns[2]["unique"], json!(false), "班级有重复: {schema}");
+        assert_eq!(columns[2]["primary_candidate"], json!(false), "{schema}");
+        let candidates = columns
+            .iter()
+            .filter(|column| column["primary_candidate"] == json!(true))
+            .count();
+        assert_eq!(candidates, 1, "每张表最多一个主键候选: {schema}");
+    }
+
+    #[test]
+    fn schema_keeps_named_id_as_the_single_primary_candidate() {
+        // orders(id, user_id, status)：仍选 id；重复的 user_id / status 不成为候选。
+        let header = vec![
+            "id".to_string(),
+            "user_id".to_string(),
+            "status".to_string(),
+            "note".to_string(),
+        ];
+        let rows = vec![
+            vec![json!(1), json!(7), json!("paid"), json!("a")],
+            vec![json!(2), json!(7), json!("paid"), Value::Null],
+            vec![json!(3), json!(9), json!("new"), json!("b")],
+        ];
+        let schema = crate::excel_import::infer_schema(Some(&header), &rows, 1000);
+        let columns = schema["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["primary_candidate"], json!(true), "{schema}");
+        assert_eq!(
+            columns[0]["primary_candidate_reason"],
+            json!("id"),
+            "{schema}"
+        );
+        assert_eq!(columns[0]["unique"], json!(true), "{schema}");
+        assert_eq!(columns[1]["unique"], json!(false), "{schema}");
+        assert_eq!(columns[1]["primary_candidate"], json!(false), "{schema}");
+        assert_eq!(columns[2]["unique"], json!(false), "{schema}");
+        // 有空值的列不算唯一（unique 要求无空值、非空样本 > 0）。
+        assert_eq!(columns[3]["unique"], json!(false), "{schema}");
+        assert_eq!(
+            columns[3]["primary_candidate_reason"],
+            json!(""),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn schema_primary_candidate_falls_back_to_unique_first_column_only() {
+        // 首列唯一短文本 → 候选（邮箱/名称这类自然键）。
+        let header = vec!["邮箱".to_string(), "备注".to_string()];
+        let rows = vec![
+            vec![json!("a@example.com"), json!("甲")],
+            vec![json!("b@example.com"), Value::Null],
+        ];
+        let schema = crate::excel_import::infer_schema(Some(&header), &rows, 1000);
+        let columns = schema["columns"].as_array().unwrap();
+        assert_eq!(
+            columns[0]["primary_candidate_reason"],
+            json!("first_column"),
+            "{schema}"
+        );
+        assert_eq!(columns[0]["primary_candidate"], json!(true), "{schema}");
+        assert_eq!(columns[1]["unique"], json!(false), "{schema}");
+
+        // 首列文本超过 64 字符、或没有唯一列 → 没有候选（reason 空串）。
+        let long_text = "长".repeat(65);
+        let header = vec!["长描述".to_string(), "状态".to_string(), "备注".to_string()];
+        let rows = vec![
+            vec![json!(long_text), json!("paid"), json!("x")],
+            vec![json!("另一段"), json!("paid"), json!("y")],
+        ];
+        let schema = crate::excel_import::infer_schema(Some(&header), &rows, 1000);
+        let columns = schema["columns"].as_array().unwrap();
+        for column in columns {
+            assert_eq!(column["primary_candidate"], json!(false), "{schema}");
+            assert_eq!(
+                column["primary_candidate_reason"],
+                json!(""),
+                "{schema}"
+            );
+        }
     }
 
     #[test]

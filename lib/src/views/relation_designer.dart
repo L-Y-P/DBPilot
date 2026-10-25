@@ -21,6 +21,7 @@ import '../notice.dart';
 import '../text.dart';
 import '../theme.dart';
 import '../tooltip.dart';
+import '../type_labels.dart';
 import '../widgets.dart';
 import 'er_model.dart';
 
@@ -109,14 +110,50 @@ String erFkIssueMessage(ErFkIssue issue) {
             'make it PRIMARY KEY / UNIQUE, or reference its primary key instead.',
       );
     case ErFkIssueKind.typeIncompatible:
+      // 整数位宽 / UNSIGNED、DECIMAL 精度不一致是 MySQL ERROR 3780 最常见的
+      // 两种原因（第 51 轮 P2-4），这里直接说清楚要改什么。
+      final localInt = erIntegerTypeSignature(issue.localType);
+      final refInt = erIntegerTypeSignature(issue.refType);
+      if (localInt != null && refInt != null) {
+        return pickText(
+          '类型不兼容：子列 $localTable.$localColumn（${issue.localType}）与父列 '
+              '$refTable.$refColumn（${issue.refType}）不兼容（整数位宽或无符号不一致），'
+              '请把两边改成同一类型。',
+          'Incompatible types: child column $localTable.$localColumn (${issue.localType}) and parent column '
+              '$refTable.$refColumn (${issue.refType}) are incompatible (integer width or signedness differs); '
+              'change both sides to the same type.',
+        );
+      }
+      final localDecimal = erDecimalTypeSignature(issue.localType);
+      final refDecimal = erDecimalTypeSignature(issue.refType);
+      if (localDecimal != null && refDecimal != null) {
+        return pickText(
+          '类型不兼容：子列 $localTable.$localColumn（${issue.localType}）与父列 '
+              '$refTable.$refColumn（${issue.refType}）不兼容（精度或小数位不一致），'
+              '请把两边改成同一类型。',
+          'Incompatible types: child column $localTable.$localColumn (${issue.localType}) and parent column '
+              '$refTable.$refColumn (${issue.refType}) are incompatible (precision or scale differs); '
+              'change both sides to the same type.',
+        );
+      }
       return pickText(
-        '类型不一致：本地列 $localTable.$localColumn（${issue.localType}）与目标列 '
-            '$refTable.$refColumn（${issue.refType}）类型不兼容。',
-        'Type mismatch: local column $localTable.$localColumn (${issue.localType}) and target column '
-            '$refTable.$refColumn (${issue.refType}) are not compatible.',
+        '类型不兼容：子列 $localTable.$localColumn（${issue.localType}）与父列 '
+            '$refTable.$refColumn（${issue.refType}）类型不一致，请把两边改成同一类型。',
+        'Type mismatch: child column $localTable.$localColumn (${issue.localType}) and parent column '
+            '$refTable.$refColumn (${issue.refType}) are not compatible; change both sides to the same type.',
       );
   }
 }
+
+/// 关系设计器里数据库错误的统一文案：本地化前缀 + [describeDbError]。
+///
+/// [describeDbError] 只负责给权限类错误补一句可行动提示；原始错误文本原样
+/// 保留（技术细节在 AlertBox 里，方便用户 / 支持人员排查）。
+String erDbActionError({
+  required String zh,
+  required String en,
+  required Object error,
+}) => pickText(zh, en) + describeDbError(error);
 
 /// 关系创建被本地前置校验阻止时的对话框；回调非空时提供「返回工作表与字段修改」。
 Future<void> showForeignKeyBlockedDialog(
@@ -136,7 +173,7 @@ Future<void> showForeignKeyBlockedDialog(
       if (onRequestEditFields != null)
         Builder(
           builder: (context) => Btn(
-            '返回工作表与字段修改',
+            pickText('返回工作表与字段修改', 'Back to worksheets and fields'),
             key: const ValueKey('er-back-to-fields'),
             primary: true,
             onPressed: () {
@@ -238,7 +275,11 @@ class _RelationDesignerState extends State<RelationDesigner> {
   String? _selectedRelationKey;
 
   /// 批量建立建议外键时的错误 / 提示（就地显示在工具栏下方）。
+  ///
+  /// 失败的汇总放 [_actionError]（红色），成功的提示放 [_actionNotice]（绿色），
+  /// 两者互斥：一次操作要么全成功、要么有失败。
   String? _actionError;
+  String? _actionNotice;
   bool _applyingSuggestions = false;
   bool _expanding = false;
 
@@ -349,6 +390,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
       _collapsedJunctions.clear();
       _selectedRelationKey = null;
       _actionError = null;
+      _actionNotice = null;
     });
     try {
       final schema = await Api.instance.builderSchema(widget.database);
@@ -393,7 +435,8 @@ class _RelationDesignerState extends State<RelationDesigner> {
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _loadError = error.toString();
+        // 保留原始错误文本，权限类错误由 describeDbError 补可行动提示。
+        _loadError = describeDbError(error);
         _loading = false;
       });
     }
@@ -683,73 +726,149 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   // ------------------------------------------------------- 建议关系（虚线）
 
+  /// 单条建议外键的「子表.列 → 父表.列」路径（错误文案里点名具体关系）。
+  String _suggestionPath(ErRelation relation) =>
+      '${relation.localTable}.${relation.localColumn} → '
+      '${relation.refTable}.${relation.refColumn}';
+
   /// 批量（或单条）建立按列名推导的建议外键。
+  ///
+  /// 关键点（第 51 轮 P0-1 / P2-7）：
+  ///   * 逐条尝试，任何一条失败都不丢弃整批——已成功的立即保留并刷新画布；
+  ///   * `alterTableChecked` 把 Rust 返回体里的 `failed` / `results[].error`
+  ///     变成异常，失败不会再被当成成功而静默；
+  ///   * 失败汇总（成功 X / 总 Y + 每条关系与数据库原文）显示在工具栏下方，
+  ///     全部失败也一定有可见错误；
+  ///   * 单条点击与批量按钮共用这条路径，成功也给可见提示。
   ///
   /// 按钮/建议线在 SQLite 下也保持可点：点击弹明确说明（而不是静默禁用）。
   Future<void> _applySuggestions({ErRelation? only}) async {
     if (_applyingSuggestions) return;
     final targets = <ErRelation>[if (only != null) only else ..._suggestions];
     if (targets.isEmpty) return;
-    // 先本地前置校验，不满足就报错（不让数据库先失败）。
-    for (final suggestion in targets) {
-      final issue = _validateSuggestion(suggestion);
+    if (_isSqlite) {
+      await _showSqliteAlterFkNotice();
+      return;
+    }
+    // 单条点击：前置校验不通过时用带「返回工作表与字段修改」的对话框说清楚。
+    // 批量时改为逐条校验（见下），避免一条不满足拖累整批建议。
+    if (only != null) {
+      final issue = _validateSuggestion(only);
       if (issue != null) {
         await _showBlocked(issue);
         return;
       }
     }
-    if (_isSqlite) {
-      await _showSqliteAlterFkNotice();
-      return;
-    }
     setState(() {
       _applyingSuggestions = true;
       _actionError = null;
+      _actionNotice = null;
     });
+    final applied = <ErRelation>[];
     final appliedTables = <String>{};
+    final failures = <_SuggestionFailure>[];
     try {
       for (final suggestion in targets) {
+        final issue = _validateSuggestion(suggestion);
+        if (issue != null) {
+          failures.add(
+            _SuggestionFailure(suggestion, erFkIssueMessage(issue)),
+          );
+          continue;
+        }
         final existingNames = <String>{
           for (final relation
               in _localRelations[suggestion.localTable] ?? const <ErRelation>[])
             if (relation.name.isNotEmpty) relation.name,
         };
-        await Api.instance.alterTable(
-          widget.database,
-          suggestion.localTable,
-          <String, dynamic>{
-            'add_foreign_keys': <Map<String, dynamic>>[
-              foreignKeyPayload(
-                name: uniqueFkName(
-                  suggestion.localTable,
-                  suggestion.localColumn,
-                  existingNames,
+        try {
+          await Api.instance.alterTableChecked(
+            widget.database,
+            suggestion.localTable,
+            <String, dynamic>{
+              'add_foreign_keys': <Map<String, dynamic>>[
+                foreignKeyPayload(
+                  name: uniqueFkName(
+                    suggestion.localTable,
+                    suggestion.localColumn,
+                    existingNames,
+                  ),
+                  localColumn: suggestion.localColumn,
+                  refTable: suggestion.refTable,
+                  refColumn: suggestion.refColumn,
                 ),
-                localColumn: suggestion.localColumn,
-                refTable: suggestion.refTable,
-                refColumn: suggestion.refColumn,
-              ),
-            ],
-          },
-        );
-        appliedTables.add(suggestion.localTable);
+              ],
+            },
+          );
+          applied.add(suggestion);
+          appliedTables.add(suggestion.localTable);
+        } catch (error) {
+          failures.add(
+            _SuggestionFailure(suggestion, describeDbError(error)),
+          );
+        }
       }
-    } catch (error) {
-      final prefix = pickText(
-        '建立建议外键失败：',
-        'Failed to create the suggested foreign key: ',
-      );
-      final detail = error.toString();
-      if (mounted) setState(() => _actionError = '$prefix$detail');
     } finally {
+      // 已成功的表立即重新读取：部分成功时画布状态与数据库保持一致。
       for (final name in appliedTables) {
         await _reloadTable(name);
       }
       if (mounted) {
-        setState(() => _applyingSuggestions = false);
-        if (appliedTables.isNotEmpty) await widget.onChanged?.call();
+        setState(() {
+          _applyingSuggestions = false;
+          _actionError = failures.isEmpty
+              ? null
+              : _suggestionFailureText(targets.length, applied.length, failures);
+          _actionNotice = failures.isEmpty
+              ? _suggestionSuccessText(applied)
+              : null;
+        });
       }
+      if (applied.isNotEmpty) await widget.onChanged?.call();
     }
+  }
+
+  /// 建立成功后的可见提示（单条点名关系，批量给条数）。
+  String _suggestionSuccessText(List<ErRelation> applied) {
+    if (applied.length == 1) {
+      final path = _suggestionPath(applied.single);
+      return pickText(
+        '已建立建议外键：$path',
+        'Suggested foreign key created: $path',
+      );
+    }
+    return pickText(
+      '已建立 ${applied.length} 条建议外键。',
+      'Created ${applied.length} suggested foreign keys.',
+    );
+  }
+
+  /// 失败汇总：成功 X / 总数 Y + 每条「子表.列 → 父表.列：数据库原文」。
+  ///
+  /// 不整批丢弃：成功的关系仍在画布上，失败的关系逐条列出原因，用户可以只修
+  /// 有问题的那几条后重试（DDL 不能回滚，这样比「全部失败」更接近事实）。
+  String _suggestionFailureText(
+    int total,
+    int succeeded,
+    List<_SuggestionFailure> failures,
+  ) {
+    final buffer = StringBuffer(
+      pickText(
+        '已建立 $succeeded/$total 条建议外键；失败：',
+        'Created $succeeded/$total suggested foreign keys; failures:',
+      ),
+    );
+    for (final failure in failures) {
+      buffer.write('\n');
+      buffer.write(
+        pickText(
+          '${_suggestionPath(failure.relation)}：',
+          '${_suggestionPath(failure.relation)}: ',
+        ),
+      );
+      buffer.write(failure.detail);
+    }
+    return buffer.toString();
   }
 
   /// 单条建议关系的前置校验（两端表都在画布上才校验）。
@@ -800,7 +919,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
         if (widget.onRequestEditFields != null)
           Builder(
             builder: (context) => Btn(
-              '返回工作表与字段修改',
+              pickText('返回工作表与字段修改', 'Back to worksheets and fields'),
               key: const ValueKey('er-back-to-fields'),
               primary: true,
               onPressed: () {
@@ -984,7 +1103,9 @@ class _RelationDesignerState extends State<RelationDesigner> {
     String localTable,
     Map<String, dynamic> payload,
   ) async {
-    await Api.instance.alterTable(
+    // P0-1：Rust 把 ALTER 失败写在返回体里，必须走 checked 版本才会抛错，
+    // 否则「创建外键」在数据库拒绝时也会静默关窗。
+    await Api.instance.alterTableChecked(
       widget.database,
       localTable,
       <String, dynamic>{
@@ -995,7 +1116,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
   }
 
   Future<void> _deleteForeignKey(String localTable, String name) async {
-    await Api.instance.alterTable(
+    await Api.instance.alterTableChecked(
       widget.database,
       localTable,
       <String, dynamic>{
@@ -1325,6 +1446,15 @@ class _RelationDesignerState extends State<RelationDesigner> {
               const SizedBox(height: 6),
               _actionErrorBox(),
             ],
+            if (_actionNotice != null) ...<Widget>[
+              const SizedBox(height: 6),
+              AlertBox(
+                _actionNotice!,
+                key: const ValueKey('er-action-notice'),
+                tone: AlertTone.ok,
+                onClose: () => setState(() => _actionNotice = null),
+              ),
+            ],
             if (_isSqlite) ...<Widget>[
               const SizedBox(height: 6),
               _sqliteHint(),
@@ -1398,7 +1528,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
             child: Btn(
-              '返回工作表与字段修改',
+              pickText('返回工作表与字段修改', 'Back to worksheets and fields'),
               key: const ValueKey('er-back-to-fields'),
               small: true,
               onPressed: () {
@@ -1467,7 +1597,10 @@ class _RelationDesignerState extends State<RelationDesigner> {
         IconBtn(
           Icons.help_outline,
           key: const ValueKey('er-suggestion-help'),
-          tooltip: '建议关系是怎么推导的',
+          tooltip: pickText(
+            '建议关系是怎么推导的',
+            'How are suggested relations derived?',
+          ),
           dimension: 24,
           glyphSize: 14,
           onPressed: _showSuggestionHelp,
@@ -1568,10 +1701,23 @@ class _RelationDesignerState extends State<RelationDesigner> {
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 24),
                 child: Text(
-                  '添加表后，从字段右侧的圆点拖到另一张表的字段即可创建外键',
+                  pickText(
+                    '添加表后，从字段两端的圆点拖到另一张表的字段即可创建外键',
+                    'After adding tables, drag from either dot on a column onto a column of another table to create a foreign key',
+                  ),
                   style: kSmallMuted,
                   textAlign: TextAlign.center,
                 ),
+              ),
+              const SizedBox(height: 12),
+              // 空画布不能只给说明文字（文员会以为功能坏了）：主按钮直接打开
+              // 添加表弹窗，和工具栏里的「+ 添加表」是同一个入口（P2-5）。
+              Btn(
+                pickText('+ 添加表', '+ Add table'),
+                key: const ValueKey('er-empty-add-table'),
+                primary: true,
+                icon: Icons.add,
+                onPressed: _openAddTables,
               ),
             ],
           ),
@@ -1805,7 +1951,10 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   Widget _fieldRow(ErTable table, int index, ErNodeMetrics metrics) {
     final column = table.columns[index];
-    final typeLabel = column.typeLabel;
+    final rawType = column.typeLabel;
+    // 中文界面说人话（varchar(255) → 文本（VARCHAR(255)）、bigint → 大整数），
+    // 完整 SQL 类型放进 Tooltip；英文界面仍显示原始类型（第 51 轮 P2-1）。
+    final typeLabel = columnTypeLabel(rawType);
     return SizedBox(
       height: metrics.rowHeight,
       child: Row(
@@ -1838,13 +1987,17 @@ class _RelationDesignerState extends State<RelationDesigner> {
           if (typeLabel.isNotEmpty)
             SizedBox(
               width: metrics.cardWidth * 0.34,
-              child: Text(
-                typeLabel,
-                maxLines: 1,
-                softWrap: false,
-                textAlign: TextAlign.right,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 9, color: AppColors.muted),
+              child: Tooltip(
+                message: columnTypeTooltip(rawType),
+                waitDuration: const Duration(milliseconds: 300),
+                child: Text(
+                  typeLabel,
+                  maxLines: 1,
+                  softWrap: false,
+                  textAlign: TextAlign.right,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 9, color: AppColors.muted),
+                ),
               ),
             ),
           _connectionDot(table, index, column, metrics, fromLeft: false),
@@ -2121,6 +2274,16 @@ enum _JunctionChoice { junction, direct, cancel }
 
 /// 中间表提示的触发原因：两表已有关系 / 双方连接列都不唯一。
 enum _JunctionReason { existingRelation, notUnique }
+
+/// 一次建议外键建立操作里单条失败的记录（用于工具栏下方的汇总提示）。
+class _SuggestionFailure {
+  const _SuggestionFailure(this.relation, this.detail);
+
+  final ErRelation relation;
+
+  /// 中文 / 英文可读原因：本地前置校验文案，或数据库返回的原始错误。
+  final String detail;
+}
 
 /// 拖拽中的临时连线。
 class _ConnectDrag {
@@ -2747,7 +2910,11 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
         if (!mounted) return;
         setState(() {
           _busy = false;
-          _error = error.toString();
+          _error = erDbActionError(
+            zh: '创建中间表失败：',
+            en: 'Failed to create the junction table: ',
+            error: error,
+          );
         });
       }
       return;
@@ -2803,7 +2970,12 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
       if (!mounted) return;
       setState(() {
         _busy = false;
-        _error = error.toString();
+        // P0-1：失败必须留在弹窗里（中文前缀 + 数据库原文），不能静默关窗。
+        _error = erDbActionError(
+          zh: '创建外键失败：',
+          en: 'Failed to create the foreign key: ',
+          error: error,
+        );
       });
     }
   }
@@ -2961,7 +3133,7 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Btn(
-                '返回工作表与字段修改',
+                pickText('返回工作表与字段修改', 'Back to worksheets and fields'),
                 key: const ValueKey('er-back-to-fields'),
                 small: true,
                 onPressed: () {
@@ -3014,7 +3186,11 @@ class _RelationDialogState extends State<_RelationDialog> {
       if (!mounted) return;
       setState(() {
         _busy = false;
-        _error = error.toString();
+        _error = erDbActionError(
+          zh: '删除外键失败：',
+          en: 'Failed to delete the foreign key: ',
+          error: error,
+        );
       });
     }
   }
@@ -3179,7 +3355,11 @@ class _JunctionDialogState extends State<_JunctionDialog> {
       if (!mounted) return;
       setState(() {
         _busy = false;
-        _error = error.toString();
+        _error = erDbActionError(
+          zh: '创建中间表失败：',
+          en: 'Failed to create the junction table: ',
+          error: error,
+        );
       });
     }
   }
@@ -3253,7 +3433,7 @@ class _JunctionDialogState extends State<_JunctionDialog> {
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Btn(
-                '返回工作表与字段修改',
+                pickText('返回工作表与字段修改', 'Back to worksheets and fields'),
                 key: const ValueKey('er-back-to-fields'),
                 small: true,
                 onPressed: () {

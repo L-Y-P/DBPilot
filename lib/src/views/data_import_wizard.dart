@@ -1954,7 +1954,7 @@ class DataImportWizardDialogState extends State<DataImportWizardDialog> {
                 const SizedBox(height: 8),
                 AlertBox(
                   _isExcel
-                      ? '工作簿较大：读取时会整表载入内存后分批插入；界面保持响应，可随时取消。'
+                      ? '工作簿较大：按行流式读取并分批插入，内存占用与行数无关（共享字符串表仍需一次加载）；界面保持响应，可随时取消。'
                       : '文件较大：导入会逐块读取并分批插入，界面保持响应，可随时取消。',
                   tone: AlertTone.warn,
                 ),
@@ -2182,7 +2182,7 @@ class DataImportWizardDialogState extends State<DataImportWizardDialog> {
   List<String> _importModeLines() {
     if (_isExcel) {
       return const <String>[
-        '工作表会整表载入内存后按批 INSERT 写入（超大工作簿请关注内存占用）；',
+        '工作表按行流式读取、按批 INSERT 写入（共享字符串表仍需一次加载）；',
         '数字 / 日期 / 布尔 / 文本按原单元格类型识别；校验通过前不会写入任何数据。',
       ];
     }

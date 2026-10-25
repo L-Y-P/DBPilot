@@ -420,16 +420,71 @@ impl ColumnEvidence {
     }
 }
 
-fn column_schema(index: usize, name: &str, rows: &[Vec<Value>]) -> Value {
-    let mut evidence = ColumnEvidence::new();
-    for row in rows {
-        evidence.observe(row.get(index).unwrap_or(&Value::Null));
+/// 文本列的「推荐长度」：给文员后续录入留余量。
+///
+/// 样本最大长度只是这一批数据的宽度，直接顶满会让用户第二天录入长一点的姓名、
+/// 班级或邮箱就撞上 MySQL STRICT 模式的 ERROR 1406 Data too long。规则：
+/// 样本最大长度 <= 127 时给 255（满足「至少 2 倍、且不小于 32」的余量）；超过
+/// 127 时返回 0，由建表向导落成 TEXT，避免把超长文本截断。
+fn recommended_text_length(sample_max_length: usize) -> usize {
+    if sample_max_length <= 127 {
+        255
+    } else {
+        0
     }
-    let data_type = evidence.inferred_type();
-    let primary_candidate = name.eq_ignore_ascii_case("id")
-        || (index == 0 && evidence.unique && evidence.empty == 0 && evidence.non_empty > 0);
+}
+
+/// 「样本内唯一」的统一口径：无重复非空值、无空值、且至少有一个非空样本。
+fn column_unique(evidence: &ColumnEvidence) -> bool {
+    evidence.unique && evidence.empty == 0 && evidence.non_empty > 0
+}
+
+/// 每张表最多选一个主键候选，优先级：id 列名 > 最早的唯一整数列 > 唯一的短文本首列。
+///
+/// 只影响「建议」，不改类型推断本身。返回与列一一对应的 reason，非候选为 ""。
+/// 规则 b/c 要求列在样本内唯一且无空值；规则 a 保持旧行为（只要列名叫 id 就提示），
+/// 以免同一个文件在新旧版本给出不同的主键建议。
+fn primary_candidate_reasons(
+    names: &[String],
+    evidences: &[ColumnEvidence],
+    types: &[&'static str],
+) -> Vec<&'static str> {
+    let mut reasons = vec![""; names.len()];
+    // a) 显式 id 列（忽略大小写）。
+    if let Some(index) = names
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("id"))
+    {
+        reasons[index] = "id";
+        return reasons;
+    }
+    // b) 最早的唯一整数列：学号/订单号/工号这类自然键，不该逼用户再加自增 id。
+    if let Some(index) = (0..names.len()).find(|&index| {
+        column_unique(&evidences[index]) && matches!(types[index], "integer" | "bigint")
+    }) {
+        reasons[index] = "unique_integer";
+        return reasons;
+    }
+    // c) 唯一的短文本首列（邮箱/名称/编号）；64 字符上限避免把长文本备注当主键。
+    if !names.is_empty()
+        && types[0] == "text"
+        && column_unique(&evidences[0])
+        && evidences[0].max_length <= 64
+    {
+        reasons[0] = "first_column";
+    }
+    reasons
+}
+
+fn column_schema(
+    index: usize,
+    name: &str,
+    evidence: &ColumnEvidence,
+    data_type: &'static str,
+    primary_reason: &'static str,
+) -> Value {
     let max_length = if data_type == "text" {
-        evidence.max_length
+        recommended_text_length(evidence.max_length)
     } else {
         0
     };
@@ -439,7 +494,9 @@ fn column_schema(index: usize, name: &str, rows: &[Vec<Value>]) -> Value {
         "type": data_type,
         "nullable": evidence.empty > 0,
         "max_length": max_length,
-        "primary_candidate": primary_candidate,
+        "unique": column_unique(evidence),
+        "primary_candidate": !primary_reason.is_empty(),
+        "primary_candidate_reason": primary_reason,
         "samples": evidence.samples,
     })
 }
@@ -479,10 +536,27 @@ pub fn infer_schema(header: Option<&[String]>, rows: &[Vec<Value>], max_rows: us
         used.push(name.clone());
         names.push(name);
     }
+    // 每列只扫一遍样本；主键候选要跨列比较，所以先算完证据再统一选。
+    let evidences: Vec<ColumnEvidence> = (0..names.len())
+        .map(|index| {
+            let mut evidence = ColumnEvidence::new();
+            for row in rows {
+                evidence.observe(row.get(index).unwrap_or(&Value::Null));
+            }
+            evidence
+        })
+        .collect();
+    let types: Vec<&'static str> = evidences
+        .iter()
+        .map(ColumnEvidence::inferred_type)
+        .collect();
+    let reasons = primary_candidate_reasons(&names, &evidences, &types);
     let columns: Vec<Value> = names
         .iter()
         .enumerate()
-        .map(|(index, name)| column_schema(index, name, rows))
+        .map(|(index, name)| {
+            column_schema(index, name, &evidences[index], types[index], reasons[index])
+        })
         .collect();
     json!({ "sample_count": rows.len(), "columns": columns })
 }

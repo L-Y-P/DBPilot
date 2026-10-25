@@ -587,7 +587,8 @@ class CreateTableDialogState extends State<CreateTableDialog> {
         headers: [
           Text(t('column_name')),
           Text(t('column_type')),
-          Text((I18n.current == AppLang.en ? 'Allow NULL' : '允许 NULL')),
+          // 与快速建表向导统一：「允许空」比裸 SQL 关键字 NULL 更好懂。
+          Text((I18n.current == AppLang.en ? 'Allow NULL' : '允许空')),
           Text(t('default_value')),
           Text(t('primary_key')),
           Text(t('auto_increment')),

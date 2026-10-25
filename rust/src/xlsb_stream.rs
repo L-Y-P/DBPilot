@@ -300,9 +300,13 @@ enum CellFormat {
 }
 
 /// 内建数字格式 id（与 xlsx 路径的 builtin_format 一致）。
+///
+/// 27–36、50–58 是 ECMA-376 预留给区域设置的日期/时间内建格式（CJK 版 Excel、
+/// LibreOffice 常见）；漏掉会让日期按序列号读成整数。37–44 是会计/数值格式，
+/// 不要并进来。
 fn builtin_format(id: u32) -> CellFormat {
     match id {
-        14..=22 | 45 | 47 => CellFormat::DateTime,
+        14..=22 | 27..=36 | 45 | 47 | 50..=58 => CellFormat::DateTime,
         46 => CellFormat::TimeDelta,
         _ => CellFormat::Other,
     }
@@ -1617,10 +1621,15 @@ mod tests {
     }
 
     /// 固定样式表：cellXfs = [General, ifmt 14, ifmt 22, ifmt 21, ifmt 165(自定义时长)]。
+    fn write_styles_bin() -> Vec<u8> {
+        write_styles_bin_with(&[0, 14, 22, 21, 165])
+    }
+
+    /// 同 write_styles_bin，但 cellXfs 的 ifmt 由调用方给出（回归内建格式号用）。
     ///
     /// 同时写两条 BrtFmt（自定义格式串），让 styles.bin 的自定义格式分支也有覆盖：
     /// 164 "0.00"（非日期）、165 "[h]:mm:ss"（时长）。
-    fn write_styles_bin() -> Vec<u8> {
+    fn write_styles_bin_with(xfs: &[u16]) -> Vec<u8> {
         let mut writer = BrtWriter::new();
         writer.empty(0x0116); // BrtBeginStyleSheet
         let custom: [(u16, &str); 2] = [(164, "0.00"), (165, "[h]:mm:ss")];
@@ -1632,10 +1641,9 @@ mod tests {
             writer.record(brt::FMT, &payload);
         }
         writer.empty(0x0268); // BrtEndFmts
-        // 下标 4 用自定义格式 165（"[h]:mm:ss"）验证自定义格式分支。
-        let xfs: [u16; 5] = [0, 14, 22, 21, 165];
+        // 默认表的下标 4 用自定义格式 165（"[h]:mm:ss"）验证自定义格式分支。
         writer.record(brt::BEGIN_CELL_XFS, &(xfs.len() as u32).to_le_bytes());
-        for ifmt in xfs {
+        for &ifmt in xfs {
             // BrtXF: ixfeParent(2) + ifmt(2) + 对齐/保护位
             let mut payload = Vec::new();
             payload.extend_from_slice(&0xFFFFu16.to_le_bytes());
@@ -2072,6 +2080,44 @@ mod tests {
         assert_eq!(builtin_format(21), CellFormat::DateTime);
         assert_eq!(builtin_format(46), CellFormat::TimeDelta);
         assert_eq!(builtin_format(0), CellFormat::Other);
+    }
+
+    #[test]
+    fn east_asian_builtin_formats_resolve_serial_to_date() {
+        // 27–36 / 50–58 是 CJK 等区域设置的日期时间内建格式；37–44 是会计/数值格式。
+        for id in [14u32, 22, 27, 28, 31, 36, 50, 55, 58] {
+            assert_eq!(builtin_format(id), CellFormat::DateTime, "ifmt={id}");
+        }
+        for id in [0u32, 37, 38, 39, 40, 41, 42, 43, 44, 49, 59] {
+            assert_eq!(builtin_format(id), CellFormat::Other, "ifmt={id}");
+        }
+        assert_eq!(builtin_format(46), CellFormat::TimeDelta);
+
+        // 走真实的 styles.bin 解析：cellXfs = [General, 27, 31, 55]，
+        // 序列号 45000 必须变成 2023-03-15，而不是整数。
+        let styles = parse_styles(&write_styles_bin_with(&[0, 27, 31, 55]));
+        assert_eq!(
+            styles.formats,
+            vec![
+                CellFormat::Other,
+                CellFormat::DateTime,
+                CellFormat::DateTime,
+                CellFormat::DateTime,
+            ]
+        );
+        let mut parser = SheetParser::new(Arc::new(Vec::new()), Arc::new(styles), false, 0);
+        let rows = parse_rows(
+            &mut parser,
+            &sheet_data_bytes(&[vec![
+                real_styled(0, 1, 45_000.0),
+                real_styled(1, 2, 45_000.0),
+                real_styled(2, 3, 45_000.0),
+            ]]),
+        );
+        assert_eq!(
+            rows[0],
+            vec![json!("2023-03-15"), json!("2023-03-15"), json!("2023-03-15")]
+        );
     }
 
     // ============================================================ 行解析（合成记录）

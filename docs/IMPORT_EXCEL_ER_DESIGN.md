@@ -586,11 +586,11 @@ Future<void> showRelationDesigner(
 - 100 MB / 252 万行本机 MySQL 实测：batch 500/1000/2000 差异在噪声内（5.27–5.35 MB/s），batch 5000 更慢（4.99 MB/s）；transaction_batches=4 反而慢约 14%，因此默认 1，不建议开启。
 - MAX_BATCH_SQL_BYTES 仍为 512 KiB，低于服务器 max_allowed_packet（本机 64 MiB）；失败、取消、连接断开路径沿用逐批/逐行错误处理。
 
-### 21.3 单写入连接有界流水线（实验，默认关闭）
+### 21.3 单写入连接有界流水线（ROUND66，默认开启）
 
-- ExecuteOptions 新增 pipeline_batches（默认 1，2..=8 启用；transaction_batches 必须为 1）。生产者解析/渲染 SQL 并把 String 所有权移交到 VecDeque 有界队列，消费者用同一 ConnectionHandle 逐批执行；在途 1 批、队列 capacity 批、缓冲回收池 capacity+2；失败时用批次 checkpoint 恢复计数，取消/解析失败会 drain 已入队完整批次。
-- 100 MB / 252 万行、容量 2 与 4 各 3 次交错实测：串行中位 19.91 s，容量 2 20.73 s、容量 4 19.18 s，未稳定低于 ROUND65 的 18.69 s；queue_wait 4.7–6.9 s，说明同 task 协作式轮询未真正重叠 DB 等待。因此默认仍为 1，保留为实验项；详见 analysis/IMPORT_PIPELINE_ROUND66.md。
-- 内存有界（队列峰值 = capacity+1），错误/取消/DB 失败与串行结果计数一致；差分测试覆盖容量 2/4、中间批失败、skip/stop、解析失败、取消后再次导入。
+- ExecuteOptions 新增 pipeline_batches（默认 2，1 回退串行，2..=8 为队列容量；transaction_batches 必须为 1）。生产者（当前导入 task）解析/渲染 SQL 并把 String/行 span 所有权移交到有界 Tokio mpsc 队列；消费者是**独立 tokio task**，用同一 ConnectionHandle 逐批执行，并通过第二个有界 channel 归还缓冲复用。队列满时生产者 await send，不继续缓存；队列 capacity 批 + 消费者当前 1 批 + 回收池 capacity+2。
+- 100 MB / 252 万行、容量 1/2/4 各 3 次交错：串行中位 18.26 s / 5.48 MB/s；容量 2 **14.58 s / 6.86 MB/s / 173,143 行/s**（相对 ROUND65 串行 18.69 s / 5.35 MB/s：−22.0% / +28.2%），容量 4 14.70 s（与 2 差异 <1%）。消费者独立 task 是关键；同 task 协作轮询实测无收益。详见 analysis/IMPORT_PIPELINE_ROUND66.md。
+- 失败/取消：stop 模式 DB 批次失败丢弃未启动队列，用 checkpoint 恢复 data_records/records/bytes/rows_failed/issues/batches/sql_bytes；skip 逐行重放；解析失败/取消 drain 已入队完整批次后退出。内存有界（队列峰值 = capacity+1），差分测试覆盖容量 2/4、中间批失败、skip/stop、解析失败、取消后再次导入。
 
 ### 21.4 LOAD DATA LOCAL INFILE（未实施）
 

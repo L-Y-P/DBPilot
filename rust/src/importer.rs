@@ -276,10 +276,11 @@ pub struct ExecuteOptions {
     pub transaction_batches: usize,
     /// Bounded-queue pipeline depth for the delimited fast path (P3).
     ///
-    /// 1 (the default) keeps the current serial path.  2..=8 runs the CSV parser
-    /// as a producer and the single MySQL connection as a consumer, overlapping
+    /// 2 (the default since ROUND66) runs the CSV parser as a producer and the
+    /// single write connection as a separate consumer task, overlapping
     /// parse/SQL-render with database execution through a bounded queue.  The
-    /// value is the queue capacity (completed batches in flight).
+    /// value is the queue capacity (completed batches in flight).  1 explicitly
+    /// disables the pipeline and keeps the serial path.
     #[serde(default = "default_pipeline_batches")]
     pub pipeline_batches: usize,
 }
@@ -289,7 +290,7 @@ fn default_transaction_batches() -> usize {
 }
 
 fn default_pipeline_batches() -> usize {
-    1
+    2
 }
 
 impl Default for ExecuteOptions {
@@ -3961,6 +3962,7 @@ struct FastBatchRow {
 
 /// A completed SQL batch handed to the single write consumer.
 struct PipelineBatch {
+    seq: u64,
     sql: String,
     rows: Vec<FastBatchRow>,
 }
@@ -3980,6 +3982,7 @@ struct BatchCheckpoint {
 
 #[derive(Clone, Debug)]
 struct PipelineFailure {
+    seq: u64,
     message: String,
     index: u64,
     line: u64,
@@ -3995,17 +3998,54 @@ struct PipelineBatchOutcome {
     db_ns: u128,
 }
 
-type PipelineFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = PipelineBatchOutcome> + Send>>;
-
-struct QueuedBatch {
-    batch: PipelineBatch,
-    checkpoint: BatchCheckpoint,
+#[derive(Default)]
+struct PipelineShared {
+    rows_inserted: u64,
+    rows_failed_consumer: u64,
+    consumer_issues: Vec<Value>,
+    db_ns: u128,
+    batches_done: u64,
+    failure: Option<PipelineFailure>,
 }
 
-struct InFlightBatch {
-    future: PipelineFuture,
-    checkpoint: BatchCheckpoint,
+/// Consumer task: one writer connection, batches in order, bounded input channel.
+async fn pipeline_consumer_task(
+    mut rx: tokio::sync::mpsc::Receiver<PipelineBatch>,
+    conn: crate::core::connection::ConnectionHandle,
+    insert_prefix: String,
+    skip_errors: bool,
+    max_issues: usize,
+    shared: std::sync::Arc<std::sync::Mutex<PipelineShared>>,
+    recycle: tokio::sync::mpsc::Sender<(String, Vec<FastBatchRow>)>,
+) {
+    while let Some(batch) = rx.recv().await {
+        let outcome = execute_pipeline_batch(
+            &conn,
+            &insert_prefix,
+            batch,
+            skip_errors,
+            max_issues,
+        )
+        .await;
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.db_ns += outcome.db_ns;
+            if let Some(failure) = outcome.failure.clone() {
+                guard.failure = Some(failure);
+                // Stop executing later queued batches; dropping rx makes the
+                // producer's next send fail instead of blocking forever.
+                return;
+            }
+            guard.rows_inserted += outcome.inserted;
+            guard.rows_failed_consumer += outcome.failed;
+            guard.consumer_issues.extend(outcome.issues);
+            guard.batches_done += 1;
+        }
+        let mut batch = outcome.batch;
+        batch.sql.clear();
+        batch.rows.clear();
+        let _ = recycle.try_send((batch.sql, batch.rows));
+    }
 }
 
 /// Run one batch on the single write connection, with the serial path's
@@ -4062,6 +4102,7 @@ async fn execute_pipeline_batch(
         } else {
             let row = &outcome.batch.rows[0];
             outcome.failure = Some(PipelineFailure {
+                seq: outcome.batch.seq,
                 message: format!("批量插入失败: {}", error),
                 index: row.index,
                 line: row.line,
@@ -4123,12 +4164,12 @@ async fn execute_delimited_fast(
     let pipeline_enabled = options.pipeline_batches > 1 && transaction_batches == 1;
     let group_enabled = !pipeline_enabled && transaction_batches > 1 && !skip_errors;
     let mut pending: Vec<FastPendingBatch> = Vec::new();
-    let mut queue: std::collections::VecDeque<QueuedBatch> = std::collections::VecDeque::new();
-    let mut in_flight: Option<InFlightBatch> = None;
-    let mut free_buffers: Vec<(String, Vec<FastBatchRow>)> = Vec::new();
     let mut pipeline_db_failure = false;
     let mut pipeline_queue_peak = 0usize;
     let mut pipeline_wait_ns: u128 = 0;
+    let mut pipeline_checkpoints: Vec<BatchCheckpoint> = Vec::new();
+    let mut pipeline_seq = 0u64;
+    let mut pipeline_sent = 0u64;
 
     let mut scanner = TextScanner::open(parse)?;
     let mut record_bytes: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -4136,6 +4177,32 @@ async fn execute_delimited_fast(
 
     let mut insert_prefix = String::new();
     push_insert_header(&mut insert_prefix, driver.kind(), database, table, &columns);
+
+    let mut pipeline_tx: Option<tokio::sync::mpsc::Sender<PipelineBatch>> = None;
+    let mut pipeline_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pipeline_shared: Option<std::sync::Arc<std::sync::Mutex<PipelineShared>>> = None;
+    let mut pipeline_recycle: Option<
+        tokio::sync::mpsc::Receiver<(String, Vec<FastBatchRow>)>,
+    > = None;
+    if pipeline_enabled {
+        let (tx, rx) = tokio::sync::mpsc::channel::<PipelineBatch>(pipeline_capacity);
+        let (recycle_tx, recycle_rx) =
+            tokio::sync::mpsc::channel::<(String, Vec<FastBatchRow>)>(pipeline_capacity + 2);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(PipelineShared::default()));
+        pipeline_handle = Some(tokio::spawn(pipeline_consumer_task(
+            rx,
+            conn.clone(),
+            insert_prefix.clone(),
+            skip_errors,
+            max_issues,
+            shared.clone(),
+            recycle_tx,
+        )));
+        pipeline_tx = Some(tx);
+        pipeline_shared = Some(shared);
+        pipeline_recycle = Some(recycle_rx);
+    }
+
     let mut batch_sql = String::with_capacity(insert_prefix.len() + 256 * 1024);
     batch_sql.push_str(&insert_prefix);
     let mut batch_rows: Vec<FastBatchRow> = Vec::with_capacity(batch_size.min(4_096));
@@ -4303,132 +4370,16 @@ async fn execute_delimited_fast(
         }};
     }
 
-    // ------------------------------ P3 cooperative producer/consumer macros
-    //
-    // The producer stays in this loop; the batch future is polled once so the
-    // single write connection starts sending SQL, then the next batch is parsed
-    // while that future is in flight.  A bounded VecDeque holds parsed batches
-    // that have not started yet (queue capacity = pipeline_batches); when it is
-    // full the producer awaits the in-flight batch instead of buffering more.
-    // No threads, no extra DB connection, no unbounded channel.
-
-    macro_rules! apply_pipeline_outcome {
-        ($checkpoint:expr, $outcome:expr) => {{
-            let outcome = $outcome;
-            let checkpoint = $checkpoint;
-            db_ns += outcome.db_ns;
-            rows_inserted += outcome.inserted;
-            rows_failed += outcome.failed;
-            if issues.len() < max_issues {
-                for issue in outcome.issues {
-                    if issues.len() >= max_issues {
-                        break;
-                    }
-                    issues.push(issue);
-                }
-            }
-            if let Some(failure) = outcome.failure {
-                // The consumer stopped on this batch.  The producer may have
-                // parsed (but not started) later batches; discard them and
-                // restore the counters to the serial path's state at the
-                // failing batch.
-                data_records = checkpoint.data_records;
-                records = checkpoint.records;
-                bytes_read = checkpoint.bytes_read;
-                // The serial batch-stop path appends the DB issue directly
-                // without incrementing rows_failed; keep that exact contract.
-                rows_failed = checkpoint.rows_failed;
-                issues.truncate(checkpoint.issues_len);
-                if issues.len() < max_issues {
-                    let mut issue = issue_json(
-                        failure.index,
-                        failure.line,
-                        failure.offset,
-                        &failure.message,
-                        "",
-                    );
-                    issue["snippet"] = json!("");
-                    issues.push(issue);
-                }
-                batches = checkpoint.batches;
-                sql_bytes = checkpoint.sql_bytes;
-                stopped = true;
-                stop_message = failure.message;
-                pipeline_db_failure = true;
-                queue.clear();
-            }
-            // Recycle the owned SQL/row buffers; capacity is reused next batch.
-            let mut batch = outcome.batch;
-            batch.sql.clear();
-            batch.rows.clear();
-            free_buffers.push((batch.sql, batch.rows));
-            if free_buffers.len() > pipeline_capacity + 2 {
-                free_buffers.remove(0);
-            }
-        }};
-    }
-
-    macro_rules! start_pipeline_batch {
+    macro_rules! pipeline_shared_failed {
         () => {{
-            if in_flight.is_none() {
-                if let Some(queued) = queue.pop_front() {
-                    let checkpoint = queued.checkpoint;
-                    let conn2 = conn.clone();
-                    let prefix2 = insert_prefix.clone();
-                    let future: PipelineFuture = Box::pin(async move {
-                        execute_pipeline_batch(
-                            &conn2,
-                            &prefix2,
-                            queued.batch,
-                            skip_errors,
-                            max_issues,
-                        )
-                        .await
-                    });
-                    in_flight = Some(InFlightBatch { future, checkpoint });
-                }
-            }
+            pipeline_shared
+                .as_ref()
+                .map(|shared| shared.lock().unwrap().failure.is_some())
+                .unwrap_or(false)
         }};
     }
 
-    macro_rules! poll_pipeline_once {
-        () => {{
-            if in_flight.is_some() && !stopped {
-                // Poll a few times, not just once: sqlx may need an immediate
-                // pool-acquire step before it actually sends the statement.  The
-                // first polls run the synchronous/pool-ready part so the query is
-                // in flight while the producer parses the next batch.
-                let mut completed = None;
-                {
-                    let entry = in_flight.as_mut().unwrap();
-                    for _ in 0..4 {
-                        // Poll with the task's real waker (select + a zero-duration
-                        // timer), not futures::poll!'s no-op waker: sqlx must be
-                        // able to register its socket/pool wakers before we go
-                        // back to CPU parsing.
-                        let outcome = tokio::select! {
-                            biased;
-                            outcome = entry.future.as_mut() => Some(outcome),
-                            _ = tokio::time::sleep(std::time::Duration::ZERO) => None,
-                        };
-                        if let Some(outcome) = outcome {
-                            completed = Some(outcome);
-                            break;
-                        }
-                    }
-                }
-                if let Some(outcome) = completed {
-                    let entry = in_flight.take().unwrap();
-                    apply_pipeline_outcome!(entry.checkpoint, outcome);
-                    if !stopped {
-                        start_pipeline_batch!();
-                    }
-                }
-            }
-        }};
-    }
-
-    macro_rules! enqueue_pipeline_batch {
+    macro_rules! pipeline_send_batch {
         () => {{
             if pipeline_enabled && !batch_rows.is_empty() && !stopped {
                 let sql_len = batch_sql.len();
@@ -4444,70 +4395,48 @@ async fn execute_delimited_fast(
                     sql_bytes,
                 };
                 let batch = PipelineBatch {
+                    seq: pipeline_seq,
                     sql: std::mem::take(&mut batch_sql),
                     rows: std::mem::take(&mut batch_rows),
                 };
-                queue.push_back(QueuedBatch { batch, checkpoint });
-                pipeline_queue_peak = pipeline_queue_peak
-                    .max(queue.len() + usize::from(in_flight.is_some()));
-                batch_bytes = 0;
-                if let Some((mut sql, rows)) = free_buffers.pop() {
-                    sql.clear();
-                    sql.push_str(&insert_prefix);
-                    batch_sql = sql;
-                    batch_rows = rows;
-                } else {
+                pipeline_seq += 1;
+                pipeline_checkpoints.push(checkpoint);
+                let send_started = Instant::now();
+                let sent = match pipeline_tx.as_ref() {
+                    Some(tx) => tx.send(batch).await.is_ok(),
+                    None => false,
+                };
+                pipeline_wait_ns += send_started.elapsed().as_nanos();
+                pipeline_sent += 1;
+                // Reuse the owned SQL/row capacity returned by the consumer.
+                let mut reused = false;
+                if let Some(recv) = pipeline_recycle.as_mut() {
+                    if let Ok((mut sql, rows)) = recv.try_recv() {
+                        sql.clear();
+                        sql.push_str(&insert_prefix);
+                        batch_sql = sql;
+                        batch_rows = rows;
+                        reused = true;
+                    }
+                }
+                if !reused {
                     batch_sql = String::with_capacity(insert_prefix.len() + 256 * 1024);
                     batch_sql.push_str(&insert_prefix);
                     batch_rows = Vec::with_capacity(batch_size.min(4_096));
                 }
-                start_pipeline_batch!();
-                poll_pipeline_once!();
-                // Give the runtime a chance to run the pool/timer/IO driver after
-                // the future registered its wakers, then overlap the DB wait with
-                // parsing the next batch.  This is not a thread: the producer is
-                // still this task, but the in-flight SQL continues on the I/O
-                // driver while the CPU parses.
-                tokio::task::yield_now().await;
-                // Keep at most pipeline_capacity parsed-but-not-started batches
-                // (plus the one in flight).  When full, wait for the in-flight
-                // batch and start the next queued one.
-                while !stopped && queue.len() >= pipeline_capacity {
-                    if let Some(entry) = in_flight.take() {
-                        let checkpoint = entry.checkpoint;
-                        let wait_started = Instant::now();
-                        let outcome = entry.future.await;
-                        pipeline_wait_ns += wait_started.elapsed().as_nanos();
-                        apply_pipeline_outcome!(checkpoint, outcome);
-                        if !stopped {
-                            start_pipeline_batch!();
-                        }
-                    } else {
-                        break;
-                    }
+                batch_bytes = 0;
+                if let Some(shared) = pipeline_shared.as_ref() {
+                    let done = shared.lock().unwrap().batches_done;
+                    pipeline_queue_peak = pipeline_queue_peak
+                        .max((pipeline_sent as usize).saturating_sub(done as usize));
                 }
-                if !stopped {
-                    start_pipeline_batch!();
+                let failed = pipeline_shared_failed!();
+                if failed {
+                    pipeline_db_failure = true;
                 }
-            }
-        }};
-    }
-
-    macro_rules! drain_pipeline {
-        () => {{
-            loop {
-                if in_flight.is_none() {
-                    start_pipeline_batch!();
-                }
-                let Some(entry) = in_flight.take() else {
-                    break;
-                };
-                let checkpoint = entry.checkpoint;
-                let outcome = entry.future.await;
-                apply_pipeline_outcome!(checkpoint, outcome);
-                if pipeline_db_failure {
-                    break;
-                }
+                sent && !failed
+            } else {
+                true
             }
         }};
     }
@@ -4716,7 +4645,9 @@ async fn execute_delimited_fast(
                         });
                         if batch_rows.len() >= batch_size || batch_bytes >= MAX_BATCH_SQL_BYTES {
                             if pipeline_enabled {
-                                enqueue_pipeline_batch!();
+                                if !pipeline_send_batch!() {
+                                    break;
+                                }
                             } else {
                                 flush_batch!();
                             }
@@ -4730,28 +4661,94 @@ async fn execute_delimited_fast(
         }
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
             last_progress = Instant::now();
-            progress_state.bytes = bytes_read;
-            progress_state.records = records;
-            progress_state.rows = rows_inserted;
-            progress_state.failed = rows_failed;
+            {
+                let (rows, consumer_failed) = if pipeline_enabled {
+                    let shared = pipeline_shared.as_ref().unwrap();
+                    let guard = shared.lock().unwrap();
+                    (guard.rows_inserted, guard.rows_failed_consumer)
+                } else {
+                    (rows_inserted, 0)
+                };
+                progress_state.bytes = bytes_read;
+                progress_state.records = records;
+                progress_state.rows = rows;
+                progress_state.failed = rows_failed + consumer_failed;
+            }
             progress_state.refresh(started);
             progress(&progress_state);
         }
     }
 
-    if !stopped && !cancelled {
+    if !stopped && !cancelled && !pipeline_db_failure {
         if pipeline_enabled {
-            enqueue_pipeline_batch!();
+            let _ = pipeline_send_batch!();
         } else {
             flush_batch!();
         }
     }
     if pipeline_enabled {
-        // Batches parsed before the stop/cancel must still be executed in order
-        // (they correspond to already-completed batches in the serial path).
-        // A DB failure stops this drain and keeps the trimmed counters.
-        if !pipeline_db_failure {
-            drain_pipeline!();
+        // Dropping the sender lets the consumer drain already-queued batches
+        // and exit; await it before reading shared results.
+        drop(pipeline_tx.take());
+        if let Some(handle) = pipeline_handle.take() {
+            if let Err(error) = handle.await {
+                // A panicking/aborted consumer must not look like a successful
+                // partial import: report it and keep the completed rows.
+                stopped = true;
+                stop_message = format!("导入消费者异常: {}", error);
+            }
+        }
+        let (rows_inserted_consumer, rows_failed_consumer, consumer_issues, db_ns_consumer, failure) = {
+            let shared = pipeline_shared.as_ref().unwrap();
+            let guard = shared.lock().unwrap();
+            (
+                guard.rows_inserted,
+                guard.rows_failed_consumer,
+                guard.consumer_issues.clone(),
+                guard.db_ns,
+                guard.failure.clone(),
+            )
+        };
+        rows_inserted = rows_inserted_consumer;
+        db_ns += db_ns_consumer;
+        if let Some(failure) = failure {
+            let checkpoint = pipeline_checkpoints
+                .get(failure.seq as usize)
+                .copied()
+                .unwrap_or(BatchCheckpoint {
+                    data_records,
+                    records,
+                    bytes_read,
+                    rows_failed,
+                    issues_len: issues.len(),
+                    batches,
+                    sql_bytes,
+                });
+            data_records = checkpoint.data_records;
+            records = checkpoint.records;
+            bytes_read = checkpoint.bytes_read;
+            rows_failed = checkpoint.rows_failed;
+            issues.truncate(checkpoint.issues_len);
+            if issues.len() < max_issues {
+                let mut issue = issue_json(
+                    failure.index,
+                    failure.line,
+                    failure.offset,
+                    &failure.message,
+                    "",
+                );
+                issue["snippet"] = json!("");
+                issues.push(issue);
+            }
+            batches = checkpoint.batches;
+            sql_bytes = checkpoint.sql_bytes;
+            stopped = true;
+            stop_message = failure.message;
+            pipeline_db_failure = true;
+        } else {
+            rows_failed += rows_failed_consumer;
+            issues.extend(consumer_issues);
+            issues.truncate(max_issues);
         }
     } else {
         // Complete batches already queued for a grouped transaction must still

@@ -264,6 +264,20 @@ pub struct ExecuteOptions {
     pub on_error: String,
     #[serde(default = "default_max_issues")]
     pub max_issues: usize,
+    /// How many autocommit batches to wrap into one transaction (P1).
+    ///
+    /// 1 (the default) keeps the historical behaviour: every batch is its own
+    /// autocommit statement, so a later failure keeps earlier batches.  Higher
+    /// values reduce commit round trips for the delimited fast path; on failure
+    /// the group is rolled back and replayed batch by batch so the observable
+    /// partial-import semantics stay the same.  Ignored by the generic path and
+    /// when on_error = "skip" (per-row diagnostics need per-batch isolation).
+    #[serde(default = "default_transaction_batches")]
+    pub transaction_batches: usize,
+}
+
+fn default_transaction_batches() -> usize {
+    1
 }
 
 impl Default for ExecuteOptions {
@@ -272,6 +286,7 @@ impl Default for ExecuteOptions {
             batch_size: default_batch(),
             on_error: default_on_error(),
             max_issues: default_max_issues(),
+            transaction_batches: default_transaction_batches(),
         }
     }
 }
@@ -1189,6 +1204,240 @@ fn normalize_read(read: &ReadSpec) -> ReadSpec {
     read
 }
 
+// ------------------------------------------------- fast delimited record scan
+//
+// The delimited execute path needs the record text AND its field boundaries
+// without allocating a `String` per record or per field.  `next_record_into`
+// reuses a caller-owned byte buffer and returns borrowed slices of it; the
+// caller must finish using the slice before the next call.  Semantics (quoted
+// fields, doubled quotes, embedded newlines, CRLF stripping, blank records,
+// UTF-8 diagnostics, size limits) are exactly `next_line`'s.
+
+#[derive(Clone, Copy, Debug)]
+struct RecordMeta {
+    index: u64,
+    offset: u64,
+    line: u64,
+}
+
+enum NextRecord {
+    /// The record bytes are in the caller's buffer and are valid UTF-8.
+    Record(RecordMeta),
+    Problem(ReadProblem),
+    End,
+}
+
+enum FastRecordFill {
+    Written,
+    Eof,
+    Fallback,
+}
+
+impl TextScanner {
+    /// Fill `out` with the next record and return its metadata plus a borrowed
+    /// `&str` view.  Only used by the delimited fast execute path, where
+    /// `read.trim` is false (delimited rows trim their fields instead).
+    fn next_record_into(&mut self, out: &mut Vec<u8>) -> AppResult<NextRecord> {
+        if self.done {
+            return Ok(NextRecord::End);
+        }
+        let sep = self.read.record_sep.as_bytes().to_vec();
+        if sep.is_empty() {
+            self.done = true;
+            return Ok(NextRecord::Problem(ReadProblem {
+                message: "记录分隔符不能为空".to_string(),
+                offset: self.stream.abs,
+                line: self.stream.line,
+                fatal: true,
+            }));
+        }
+        let quote_on = self.fields.mode == "delimited" && !self.read.quote.is_empty();
+        let quote = self.read.quote.as_bytes().first().copied();
+        let field_sep = self.fields.field_sep.as_bytes().to_vec();
+        loop {
+            if self.stream.at_eof()? {
+                self.done = true;
+                return Ok(NextRecord::End);
+            }
+            let (start_offset, start_line) = self.stream.position();
+            out.clear();
+            match self.read_fast_record_into(&sep, quote_on, quote, out)? {
+                FastRecordFill::Written => {}
+                FastRecordFill::Eof => {
+                    self.done = true;
+                    return Ok(NextRecord::End);
+                }
+                FastRecordFill::Fallback => {
+                    // Same state machine as `next_line`, but it appends bytes to
+                    // the reusable buffer instead of allocating a fresh Vec.
+                    let mut in_quote = false;
+                    let mut at_field_start = true;
+                    loop {
+                        if self.stream.at_eof()? {
+                            if in_quote {
+                                self.done = true;
+                                return Ok(NextRecord::Problem(ReadProblem {
+                                    message: "引号未闭合：记录一直读到文件结尾".to_string(),
+                                    offset: start_offset,
+                                    line: start_line,
+                                    fatal: true,
+                                }));
+                            }
+                            break;
+                        }
+                        if !in_quote && self.stream.starts_with(&sep)? {
+                            self.stream.advance(sep.len());
+                            break;
+                        }
+                        if quote_on
+                            && !in_quote
+                            && !field_sep.is_empty()
+                            && self.stream.starts_with(&field_sep)?
+                        {
+                            self.stream.advance(field_sep.len());
+                            out.extend_from_slice(&field_sep);
+                            at_field_start = true;
+                            continue;
+                        }
+                        let byte = match self.stream.next_byte()? {
+                            Some(byte) => byte,
+                            None => break,
+                        };
+                        if quote_on {
+                            if in_quote {
+                                if Some(byte) == quote {
+                                    if Some(byte) == self.stream.peek()? {
+                                        self.stream.advance(1);
+                                        out.push(byte);
+                                        out.push(byte);
+                                    } else {
+                                        in_quote = false;
+                                        out.push(byte);
+                                    }
+                                } else {
+                                    out.push(byte);
+                                }
+                                continue;
+                            }
+                            if Some(byte) == quote && at_field_start {
+                                in_quote = true;
+                                at_field_start = false;
+                                out.push(byte);
+                                continue;
+                            }
+                        }
+                        at_field_start = false;
+                        out.push(byte);
+                        if out.len() > self.read.max_record_bytes {
+                            self.done = true;
+                            return Ok(NextRecord::Problem(ReadProblem {
+                                message: format!(
+                                    "单条记录超过上限 {} 字节，可能记录分隔符配置不正确",
+                                    self.read.max_record_bytes
+                                ),
+                                offset: start_offset,
+                                line: start_line,
+                                fatal: true,
+                            }));
+                        }
+                    }
+                }
+            }
+            // A record terminated by CRLF keeps a trailing CR when the separator
+            // is a bare newline; strip it like a text editor would.
+            if sep.ends_with(b"\n") && out.last() == Some(&b'\r') {
+                out.pop();
+            }
+            let index = self.next_index;
+            self.next_index += 1;
+            if std::str::from_utf8(out).is_err() {
+                return Ok(NextRecord::Problem(ReadProblem {
+                    message: "记录不是有效的 UTF-8 文本（可能是 GBK/GB18030 编码）".to_string(),
+                    offset: start_offset,
+                    line: start_line,
+                    fatal: false,
+                }));
+            }
+            let text = std::str::from_utf8(out).expect("UTF-8 validated above");
+            debug_assert!(
+                !(self.read.trim
+                    && !matches!(self.fields.mode.as_str(), "delimited" | "markdown")),
+                "next_record_into is only used for delimited records"
+            );
+            if text.is_empty() {
+                if self.read.skip_blank {
+                    continue;
+                }
+                return Ok(NextRecord::Problem(ReadProblem {
+                    message: "空记录（跳过空行可避免）".to_string(),
+                    offset: start_offset,
+                    line: start_line,
+                    fatal: false,
+                }));
+            }
+            return Ok(NextRecord::Record(RecordMeta {
+                index,
+                offset: start_offset,
+                line: start_line,
+            }));
+        }
+    }
+
+    /// Copy the next unquoted record into `out`.  Leaves the stream untouched
+    /// when it returns `Fallback` so the byte-wise state machine can take over.
+    fn read_fast_record_into(
+        &mut self,
+        sep: &[u8],
+        quote_on: bool,
+        quote: Option<u8>,
+        out: &mut Vec<u8>,
+    ) -> AppResult<FastRecordFill> {
+        if sep.len() != 1 {
+            return Ok(FastRecordFill::Fallback);
+        }
+        let sep_byte = sep[0];
+        let quote_byte = if quote_on {
+            match quote {
+                Some(byte) if byte != b'\n' && byte != sep_byte => Some(byte),
+                _ => return Ok(FastRecordFill::Fallback),
+            }
+        } else {
+            None
+        };
+        loop {
+            if self.stream.remaining() == 0 {
+                if !self.stream.fill_more()? {
+                    return Ok(FastRecordFill::Eof);
+                }
+            }
+            let start = self.stream.pos;
+            let buf = &self.stream.buf;
+            match buf[start..].iter().position(|&byte| byte == sep_byte) {
+                Some(relative) => {
+                    let end = start + relative;
+                    if end - start > self.read.max_record_bytes {
+                        return Ok(FastRecordFill::Fallback);
+                    }
+                    if let Some(quote_byte) = quote_byte {
+                        if buf[start..end].contains(&quote_byte) {
+                            return Ok(FastRecordFill::Fallback);
+                        }
+                    }
+                    out.extend_from_slice(&buf[start..end]);
+                    self.stream.consume_through(end + sep.len());
+                    return Ok(FastRecordFill::Written);
+                }
+                None => {
+                    if self.stream.eof || self.stream.remaining() > self.read.max_record_bytes {
+                        return Ok(FastRecordFill::Fallback);
+                    }
+                    self.stream.fill_more()?;
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- field parse
 
 #[derive(Clone, Debug)]
@@ -1294,6 +1543,43 @@ fn finish_field(mut field: String, trim: bool) -> String {
         }
     }
     field
+}
+
+/// Field boundaries (byte ranges into `text`) for a record that contains no
+/// quote character.  This is the unquoted CSV fast path: no per-field String,
+/// no escaping work — the semantics are exactly `split_fields`'s fast path
+/// (`text.split(sep)`, then `trim` every field).
+fn split_fields_ranges(
+    text: &str,
+    sep: &str,
+    trim: bool,
+    out: &mut Vec<(usize, usize)>,
+) -> Result<(), String> {
+    if sep.is_empty() {
+        return Err("字段分隔符不能为空".to_string());
+    }
+    out.clear();
+    let mut start = 0usize;
+    loop {
+        let end = match text[start..].find(sep) {
+            Some(relative) => start + relative,
+            None => text.len(),
+        };
+        let (field_start, field_end) = if trim {
+            let part = &text[start..end];
+            let trimmed = part.trim();
+            let offset = trimmed.as_ptr() as usize - text.as_ptr() as usize;
+            (offset, offset + trimmed.len())
+        } else {
+            (start, end)
+        };
+        out.push((field_start, field_end));
+        if end == text.len() {
+            break;
+        }
+        start = end + sep.len();
+    }
+    Ok(())
 }
 
 /// Parse one record according to the field rule.
@@ -1912,7 +2198,7 @@ fn convert_value(raw: Value, column: &TableColumn, mapping: &MappingSpec) -> Res
             // instead of cloning it (the old code cloned it twice: trim + match).
             ColumnKind::Text => Ok(Value::String(text)),
             ColumnKind::Int => {
-                let cleaned = text.replace([',', '_'], "");
+                let cleaned = cleaned_numeric(&text);
                 if let Ok(value) = cleaned.parse::<i64>() {
                     Ok(json!(value))
                 } else if let Ok(value) = cleaned.parse::<u64>() {
@@ -1926,7 +2212,7 @@ fn convert_value(raw: Value, column: &TableColumn, mapping: &MappingSpec) -> Res
                 }
             }
             ColumnKind::Float => {
-                let cleaned = text.replace([',', '_'], "");
+                let cleaned = cleaned_numeric(&text);
                 if cleaned.parse::<f64>().is_err() {
                     return Err(format!(
                         "列 '{}' 需要数字，但值是 '{}'",
@@ -1936,22 +2222,38 @@ fn convert_value(raw: Value, column: &TableColumn, mapping: &MappingSpec) -> Res
                 }
                 // Keep the original text: the database parses decimals without
                 // the precision loss of an f64 round-trip.
-                Ok(Value::String(cleaned))
+                Ok(Value::String(cleaned.into_owned()))
             }
             ColumnKind::Bool => {
-                let lowered = text.to_ascii_lowercase();
-                let value = match lowered.as_str() {
-                    "1" | "t" | "true" | "y" | "yes" | "on" => Some(true),
-                    "0" | "f" | "false" | "n" | "no" | "off" => Some(false),
-                    _ => None,
+                let value = if text.eq_ignore_ascii_case("1")
+                    || text.eq_ignore_ascii_case("t")
+                    || text.eq_ignore_ascii_case("true")
+                    || text.eq_ignore_ascii_case("y")
+                    || text.eq_ignore_ascii_case("yes")
+                    || text.eq_ignore_ascii_case("on")
+                {
+                    Some(true)
+                } else if text.eq_ignore_ascii_case("0")
+                    || text.eq_ignore_ascii_case("f")
+                    || text.eq_ignore_ascii_case("false")
+                    || text.eq_ignore_ascii_case("n")
+                    || text.eq_ignore_ascii_case("no")
+                    || text.eq_ignore_ascii_case("off")
+                {
+                    Some(false)
+                } else {
+                    None
                 };
                 match value {
                     Some(value) => Ok(Value::Bool(value)),
-                    None => Err(format!(
-                        "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
-                        column.name,
-                        snippet(&lowered, 40)
-                    )),
+                    None => {
+                        let lowered = text.to_ascii_lowercase();
+                        Err(format!(
+                            "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
+                            column.name,
+                            snippet(&lowered, 40)
+                        ))
+                    }
                 }
             }
             ColumnKind::Date => Ok(Value::String(text)),
@@ -3361,6 +3663,782 @@ pub fn validate(
     }))
 }
 
+// ------------------------------------------------ fast delimited CSV execute
+//
+// P0 (round 65): the generic execute loop materialises one `String` per record,
+// one `String` per field, and a `Vec<Value>` per row before rendering the SQL.
+// For the common delimited/CSV shape we instead stream records into a reusable
+// byte buffer, split unquoted records into byte ranges, convert each field
+// straight into the reusable INSERT buffer, and keep only a byte span per row
+// (needed for the rare skip-errors single-row retry).  Quoted records keep the
+// existing `split_fields` implementation so all quoting/escaping semantics stay
+// byte-for-byte identical; other formats stay on the generic path.
+
+/// Allocate a cleaned numeric string only when the raw field actually contains
+/// thousands separators.  The old code always ran `str::replace`, creating one
+/// temporary String per numeric cell even for the common "1234.56" case.
+fn cleaned_numeric(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.as_bytes().iter().any(|byte| *byte == b',' || *byte == b'_') {
+        std::borrow::Cow::Owned(text.replace([',', '_'], ""))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn push_bool_literal(out: &mut String, driver: DriverKind, value: bool) {
+    if matches!(driver, DriverKind::Postgres) {
+        out.push_str(if value { "TRUE" } else { "FALSE" });
+    } else {
+        out.push_str(if value { "1" } else { "0" });
+    }
+}
+
+/// Convert one raw text field exactly like `convert_value(Value::String) +
+/// push_literal`, appending the SQL literal directly to `out`.
+fn append_field_sql(
+    out: &mut String,
+    driver: DriverKind,
+    raw: Option<&str>,
+    column: &TableColumn,
+    mapping: &MappingSpec,
+) -> Result<(), String> {
+    let Some(raw) = raw else {
+        out.push_str("NULL");
+        return Ok(());
+    };
+    let kind = column.kind();
+    let text = if mapping.trim_values { raw.trim() } else { raw };
+    if mapping
+        .null_tokens
+        .iter()
+        .any(|token| token.as_str() == text)
+    {
+        out.push_str("NULL");
+        return Ok(());
+    }
+    if text.is_empty() {
+        if mapping.empty_as_null || !matches!(kind, ColumnKind::Text) {
+            out.push_str("NULL");
+        } else {
+            push_quoted(out, driver, "");
+        }
+        return Ok(());
+    }
+    match kind {
+        ColumnKind::Text => {
+            push_quoted(out, driver, text);
+            Ok(())
+        }
+        ColumnKind::Int => {
+            let cleaned = cleaned_numeric(text);
+            if let Ok(value) = cleaned.parse::<i64>() {
+                let _ = write!(out, "{value}");
+                return Ok(());
+            }
+            if let Ok(value) = cleaned.parse::<u64>() {
+                let _ = write!(out, "{value}");
+                return Ok(());
+            }
+            Err(format!(
+                "列 '{}' 需要整数，但值是 '{}'",
+                column.name,
+                snippet(text, 40)
+            ))
+        }
+        ColumnKind::Float => {
+            let cleaned = cleaned_numeric(text);
+            if cleaned.parse::<f64>().is_err() {
+                return Err(format!(
+                    "列 '{}' 需要数字，但值是 '{}'",
+                    column.name,
+                    snippet(text, 40)
+                ));
+            }
+            // Keep the textual representation (the database parses decimals
+            // without an f64 round-trip), quoted exactly like the old path.
+            push_quoted(out, driver, &cleaned);
+            Ok(())
+        }
+        ColumnKind::Bool => {
+            let value = if text.eq_ignore_ascii_case("1")
+                || text.eq_ignore_ascii_case("t")
+                || text.eq_ignore_ascii_case("true")
+                || text.eq_ignore_ascii_case("y")
+                || text.eq_ignore_ascii_case("yes")
+                || text.eq_ignore_ascii_case("on")
+            {
+                Some(true)
+            } else if text.eq_ignore_ascii_case("0")
+                || text.eq_ignore_ascii_case("f")
+                || text.eq_ignore_ascii_case("false")
+                || text.eq_ignore_ascii_case("n")
+                || text.eq_ignore_ascii_case("no")
+                || text.eq_ignore_ascii_case("off")
+            {
+                Some(false)
+            } else {
+                None
+            };
+            match value {
+                Some(value) => {
+                    push_bool_literal(out, driver, value);
+                    Ok(())
+                }
+                None => {
+                    // The error message historically shows the lower-cased value;
+                    // only pay for that allocation on the error path.
+                    let lowered = text.to_ascii_lowercase();
+                    Err(format!(
+                        "列 '{}' 需要布尔值（true/false/1/0），但值是 '{}'",
+                        column.name,
+                        snippet(&lowered, 40)
+                    ))
+                }
+            }
+        }
+        ColumnKind::Date => {
+            push_quoted(out, driver, text);
+            Ok(())
+        }
+        ColumnKind::Json => {
+            if serde_json::from_str::<Value>(text).is_err() {
+                return Err(format!(
+                    "列 '{}' 是 JSON 类型，但值是 '{}'，不是合法的 JSON 文本",
+                    column.name,
+                    snippet(text, 40)
+                ));
+            }
+            push_quoted(out, driver, text);
+            Ok(())
+        }
+        ColumnKind::Binary => Err(format!(
+            "列 '{}' 是二进制/BLOB 类型，暂不支持从文本文件导入",
+            column.name
+        )),
+    }
+}
+
+/// Field list for one delimited record: borrowed byte ranges (unquoted fast
+/// path) or owned Strings (records containing the quote character).
+enum RowFields<'a> {
+    Ranges(&'a [(usize, usize)]),
+    Owned(&'a [String]),
+}
+
+impl RowFields<'_> {
+    fn len(&self) -> usize {
+        match self {
+            RowFields::Ranges(ranges) => ranges.len(),
+            RowFields::Owned(fields) => fields.len(),
+        }
+    }
+
+    fn get<'a>(&'a self, text: &'a str, index: usize) -> Option<&'a str> {
+        match self {
+            RowFields::Ranges(ranges) => ranges
+                .get(index)
+                .map(|(start, end)| &text[*start..*end]),
+            RowFields::Owned(fields) => fields.get(index).map(|field| field.as_str()),
+        }
+    }
+}
+
+/// Prepared positional layout for one delimited import.
+enum FastRowPlan {
+    /// Header present + name-based mapping (the normal CSV-with-header case).
+    Header(HeaderPlan),
+    /// No header + positional mapping.
+    Positional(Vec<usize>),
+}
+
+fn fast_delimited_eligible(spec: &ExecuteSpec, resolved: &ResolvedMapping) -> bool {
+    let parse = &spec.validate.parse;
+    std::env::var_os("DBPILOT_IMPORT_LEGACY").is_none()
+        && parse.fields.mode == "delimited"
+        && parse.read.mode != "wrapped"
+        && parse.fields.header == resolved.keyed
+        && !parse.fields.field_sep.is_empty()
+        && (resolved.keyed || resolved.sources.iter().all(|source| source.as_u64().is_some()))
+}
+
+/// Convert one delimited record into the current INSERT row, appending the SQL
+/// literal directly to `out`.  Returns the same errors as the generic
+/// parse_row/map/convert pipeline.
+fn fast_process_row(
+    text: &str,
+    fields: &RowFields<'_>,
+    plan: &FastRowPlan,
+    columns: &[TableColumn],
+    resolved: &ResolvedMapping,
+    mapping: &MappingSpec,
+    driver: DriverKind,
+    out: &mut String,
+) -> Result<(), String> {
+    match plan {
+        FastRowPlan::Header(header_plan) => {
+            if fields.len() > header_plan.header_len {
+                return Err(format!(
+                    "记录有 {} 个字段，表头只有 {} 列",
+                    fields.len(),
+                    header_plan.header_len
+                ));
+            }
+            for (index, position) in header_plan.positions.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                let column = &columns[index];
+                match position {
+                    Some(field_index) => append_field_sql(
+                        out,
+                        driver,
+                        fields.get(text, *field_index),
+                        column,
+                        mapping,
+                    )?,
+                    None => {
+                        if column.nullable || column.auto_increment {
+                            append_field_sql(out, driver, None, column, mapping)?;
+                        } else {
+                            let key = resolved.sources[index].as_str().unwrap_or("");
+                            return Err(format!(
+                                "缺少字段 '{}'（目标列 '{}' 不允许 NULL）",
+                                key, column.name
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(name) = &header_plan.extra_field {
+                return Err(format!("记录多出未映射的字段 '{}'", name));
+            }
+            Ok(())
+        }
+        FastRowPlan::Positional(sources) => {
+            if fields.len() > sources.len() {
+                return Err(format!(
+                    "记录有 {} 个字段，但列映射只有 {} 列（字段数多于列映射）",
+                    fields.len(),
+                    sources.len()
+                ));
+            }
+            for (index, source) in sources.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                append_field_sql(
+                    out,
+                    driver,
+                    fields.get(text, *source),
+                    &columns[index],
+                    mapping,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+struct FastBatchRow {
+    span: std::ops::Range<usize>,
+    index: u64,
+    line: u64,
+    offset: u64,
+}
+
+/// One complete batch queued for a grouped transaction (P1).
+struct FastPendingBatch {
+    sql: String,
+    rows: Vec<FastBatchRow>,
+}
+
+#[allow(unused_assignments)]
+async fn execute_delimited_fast(
+    driver: &dyn crate::core::driver::DatabaseDriver,
+    conn: &crate::core::connection::ConnectionHandle,
+    spec: &ExecuteSpec,
+    table_columns: &[TableColumn],
+    total_bytes: u64,
+    progress: &(dyn Fn(&Progress) + Sync),
+    cancel: &AtomicBool,
+) -> AppResult<Value> {
+    let started = Instant::now();
+    let mut db_ns: u128 = 0;
+    let mut sql_bytes: u64 = 0;
+    ensure_large_file_streamable(&spec.validate.parse.path)?;
+    let mapping = spec
+        .validate
+        .mapping
+        .as_ref()
+        .ok_or_else(|| AppError::bad("请先设置列映射"))?;
+    let resolved = resolve_mapping(mapping, table_columns)?;
+    let columns = mapping_column_names(&resolved);
+    let database = spec
+        .validate
+        .database
+        .as_deref()
+        .ok_or_else(|| AppError::bad("缺少目标数据库"))?;
+    let table = spec
+        .validate
+        .table
+        .as_deref()
+        .ok_or_else(|| AppError::bad("缺少目标表"))?;
+    let parse = &spec.validate.parse;
+    let options = &spec.options;
+    let batch_size = options.batch_size.clamp(1, MAX_BATCH_SIZE);
+    let max_issues = options.max_issues.clamp(1, 1_000);
+    let skip_errors = options.on_error == "skip";
+    // P1: transaction grouping is opt-in and only used when per-batch isolation
+    // is not required for diagnostics (on_error = "skip" keeps batch = 1).
+    let transaction_batches = options.transaction_batches.clamp(1, 16);
+    let group_enabled = transaction_batches > 1 && !skip_errors;
+    let mut pending: Vec<FastPendingBatch> = Vec::new();
+
+    let mut scanner = TextScanner::open(parse)?;
+    let mut record_bytes: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(64);
+
+    let mut insert_prefix = String::new();
+    push_insert_header(&mut insert_prefix, driver.kind(), database, table, &columns);
+    let mut batch_sql = String::with_capacity(insert_prefix.len() + 256 * 1024);
+    batch_sql.push_str(&insert_prefix);
+    let mut batch_rows: Vec<FastBatchRow> = Vec::with_capacity(batch_size.min(4_096));
+    let mut batch_bytes: usize = 0;
+
+    let mut progress_state = Progress {
+        phase: "importing".to_string(),
+        total_bytes,
+        ..Default::default()
+    };
+    let mut bytes_read = 0u64;
+    let mut records = 0u64;
+    let mut data_records = 0u64;
+    let mut rows_inserted = 0u64;
+    let mut rows_failed = 0u64;
+    let mut batches = 0u64;
+    let mut issues: Vec<Value> = Vec::new();
+    let mut cancelled = false;
+    let mut stopped = false;
+    let mut stop_message = String::new();
+    let mut last_progress = Instant::now();
+    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    macro_rules! report_issue {
+        ($index:expr, $line:expr, $offset:expr, $message:expr, $text:expr) => {{
+            rows_failed += 1;
+            if issues.len() < max_issues {
+                let mut issue = issue_json($index, $line, $offset, $message, "");
+                issue["snippet"] = json!(snippet($text, 120));
+                issues.push(issue);
+            }
+        }};
+    }
+
+    // P1: optionally group several autocommit batches into one transaction.
+    // The group is sent through `execute_transaction`; if it fails, it has been
+    // rolled back as a unit, and the batches are replayed one by one so the
+    // historical partial-import semantics (earlier batches stay, the failing
+    // batch reports its own error) are preserved.
+    macro_rules! flush_group {
+        () => {{
+            if !pending.is_empty() {
+                let group_len = pending.len() as u64;
+                let sqls: Vec<String> =
+                    pending.iter().map(|batch| batch.sql.clone()).collect();
+                let db_started = Instant::now();
+                let result = conn.execute_transaction(sqls).await;
+                db_ns += db_started.elapsed().as_nanos();
+                batches += group_len;
+                match result {
+                    Ok(_) => {
+                        for batch in &pending {
+                            rows_inserted += batch.rows.len() as u64;
+                        }
+                    }
+                    Err(_) => {
+                        // Replay batch by batch: the failed transaction left
+                        // nothing behind, and earlier batches must still commit
+                        // exactly like the old autocommit path.
+                        for batch in &pending {
+                            sql_bytes += batch.sql.len() as u64;
+                            let replay_started = Instant::now();
+                            let replayed = conn.run_raw(&batch.sql).await;
+                            db_ns += replay_started.elapsed().as_nanos();
+                            match replayed.error {
+                                Some(error) => {
+                                    stopped = true;
+                                    stop_message = format!("批量插入失败: {}", error);
+                                    if issues.len() < max_issues {
+                                        let row = &batch.rows[0];
+                                        let mut issue = issue_json(
+                                            row.index,
+                                            row.line,
+                                            row.offset,
+                                            &stop_message,
+                                            "",
+                                        );
+                                        issue["snippet"] = json!("");
+                                        issues.push(issue);
+                                    }
+                                    break;
+                                }
+                                None => rows_inserted += batch.rows.len() as u64,
+                            }
+                        }
+                    }
+                }
+                pending.clear();
+            }
+        }};
+    }
+
+    macro_rules! flush_batch {
+        () => {{
+            if !batch_rows.is_empty() {
+                if group_enabled {
+                    sql_bytes += batch_sql.len() as u64;
+                    pending.push(FastPendingBatch {
+                        sql: std::mem::take(&mut batch_sql),
+                        rows: std::mem::take(&mut batch_rows),
+                    });
+                    batch_bytes = 0;
+                    batch_sql.push_str(&insert_prefix);
+                    if pending.len() >= transaction_batches {
+                        flush_group!();
+                    }
+                } else {
+                    batches += 1;
+                    sql_bytes += batch_sql.len() as u64;
+                    let db_started = Instant::now();
+                    let result = conn.run_raw(&batch_sql).await;
+                    db_ns += db_started.elapsed().as_nanos();
+                    if let Some(error) = result.error {
+                        if skip_errors {
+                            // The batch rolled back as a unit (autocommit):
+                            // replay it row by row to keep the historical
+                            // per-row diagnostics.
+                            for row in &batch_rows {
+                                let mut single =
+                                    String::with_capacity(insert_prefix.len() + row.span.len());
+                                single.push_str(&insert_prefix);
+                                single.push_str(&batch_sql[row.span.clone()]);
+                                sql_bytes += single.len() as u64;
+                                let single_started = Instant::now();
+                                let single_result = conn.run_raw(&single).await;
+                                db_ns += single_started.elapsed().as_nanos();
+                                match single_result.error {
+                                    Some(error) => {
+                                        report_issue!(
+                                            row.index,
+                                            row.line,
+                                            row.offset,
+                                            &format!("插入失败: {}", error),
+                                            ""
+                                        );
+                                    }
+                                    None => rows_inserted += 1,
+                                }
+                            }
+                        } else {
+                            stopped = true;
+                            stop_message = format!("批量插入失败: {}", error);
+                            if issues.len() < max_issues {
+                                let row = &batch_rows[0];
+                                let mut issue = issue_json(
+                                    row.index,
+                                    row.line,
+                                    row.offset,
+                                    &stop_message,
+                                    "",
+                                );
+                                issue["snippet"] = json!("");
+                                issues.push(issue);
+                            }
+                        }
+                    } else {
+                        rows_inserted += batch_rows.len() as u64;
+                    }
+                    batch_rows.clear();
+                    batch_bytes = 0;
+                    batch_sql.clear();
+                    batch_sql.push_str(&insert_prefix);
+                }
+            }
+        }};
+    }
+
+    let mut header_pending = parse.fields.header;
+    let mut header_failed = false;
+    let mut plan: Option<FastRowPlan> = if header_pending {
+        None
+    } else if resolved.keyed {
+        None
+    } else {
+        Some(FastRowPlan::Positional(
+            resolved
+                .sources
+                .iter()
+                .map(|source| source.as_u64().unwrap_or(0) as usize)
+                .collect(),
+        ))
+    };
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let item = scanner.next_record_into(&mut record_bytes)?;
+        match item {
+            NextRecord::End => break,
+            NextRecord::Problem(problem) => {
+                if problem.fatal {
+                    stopped = true;
+                    stop_message = problem.message.clone();
+                    report_issue!(
+                        records,
+                        problem.line,
+                        problem.offset,
+                        &problem.message,
+                        ""
+                    );
+                    break;
+                }
+                report_issue!(
+                    records,
+                    problem.line,
+                    problem.offset,
+                    &problem.message,
+                    ""
+                );
+                continue;
+            }
+            NextRecord::Record(meta) => {
+                let text = match std::str::from_utf8(&record_bytes) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        return Err(AppError::Internal(
+                            "record buffer is not valid UTF-8".to_string(),
+                        ))
+                    }
+                };
+                records += 1;
+                bytes_read = meta.offset.max(bytes_read);
+                if header_pending {
+                    header_pending = false;
+                    match header_of(text, &parse.fields) {
+                        Ok(names) => {
+                            if resolved.keyed {
+                                plan = Some(FastRowPlan::Header(HeaderPlan::new(
+                                    &names,
+                                    &resolved,
+                                    mapping,
+                                )));
+                            }
+                            progress_state.records = records;
+                            progress_state.bytes = bytes_read;
+                            progress_state.refresh(started);
+                            progress(&progress_state);
+                            continue;
+                        }
+                        Err(message) => {
+                            header_failed = true;
+                            let message = format!("表头解析失败: {}", message);
+                            report_issue!(meta.index, meta.line, meta.offset, &message, text);
+                            if !skip_errors {
+                                stopped = true;
+                                stop_message = message;
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Row delimiters live in the shared batch buffer; the per-row
+                // span covers "(...)" only, so the skip-errors retry can send
+                // the INSERT prefix followed by exactly that span.
+                let segment_start = batch_sql.len();
+                if !batch_rows.is_empty() {
+                    batch_sql.push(',');
+                }
+                let row_start = batch_sql.len();
+                batch_sql.push('(');
+                let quote_char = parse.fields.quote.chars().next();
+                let contains_quote = quote_char.map_or(false, |quote| text.contains(quote));
+                let row_result: Result<(), String> = if let Some(plan) = plan.as_ref() {
+                    if contains_quote {
+                        match split_fields(
+                            text,
+                            &parse.fields.field_sep,
+                            &parse.fields.quote,
+                            &parse.fields.escape,
+                            parse.fields.trim,
+                        ) {
+                            Ok(fields) => {
+                                let row_fields = RowFields::Owned(&fields);
+                                fast_process_row(
+                                    text,
+                                    &row_fields,
+                                    plan,
+                                    &resolved.columns,
+                                    &resolved,
+                                    mapping,
+                                    driver.kind(),
+                                    &mut batch_sql,
+                                )
+                            }
+                            Err(message) => Err(message),
+                        }
+                    } else {
+                        match split_fields_ranges(
+                            text,
+                            &parse.fields.field_sep,
+                            parse.fields.trim,
+                            &mut ranges,
+                        ) {
+                            Ok(()) => {
+                                let row_fields = RowFields::Ranges(&ranges);
+                                fast_process_row(
+                                    text,
+                                    &row_fields,
+                                    plan,
+                                    &resolved.columns,
+                                    &resolved,
+                                    mapping,
+                                    driver.kind(),
+                                    &mut batch_sql,
+                                )
+                            }
+                            Err(message) => Err(message),
+                        }
+                    }
+                } else {
+                    debug_assert!(header_failed);
+                    // The header failed, so the generic path kept `header = None`
+                    // and every later positional row fails mapping as "keyed
+                    // mapping vs positional record". Surface a parse error first
+                    // when the row itself is malformed, like the generic path.
+                    if contains_quote {
+                        match split_fields(
+                            text,
+                            &parse.fields.field_sep,
+                            &parse.fields.quote,
+                            &parse.fields.escape,
+                            parse.fields.trim,
+                        ) {
+                            Ok(_) => Err(
+                                "文件记录没有列名（数组/分隔文本），但列映射使用的是列名"
+                                    .to_string(),
+                            ),
+                            Err(message) => Err(message),
+                        }
+                    } else {
+                        match split_fields_ranges(
+                            text,
+                            &parse.fields.field_sep,
+                            parse.fields.trim,
+                            &mut ranges,
+                        ) {
+                            Ok(()) => Err(
+                                "文件记录没有列名（数组/分隔文本），但列映射使用的是列名"
+                                    .to_string(),
+                            ),
+                            Err(message) => Err(message),
+                        }
+                    }
+                };
+                match row_result {
+                    Err(message) => {
+                        batch_sql.truncate(segment_start);
+                        report_issue!(meta.index, meta.line, meta.offset, &message, text);
+                        if !skip_errors {
+                            stopped = true;
+                            stop_message = message;
+                            break;
+                        }
+                    }
+                    Ok(()) => {
+                        batch_sql.push(')');
+                        data_records += 1;
+                        let span = row_start..batch_sql.len();
+                        batch_bytes += span.len();
+                        batch_rows.push(FastBatchRow {
+                            span,
+                            index: meta.index,
+                            line: meta.line,
+                            offset: meta.offset,
+                        });
+                        if batch_rows.len() >= batch_size || batch_bytes >= MAX_BATCH_SQL_BYTES {
+                            flush_batch!();
+                            if stopped {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if last_progress.elapsed() >= PROGRESS_INTERVAL {
+            last_progress = Instant::now();
+            progress_state.bytes = bytes_read;
+            progress_state.records = records;
+            progress_state.rows = rows_inserted;
+            progress_state.failed = rows_failed;
+            progress_state.refresh(started);
+            progress(&progress_state);
+        }
+    }
+
+    if !stopped && !cancelled {
+        flush_batch!();
+    }
+    // Complete batches already queued for a grouped transaction must still be
+    // committed when the run stops/cancels, matching the old per-batch commits.
+    // (The current partially filled batch is intentionally not flushed, exactly
+    // like the autocommit path.)
+    flush_group!();
+    if !cancelled && bytes_read < total_bytes {
+        bytes_read = total_bytes;
+    }
+    progress_state.bytes = bytes_read;
+    progress_state.phase = if cancelled {
+        "cancelled".to_string()
+    } else {
+        "done".to_string()
+    };
+    progress_state.records = records;
+    progress_state.rows = rows_inserted;
+    progress_state.failed = rows_failed;
+    progress_state.refresh(started);
+    progress(&progress_state);
+
+    Ok(json!({
+        "ok": rows_failed == 0 && !stopped && !cancelled,
+        "cancelled": cancelled,
+        "stopped": stopped,
+        "message": stop_message,
+        "bytes": bytes_read,
+        "total_bytes": total_bytes,
+        "records": records,
+        "data_records": data_records,
+        "rows_inserted": rows_inserted,
+        "rows_failed": rows_failed,
+        "batches": batches,
+        "issues": issues,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "timings": {
+            "total_ms": started.elapsed().as_millis() as u64,
+            "db_ms": (db_ns / 1_000_000) as u64,
+            "non_db_ms": ((started.elapsed().as_nanos().saturating_sub(db_ns)) / 1_000_000) as u64,
+            "sql_bytes": sql_bytes,
+            "batches": batches,
+            "batch_size": batch_size,
+            "transaction_batches": transaction_batches,
+        },
+    }))
+}
+
 // ---------------------------------------------------------------- execution
 
 /// Stream the file and INSERT it in batches.
@@ -3379,7 +4457,55 @@ pub async fn execute(
     progress: &(dyn Fn(&Progress) + Sync),
     cancel: &AtomicBool,
 ) -> AppResult<Value> {
+    // P0 fast path: the common delimited/CSV shape avoids the per-record /
+    // per-field / per-row intermediate allocations.  Every other format (and
+    // any mapping/layout this path cannot prove equivalent) stays on the
+    // original generic implementation below.  DBPILOT_IMPORT_LEGACY=1 forces the
+    // generic path for differential testing/benchmarks.
+    if let Some(mapping) = spec.validate.mapping.as_ref() {
+        if let Ok(resolved) = resolve_mapping(mapping, table_columns) {
+            if fast_delimited_eligible(spec, &resolved) {
+                return execute_delimited_fast(
+                    driver,
+                    conn,
+                    spec,
+                    table_columns,
+                    total_bytes,
+                    progress,
+                    cancel,
+                )
+                .await;
+            }
+        }
+    }
+    execute_generic(
+        driver,
+        conn,
+        spec,
+        table_columns,
+        total_bytes,
+        progress,
+        cancel,
+    )
+    .await
+}
+
+#[allow(unused_assignments)]
+async fn execute_generic(
+    driver: &dyn crate::core::driver::DatabaseDriver,
+    conn: &crate::core::connection::ConnectionHandle,
+    spec: &ExecuteSpec,
+    table_columns: &[TableColumn],
+    total_bytes: u64,
+    progress: &(dyn Fn(&Progress) + Sync),
+    cancel: &AtomicBool,
+) -> AppResult<Value> {
     let started = Instant::now();
+    // Benchmark-only counters (exposed as additive `timings` in the result):
+    // time spent inside database round trips vs everything else (read/parse/
+    // convert/render/progress). No behavioural impact.
+    let mut db_ns: u128 = 0;
+    let mut sql_bytes: u64 = 0;
     ensure_large_file_streamable(&spec.validate.parse.path)?;
     let mapping = spec
         .validate
@@ -3461,9 +4587,12 @@ pub async fn execute(
                 let mut sql = String::with_capacity(insert_prefix.len() + batch_bytes + 16);
                 sql.push_str(&insert_prefix);
                 push_insert_rows(&mut sql, driver.kind(), batch.iter().map(|row| row.3.as_slice()));
+                sql_bytes += sql.len() as u64;
                 // Text protocol: the SQL text is unique per batch, so a prepared
                 // statement would be a prepare+execute+close round trip each time.
+                let db_started = Instant::now();
                 let result = conn.run_raw(&sql).await;
+                db_ns += db_started.elapsed().as_nanos();
                 batches += 1;
                 if let Some(error) = result.error {
                     if skip_errors {
@@ -3472,7 +4601,10 @@ pub async fn execute(
                             let mut single = String::with_capacity(insert_prefix.len() + 128);
                             single.push_str(&insert_prefix);
                             push_insert_rows(&mut single, driver.kind(), std::iter::once(values.as_slice()));
+                            sql_bytes += single.len() as u64;
+                            let single_started = Instant::now();
                             let result = conn.run_raw(&single).await;
+                            db_ns += single_started.elapsed().as_nanos();
                             match result.error {
                                 Some(error) => {
                                     report_issue!(
@@ -3696,6 +4828,14 @@ pub async fn execute(
         "batches": batches,
         "issues": issues,
         "elapsed_ms": started.elapsed().as_millis() as u64,
+        "timings": {
+            "total_ms": started.elapsed().as_millis() as u64,
+            "db_ms": (db_ns / 1_000_000) as u64,
+            "non_db_ms": ((started.elapsed().as_nanos().saturating_sub(db_ns)) / 1_000_000) as u64,
+            "sql_bytes": sql_bytes,
+            "batches": batches,
+            "batch_size": batch_size,
+        },
     }))
 }
 
@@ -6688,3 +7828,162 @@ mod excel_tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod fast_path_equivalence_tests {
+    use super::*;
+
+    fn column(data_type: &str) -> TableColumn {
+        TableColumn {
+            name: "c".to_string(),
+            data_type: data_type.to_string(),
+            type_name: String::new(),
+            nullable: true,
+            auto_increment: false,
+        }
+    }
+
+    #[test]
+    fn split_fields_ranges_matches_split_fields_on_unquoted_records() {
+        let cases = [
+            "",
+            "a",
+            "a,b,c",
+            "a,,c",
+            ",",
+            "a,",
+            ",a",
+            " a , b ",
+            "中文,值,🙂",
+            "a;b",
+            "a\tb",
+        ];
+        for trim in [true, false] {
+            for sep in [",", ";", "\t"] {
+                for text in cases {
+                    let mut ranges = Vec::new();
+                    split_fields_ranges(text, sep, trim, &mut ranges).unwrap();
+                    let ours: Vec<&str> =
+                        ranges.iter().map(|(start, end)| &text[*start..*end]).collect();
+                    let old = split_fields(text, sep, "\"", "", trim).unwrap();
+                    let old_refs: Vec<&str> = old.iter().map(|field| field.as_str()).collect();
+                    assert_eq!(ours, old_refs, "text={text:?} sep={sep:?} trim={trim}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_field_rendering_matches_legacy_conversion() {
+        let mapping = MappingSpec::default();
+        let mapping_empty_null = MappingSpec {
+            empty_as_null: true,
+            ..Default::default()
+        };
+        let mapping_no_trim = MappingSpec {
+            trim_values: false,
+            ..Default::default()
+        };
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "varchar(32)",
+                &[
+                    "hello",
+                    "中文",
+                    "a'b",
+                    "a\\b",
+                    "  spaced  ",
+                    "",
+                    "\\N",
+                    "line\nbreak",
+                    "🙂",
+                ],
+            ),
+            (
+                "bigint",
+                &[
+                    "0",
+                    "-1",
+                    "1,234",
+                    "1_234",
+                    "-1_000,5",
+                    " 42 ",
+                    "abc",
+                    "1.5",
+                    "18446744073709551615",
+                ],
+            ),
+            (
+                "decimal(12,2)",
+                &[
+                    "0",
+                    "-0.5",
+                    "1.25",
+                    "1,234.50",
+                    "1_234.50",
+                    "1e3",
+                    "NaN",
+                    "abc",
+                    " 3.5 ",
+                ],
+            ),
+            (
+                "bool",
+                &[
+                    "1", "0", "true", "FALSE", "yes", "no", "on", "off", "t", "f", "2", "abc",
+                ],
+            ),
+            (
+                "datetime",
+                &["2024-01-02 03:04:05", "2024-01-02", "abc"],
+            ),
+            ("json", &["{\"a\":1}", "[1,2]", "not-json", ""]),
+            ("blob", &["x"]),
+        ];
+        for driver in [DriverKind::Mysql, DriverKind::Postgres, DriverKind::Sqlite] {
+            for (data_type, values) in cases {
+                let col = column(data_type);
+                for raw in *values {
+                    for mp in [&mapping, &mapping_empty_null, &mapping_no_trim] {
+                        let mut ours = String::new();
+                        let ours_result = append_field_sql(&mut ours, driver, Some(raw), &col, mp);
+                        let legacy_result =
+                            convert_value(Value::String((*raw).to_string()), &col, mp).map(
+                                |value| {
+                                    let mut out = String::new();
+                                    push_literal(&mut out, driver, &value);
+                                    out
+                                },
+                            );
+                        match (ours_result, legacy_result) {
+                            (Ok(()), Ok(expected)) => assert_eq!(
+                                ours, expected,
+                                "driver={driver:?} type={data_type} raw={raw:?}"
+                            ),
+                            (Err(ours_error), Err(legacy_error)) => assert_eq!(
+                                ours_error, legacy_error,
+                                "driver={driver:?} type={data_type} raw={raw:?}"
+                            ),
+                            (ours_result, legacy_result) => panic!(
+                                "mismatch driver={driver:?} type={data_type} raw={raw:?}: \
+                                 ours={ours_result:?} legacy={legacy_result:?}"
+                            ),
+                        }
+                    }
+                    // Missing field -> NULL, exactly like convert_value(Null).
+                    let mut ours = String::new();
+                    append_field_sql(&mut ours, driver, None, &col, &mapping).unwrap();
+                    let mut expected = String::new();
+                    push_literal(
+                        &mut expected,
+                        driver,
+                        &convert_value(Value::Null, &col, &mapping).unwrap(),
+                    );
+                    assert_eq!(ours, expected);
+                }
+            }
+        }
+    }
+}
+

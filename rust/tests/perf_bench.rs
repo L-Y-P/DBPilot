@@ -16,13 +16,76 @@
 //!
 //! 未设 DBPILOT_PERF=1 时全部 skip，避免拖慢常规 CI。
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rust_myadmin_core::api;
 use serde_json::{json, Value};
 
 mod common;
+
+// ---------------------------------------------------------------- allocation count
+//
+// Counting is opt-in (DBPILOT_PERF_ALLOC=1): the atomic increments would distort
+// the MB/s measurement, so timing runs keep it disabled and allocation runs only
+// report call/byte counts.
+
+struct CountingAllocator;
+
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
+static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if COUNTING.load(Ordering::Relaxed) {
+            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        System.alloc(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if COUNTING.load(Ordering::Relaxed) {
+            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        }
+        System.realloc(ptr, layout, new_size)
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if COUNTING.load(Ordering::Relaxed) {
+            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        System.alloc_zeroed(layout)
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOC: CountingAllocator = CountingAllocator;
+
+fn alloc_snapshot() -> (u64, u64) {
+    (
+        ALLOC_CALLS.load(Ordering::Relaxed),
+        ALLOC_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+fn alloc_counting_start() -> (u64, u64) {
+    let snapshot = alloc_snapshot();
+    COUNTING.store(true, Ordering::Relaxed);
+    snapshot
+}
+
+fn alloc_counting_stop(start: (u64, u64)) -> (u64, u64) {
+    let end = alloc_snapshot();
+    COUNTING.store(false, Ordering::Relaxed);
+    (end.0 - start.0, end.1 - start.1)
+}
 
 /// 性能测试默认关闭：没有 DBPILOT_PERF=1 时整个文件 skip。
 fn perf_enabled() -> bool {
@@ -329,6 +392,193 @@ async fn p0_large_csv_import() {
     let _ = std::fs::remove_file(&csv_path);
 }
 
+
+// ================================================ CSV import phase benchmark
+
+/// 分阶段导入基准：A 解析+类型转换（validate），B 解析+生成 SQL（= 端到端非 DB
+/// 部分），C 数据库执行，D 端到端。可配 batch 大小、重复次数和分配统计。
+///
+///   DBPILOT_PERF=1 PERF_CSV_MB=100 PERF_BATCH_SIZE=1000 PERF_PASSES=2 \
+///   DBPILOT_TEST_MYSQL_PASSWORD=123456 \
+///   cargo test --release --test perf_bench p0_csv_import_phases -- --nocapture --test-threads=1
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p0_csv_import_phases() {
+    if !perf_enabled() {
+        eprintln!("skip: 设 DBPILOT_PERF=1 才跑性能基准");
+        return;
+    }
+    init_perf_state();
+    connect().await;
+
+    let target_mb: u64 = std::env::var("PERF_CSV_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let batch_size: usize = std::env::var("PERF_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let passes: usize = std::env::var("PERF_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let transaction_batches: usize = std::env::var("PERF_TX_BATCHES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let measure_alloc = std::env::var("DBPILOT_PERF_ALLOC").map(|v| v == "1").unwrap_or(false);
+
+    println!(
+        "\n== CSV 导入分阶段（{target_mb} MB, batch={batch_size}, tx_batches={transaction_batches}, passes={passes}, alloc={measure_alloc}）=="
+    );
+
+    let dir = std::env::temp_dir().join("dbpilot-perf-csv");
+    let _ = std::fs::create_dir_all(&dir);
+    let csv_path = dir.join(format!("import_{target_mb}mb_phases.csv"));
+    let gen_started = Instant::now();
+    let rows = write_csv(&csv_path, target_mb * 1024 * 1024);
+    let size = std::fs::metadata(&csv_path).map(|m| m.len()).unwrap_or(0);
+    report(
+        "生成 CSV",
+        gen_started.elapsed().as_secs_f64() * 1000.0,
+        &format!("file={}MB rows={rows}", size / 1024 / 1024),
+    );
+    let mb = size as f64 / 1024.0 / 1024.0;
+
+    let inspect = api::data_import::import_inspect(csv_path.to_string_lossy().to_string())
+        .await
+        .expect("inspect");
+    let mapping = json!({
+        "columns": [
+            { "column": "id", "source": "id" },
+            { "column": "name", "source": "name" },
+            { "column": "amount", "source": "amount" },
+            { "column": "note", "source": "note" }
+        ],
+        "ignore_unknown": true,
+        "empty_as_null": false,
+        "null_tokens": ["\\N"],
+        "trim_values": true
+    });
+    let base_params = json!({
+        "path": csv_path.to_string_lossy().to_string(),
+        "read": inspect["read"],
+        "fields": inspect["fields"],
+        "mapping": mapping,
+        "database": perf_db(),
+        "table": "perf_csv_import",
+    });
+
+    // The validate API resolves the target table when a mapping is present.
+    let _ = api::query::run_query(json!({ "sql": "DROP TABLE IF EXISTS perf_csv_import" })).await;
+    let _ = api::query::run_query(json!({
+        "sql": "CREATE TABLE perf_csv_import (id BIGINT PRIMARY KEY, name VARCHAR(64), amount DECIMAL(12,2), note VARCHAR(64))"
+    }))
+    .await;
+
+    // ---------------------------------------------------------------- A: validate
+    let validate_started = Instant::now();
+    let write_guard = if measure_alloc { Some(alloc_counting_start()) } else { None };
+    let vjob = api::data_import::import_validate_start(base_params.clone())
+        .await
+        .expect("start validate");
+    let vjob = wait_import_job(vjob["job_id"].as_str().expect("validate job id")).await;
+    let validate_ms = validate_started.elapsed().as_secs_f64() * 1000.0;
+    let validate_alloc = write_guard.map(alloc_counting_stop);
+    let vresult = if vjob["result"].is_null() { &vjob } else { &vjob["result"] };
+    report(
+        "A 解析+类型转换（validate）",
+        validate_ms,
+        &format!(
+            "valid={} invalid={} {:.2} MB/s",
+            vresult["valid"].as_u64().unwrap_or(0),
+            vresult["invalid"].as_u64().unwrap_or(0),
+            mb / (validate_ms / 1000.0)
+        ),
+    );
+    if let Some((calls, bytes)) = validate_alloc {
+        println!(
+            "  ↳ allocations: {calls} 次 / {:.1} MB",
+            bytes as f64 / 1024.0 / 1024.0
+        );
+    }
+
+    // ------------------------------------------------------- D/B/C: import passes
+    for pass in 1..=passes {
+        let _ = api::query::run_query(json!({ "sql": "DROP TABLE IF EXISTS perf_csv_import" })).await;
+        let _ = api::query::run_query(json!({
+            "sql": "CREATE TABLE perf_csv_import (id BIGINT PRIMARY KEY, name VARCHAR(64), amount DECIMAL(12,2), note VARCHAR(64))"
+        }))
+        .await;
+
+        let mut params = base_params.clone();
+        params["options"] = json!({
+            "batch_size": batch_size,
+            "on_error": "stop",
+            "max_issues": 10,
+            "transaction_batches": transaction_batches,
+        });
+
+        let baseline_rss = rss_kb();
+        let alloc_guard = if measure_alloc { Some(alloc_counting_start()) } else { None };
+        let started = Instant::now();
+        let job = api::data_import::import_execute_start(params)
+            .await
+            .expect("start import");
+        let job = wait_import_job(job["job_id"].as_str().expect("job id")).await;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let import_alloc = alloc_guard.map(alloc_counting_stop);
+        let after_rss = rss_kb();
+
+        let result = &job["result"];
+        let inserted = result["rows_inserted"].as_u64().unwrap_or(0);
+        let timings = &result["timings"];
+        let db_ms = timings["db_ms"].as_f64().unwrap_or(0.0);
+        let non_db_ms = timings["non_db_ms"].as_f64().unwrap_or(0.0);
+        let batches = result["batches"].as_u64().unwrap_or(0);
+        let sql_bytes = timings["sql_bytes"].as_u64().unwrap_or(0);
+        let mb_s = mb / (ms / 1000.0);
+        let rows_s = inserted as f64 / (ms / 1000.0);
+        report(
+            &format!("D 端到端 pass {pass}（{inserted} 行）"),
+            ms,
+            &format!("{mb_s:.2} MB/s  {rows_s:.0} 行/s"),
+        );
+        println!(
+            "  ↳ B 非 DB = {non_db_ms:.0} ms（{:.2} MB/s） / C DB = {db_ms:.0} ms / batches = {batches} / SQL = {:.1} MB",
+            mb / (non_db_ms / 1000.0).max(0.001),
+            sql_bytes as f64 / 1024.0 / 1024.0
+        );
+        if let Some((calls, bytes)) = import_alloc {
+            println!(
+                "  ↳ allocations: {calls} 次 / {:.1} MB（{:.0} 次/行）",
+                bytes as f64 / 1024.0 / 1024.0,
+                calls as f64 / inserted.max(1) as f64
+            );
+        }
+        if baseline_rss > 0 && after_rss > 0 {
+            println!(
+                "  ↳ RSS {} -> {} KB（{:+.1}%）",
+                baseline_rss,
+                after_rss,
+                (after_rss as f64 - baseline_rss as f64) / baseline_rss as f64 * 100.0
+            );
+        }
+
+        let counted = scalar_u64("SELECT COUNT(*) FROM perf_csv_import").await;
+        println!("  ↳ 表内行数 = {counted}");
+        assert_eq!(inserted, rows, "导入行数与生成行数不一致");
+        assert_eq!(counted, rows, "表内行数与生成行数不一致");
+        assert!(
+            job["state"].as_str() == Some("done"),
+            "job state = {} error = {}",
+            job["state"],
+            job["error"]
+        );
+    }
+
+    let _ = std::fs::remove_file(&csv_path);
+}
 
 // ==================================================================== P0-3
 

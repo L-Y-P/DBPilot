@@ -567,3 +567,27 @@ Future<void> showRelationDesigner(
 - _applyDesign 在 dry_run 前弹中英双语警告框（取消 / 继续应用其余修改），取消什么都不做，确认后才 dry_run + ALTER；成功提示「修改已应用；N 处改名未生效（已跳过）」。_previewDesign 在结果区显示「预览 SQL 不包含以下 N 处改名」，设计 tab 保留可关闭的警示；无其它修改时提示「当前没有其它修改；继续不会修改数据库」。
 - 测试：table_design_rename_conflict_test.dart（28 例：纯逻辑、冲突集合与被跳过改名集合一致性、中英文案、弹窗 widget、SQLite live 接线）。
 
+
+## 21. 第 65 轮修订（CSV 导入吞吐 / 批次与事务策略 / LOAD DATA 评估）
+
+> 详细基准、方法与结论分类见 analysis/IMPORT_PERF_ROUND65.md。
+
+### 21.1 分隔文本零拷贝快速路径
+
+- execute 对 fields.mode = "delimited"、header 与映射类型一致、非 wrapped 的 CSV/TSV 走新的 execute_delimited_fast；其余格式（JSON/XML/HTML/Excel/Markdown）与不一致组合仍走原通用路径。
+- TextScanner::next_record_into 把记录写入复用 Vec<u8> 并返回借用 &str；无引号记录用 split_fields_ranges 返回字段字节区间（trim 为子切片），不逐字段创建 String；含引号记录仍调用原 split_fields 状态机，引号/双写引号/转义/字段内换行语义不变。
+- append_field_sql 直接做类型校验并把 SQL 字面量写入复用 batch_sql，取消 Vec<Value> 中间表示；每行只保留 byte span 供 skip-errors 逐行重试。数字清洗（去 ,/_）仅在需要时分配；bool 成功路径不再小写化。
+- 结果 JSON 新增 timings（total_ms/db_ms/non_db_ms/sql_bytes/batches/batch_size/transaction_batches），为附加字段。
+- 环境变量 DBPILOT_IMPORT_LEGACY=1 可强制旧路径（差分测试/基准用），生产默认快速路径。
+
+### 21.2 批量与事务参数
+
+- ExecuteOptions 新增 transaction_batches（默认 1，上限 16，约 ≤8 MiB SQL）：仅快速路径 + on_error=stop 时生效，把多批 INSERT 放进一个 sqlx 事务；失败时整组回滚并逐批重放，保持「失败前已成功批次保留、失败批次报错」的语义；on_error=skip 仍逐批执行。
+- 100 MB / 252 万行本机 MySQL 实测：batch 500/1000/2000 差异在噪声内（5.27–5.35 MB/s），batch 5000 更慢（4.99 MB/s）；transaction_batches=4 反而慢约 14%，因此默认 1，不建议开启。
+- MAX_BATCH_SQL_BYTES 仍为 512 KiB，低于服务器 max_allowed_packet（本机 64 MiB）；失败、取消、连接断开路径沿用逐批/逐行错误处理。
+
+### 21.3 LOAD DATA LOCAL INFILE（未实施）
+
+- sqlx 0.8.6 未处理 LocalInfileRequest（connection/executor.rs:161 注释 unhandled），本机 MySQL local_infile=0，离线 cargo 缓存无 mysql_async；因此未实现、未测吞吐。
+- 后续可选：patch sqlx-mysql 增加 handler，或仅在导入模块引入 mysql_async 建独立连接；需覆盖字符集、\N 与空串、日期/数字、错误行号、安全开关与回滚，不迁移全项目访问层。
+

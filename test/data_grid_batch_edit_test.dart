@@ -149,4 +149,97 @@ void main() {
     expect(immediateSaves, 1);
     expect(find.byKey(const ValueKey('grid-apply-dirty')), findsNothing);
   });
+
+  // =====================================================================
+  // 第 57 轮：onDirtyChanges（离开当前页前的未保存保护用）
+  // =====================================================================
+
+  testWidgets('onDirtyChanges reports staged edits, then empty after apply',
+      (tester) async {
+    final reports = <List<DirtyCell>>[];
+    await tester.pumpWidget(host(DataGrid(
+      columns: _columns,
+      rows: _rows,
+      primaryKey: const <String>['id'],
+      rowOps: true,
+      editable: true,
+      onApplyEdits: (edits) async => true,
+      onDirtyChanges: (edits) => reports.add(List<DirtyCell>.of(edits)),
+    )));
+    await tester.pumpAndSettle();
+    expect(reports, isEmpty);
+
+    await editCell(tester, 'one', 'ONE');
+    expect(reports, isNotEmpty);
+    expect(reports.last, hasLength(1));
+    expect(reports.last.single.rowIndex, 0);
+    expect(reports.last.single.column, 'name');
+    expect(reports.last.single.value, 'ONE');
+
+    await tester.tap(find.byKey(const ValueKey('grid-apply-dirty')));
+    await tester.pumpAndSettle();
+    expect(reports.last, isEmpty, reason: '保存成功后应上报空列表');
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('onDirtyChanges reports empty after 撤销改动', (tester) async {
+    final reports = <List<DirtyCell>>[];
+    await tester.pumpWidget(host(DataGrid(
+      columns: _columns,
+      rows: _rows,
+      primaryKey: const <String>['id'],
+      rowOps: true,
+      editable: true,
+      onApplyEdits: (edits) async => true,
+      onDirtyChanges: (edits) => reports.add(List<DirtyCell>.of(edits)),
+    )));
+    await tester.pumpAndSettle();
+
+    await editCell(tester, 'one', 'ONE');
+    expect(reports.last, hasLength(1));
+
+    await tester.tap(find.byKey(const ValueKey('grid-discard-dirty')));
+    await tester.pumpAndSettle();
+    expect(reports.last, isEmpty);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('rows replacement clears edits and reports empty; unrelated rebuild keeps them',
+      (tester) async {
+    final reports = <List<DirtyCell>>[];
+    final rows = _rows;
+    Widget grid(List<List<dynamic>> tableRows) => host(DataGrid(
+          columns: _columns,
+          rows: tableRows,
+          primaryKey: const <String>['id'],
+          rowOps: true,
+          editable: true,
+          onApplyEdits: (edits) async => true,
+          onDirtyChanges: (edits) => reports.add(List<DirtyCell>.of(edits)),
+        ));
+
+    await tester.pumpWidget(grid(rows));
+    await tester.pumpAndSettle();
+    await editCell(tester, 'one', 'ONE');
+    expect(reports.last, hasLength(1));
+
+    // 父组件因无关原因重建：外层 list 是新的，但行对象没变 → 暂存编辑保留。
+    await tester.pumpWidget(grid(<List<dynamic>>[...rows]));
+    await tester.pumpAndSettle();
+    expect(find.text('保存全部改动 (1)'), findsOneWidget);
+    expect(reports.last, hasLength(1));
+
+    // 真正的行替换（reload / page flip）：内层行对象也变了 → 清空并上报 []。
+    await tester.pumpWidget(grid(<List<dynamic>>[
+      <dynamic>[1, 'one'],
+      <dynamic>[2, 'two'],
+    ]));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('grid-apply-dirty')), findsNothing);
+    expect(reports.last, isEmpty);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+  });
 }

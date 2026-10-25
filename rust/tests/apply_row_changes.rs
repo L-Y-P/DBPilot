@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use rust_myadmin_core::api;
 use rust_myadmin_core::core::DriverKind;
 use rust_myadmin_core::drivers::builtin::driver_for;
+use rust_myadmin_core::drivers::qi;
 
 mod common;
 
@@ -275,6 +276,23 @@ fn mysql_body(name: &str, database: &str) -> Value {
     })
 }
 
+/// PostgreSQL 连接体：端点来自 DBPILOT_TEST_PG_*。
+///
+/// 不指定 database：PostgreSQL 会连到用户名同名的库（本机是 postgres），
+/// 测试只用自己的临时 schema，不碰任何既有表。
+fn pg_body(name: &str) -> Value {
+    let endpoint = common::postgres();
+    json!({
+        "name": name,
+        "driver": "postgres",
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "user": endpoint.user,
+        "password": endpoint.password,
+        "ssl_mode": "disable",
+    })
+}
+
 /// Live MySQL variant (the first driver the batch path was written for).
 #[tokio::test]
 #[ignore = "requires DBPILOT_TEST_MYSQL_* (MySQL transaction/rollback)"]
@@ -358,6 +376,110 @@ async fn mysql_batch_edits_are_atomic() {
     assert_eq!(rows["rows"], json!([["two"]]), "rolled back: {rows}");
 
     run(&format!("DROP TABLE `{table}`")).await;
+    let _ = api::connections::disconnect().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Live PostgreSQL variant: the batch path must be one transaction there too.
+///
+/// The failing item is an UPDATE that violates a UNIQUE constraint (the task's
+/// "1 valid UPDATE + 1 failing UPDATE" shape): the first UPDATE sets a value the
+/// second one would collide with, so PostgreSQL rejects the second and the whole
+/// batch must roll back — including the first UPDATE.
+#[tokio::test]
+#[ignore = "requires DBPILOT_TEST_PG_* (PostgreSQL transaction/rollback)"]
+async fn postgres_batch_edits_are_atomic() {
+    if !common::postgres_usable().await {
+        eprintln!("SKIP: DBPILOT_TEST_PG_* does not authenticate");
+        return;
+    }
+    let dir = temp_dir("postgres");
+    let init = api::init_app(dir.to_string_lossy().to_string());
+    assert_eq!(init.get("ok"), Some(&Value::Bool(true)), "init: {init}");
+
+    let created = ok(api::connections::create_connection(pg_body(
+        "Apply PostgreSQL",
+    )))
+    .await;
+    let conn_id = created["connection"]["id"].as_str().unwrap().to_string();
+    if let Err(error) = api::connections::connect_connection(conn_id).await {
+        eprintln!("SKIP: cannot open a PostgreSQL connection: {error}");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // 独立 schema：只动自己建的东西，结束时 DROP SCHEMA ... CASCADE。
+    let schema = format!("rma_apply_tx_{}", std::process::id());
+    let schema_sql = qi(DriverKind::Postgres, &schema);
+    let table_sql = format!("{schema_sql}.{}", qi(DriverKind::Postgres, "items"));
+    run(&format!("DROP SCHEMA IF EXISTS {schema_sql} CASCADE")).await;
+    run(&format!("CREATE SCHEMA {schema_sql}")).await;
+    run(&format!(
+        "CREATE TABLE {table_sql} (id INT PRIMARY KEY, code TEXT NOT NULL UNIQUE, qty INT)"
+    ))
+    .await;
+    run(&format!(
+        "INSERT INTO {table_sql} (id, code, qty) VALUES (1, 'one', 1), (2, 'two', 2)"
+    ))
+    .await;
+
+    // -------- all-valid batch: commits and the data really is there
+    let done = ok(api::explorer::apply_row_changes(
+        schema.clone(),
+        "items".into(),
+        json!([
+            { "action": "update", "keys": { "id": 1 }, "values": { "code": "ONE", "qty": 10 } },
+            { "action": "update", "keys": { "id": 2 }, "values": { "qty": 20 } },
+            { "action": "insert", "values": { "id": 3, "code": "three", "qty": 30 } },
+        ]),
+    ))
+    .await;
+    assert_eq!(done["ok"], json!(true), "{done}");
+    assert_eq!(done["rows_affected"], json!(3), "{done}");
+    let rows = run(&format!(
+        "SELECT id, code, qty FROM {table_sql} ORDER BY id"
+    ))
+    .await;
+    assert_eq!(
+        rows["rows"],
+        json!([[1, "ONE", 10], [2, "two", 20], [3, "three", 30]]),
+        "{rows}"
+    );
+
+    // -------- mixed batch: 1 valid UPDATE, then 1 UPDATE violating UNIQUE.
+    // One transaction, so the valid UPDATE must be rolled back too.
+    let failed = api::explorer::apply_row_changes(
+        schema.clone(),
+        "items".into(),
+        json!([
+            { "action": "update", "keys": { "id": 1 }, "values": { "code": "MUST ROLL BACK" } },
+            { "action": "update", "keys": { "id": 2 }, "values": { "code": "MUST ROLL BACK" } },
+        ]),
+    )
+    .await
+    .expect_err("unique violation must fail the whole batch");
+    let message = failed.to_string();
+    assert!(
+        message.contains("第 2 条"),
+        "error must name the failing item: {message}"
+    );
+    let lower = message.to_ascii_lowercase();
+    assert!(
+        lower.contains("duplicate key") || lower.contains("unique") || lower.contains("23505"),
+        "error must carry the server message: {message}"
+    );
+    let rows = run(&format!(
+        "SELECT id, code FROM {table_sql} WHERE id IN (1, 2) ORDER BY id"
+    ))
+    .await;
+    assert_eq!(
+        rows["rows"],
+        json!([[1, "ONE"], [2, "two"]]),
+        "the valid UPDATE must have been rolled back: {rows}"
+    );
+
+    // -------- cleanup: only our own schema, then disconnect.
+    run(&format!("DROP SCHEMA IF EXISTS {schema_sql} CASCADE")).await;
     let _ = api::connections::disconnect().await;
     let _ = std::fs::remove_dir_all(dir);
 }

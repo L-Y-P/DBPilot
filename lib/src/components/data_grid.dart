@@ -77,6 +77,7 @@ class DataGrid extends StatefulWidget {
     this.onDeleteSelected,
     this.onSaveCell,
     this.onApplyEdits,
+    this.onDirtyChanges,
     this.exportActions,
   });
 
@@ -103,6 +104,14 @@ class DataGrid extends StatefulWidget {
   /// staged edits (the caller reloads the rows), false keeps them so the user
   /// can retry.
   final Future<bool> Function(List<DirtyCell> edits)? onApplyEdits;
+
+  /// Reports the current staged-edit list whenever it changes (第 57 轮).
+  ///
+  /// The host uses it to warn before a page/tab switch would discard the batch
+  /// edits. Emitted after staging a cell, after a successful apply (empty),
+  /// after "撤销改动" (empty), and after a rows replacement cleared stale edits
+  /// (empty, one frame later because it happens during didUpdateWidget).
+  final void Function(List<DirtyCell> edits)? onDirtyChanges;
 
   /// Optional replacement for the built-in "导出 CSV / 导出 JSON" buttons.
   ///
@@ -213,17 +222,56 @@ class _DataGridState extends State<DataGrid> {
     if (oldWidget.columns.length != widget.columns.length) {
       _filters = List.generate(widget.columns.length, (_) => GridFilter());
     }
-    if (oldWidget.rows != widget.rows) {
+    if (_rowsReplaced(oldWidget.rows, widget.rows)) {
       _selected.clear();
       // A reload / page flip replaces the rendered rows: staged edits index into
       // the old list, so keeping them would write to the wrong row.
+      final hadDirtyEdits = _dirtyCells.isNotEmpty;
       _dirtyCells.clear();
+      // didUpdateWidget runs during build: the host's callback normally calls
+      // setState, which must wait for the next frame.
+      if (hadDirtyEdits) _notifyDirtyChanges(postFrame: true);
     }
+  }
+
+  /// Whether [after] really replaced the rendered rows (reload / page flip).
+  ///
+  /// The host passes a freshly built outer list on every rebuild (its rows
+  /// getter maps the data payload each time), while the row objects themselves
+  /// are unchanged. Comparing row identities keeps staged edits across an
+  /// unrelated parent rebuild but still clears them on a real data reload.
+  static bool _rowsReplaced(
+    List<List<dynamic>> before,
+    List<List<dynamic>> after,
+  ) {
+    if (identical(before, after)) return false;
+    if (before.length != after.length) return true;
+    for (var i = 0; i < before.length; i++) {
+      if (!identical(before[i], after[i])) return true;
+    }
+    return false;
   }
 
   List<DirtyCell> get _dirtyEdits => <DirtyCell>[
         for (final row in _dirtyCells.values) ...row.values,
       ];
+
+  /// Report the current staged edits to [DataGrid.onDirtyChanges].
+  ///
+  /// Use [postFrame] from didUpdateWidget: the host's callback usually calls
+  /// setState, which throws during this widget's build.
+  void _notifyDirtyChanges({bool postFrame = false}) {
+    final callback = widget.onDirtyChanges;
+    if (callback == null) return;
+    final edits = _dirtyEdits;
+    if (!postFrame) {
+      callback(edits);
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) callback(edits);
+    });
+  }
 
   bool get _rowOps => widget.rowOps || widget.primaryKey.isNotEmpty;
   bool get _selectable => widget.selectable && _rowOps;
@@ -248,6 +296,7 @@ class _DataGridState extends State<DataGrid> {
     if (!mounted) return;
     if (keepGoing) {
       setState(_dirtyCells.clear);
+      _notifyDirtyChanges();
       _flashMessage('已保存 ${edits.length} 个改动');
     }
   }
@@ -327,7 +376,10 @@ class _DataGridState extends State<DataGrid> {
             Btn('撤销改动',
                 key: const ValueKey('grid-discard-dirty'),
                 small: true,
-                onPressed: () => setState(_dirtyCells.clear)),
+                onPressed: () {
+                  setState(_dirtyCells.clear);
+                  _notifyDirtyChanges();
+                }),
           ],
           const SizedBox(width: 12),
           Text('本页 ${widget.rows.length} 行', style: kSmallMuted),
@@ -1125,6 +1177,7 @@ class _DataGridState extends State<DataGrid> {
             isNull: isNull,
           );
         });
+        _notifyDirtyChanges();
         _flashMessage('已暂存，点「保存全部改动」生效');
       } else {
         widget.onSaveCell!(

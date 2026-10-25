@@ -432,3 +432,21 @@ Future<void> showRelationDesigner(
 - 实现：三个驱动的 `alter_table_statements` 在 rename_columns 非空时，先按顺序为每个 rename 生成独立 `ALTER TABLE … RENAME COLUMN a TO b`，其余改动合并且不含 RENAME；`rename_to` 仍最后；只有 rename 时不产生空 ALTER。Dart 侧 MODIFY 改为使用新列名。
 - 验证：新增 MySQL live（test/table_design_live_test.dart）：只改名、改名+改类型（新列名 MODIFY）两条真实 ALTER 成功；驱动层 5 个单测覆盖 MySQL/PG/SQLite 语句顺序与形态。
 
+
+## 13. 第 57 轮修订（批量编辑未保存保护 / PG 事务 live 测试）
+
+### 13.1 批量编辑未保存保护
+
+- 背景（HANDOVER_ROUND49 P2）：批量暂存编辑只存在 DataGrid 的 _dirtyCells，翻页/刷新时 DataGrid 的 didUpdateWidget 直接清空，用户未保存的批量修改静默丢失。
+- DataGrid 新增 onDirtyChanges(List<DirtyCell>) 回调：暂存、保存成功、撤销改动、rows 真正替换时都会上报；didUpdateWidget 的 rows 判断由「外层 list 身份」改为逐行身份比较（父组件 rebuild 只换外层 list 时保留暂存编辑，真正 reload 才清）。
+- table_view 维护 _stagedEdits 并在数据页工具栏显示「未保存 N 处」；新增 _confirmLeaveDirty 三选一（取消 / 放弃修改并继续 / 保存后继续）：
+  保存走既有单事务 _applyDirtyEdits，失败停留并保留编辑。
+- 守卫覆盖：上一页/下一页、每页条数、刷新、切页签、排序/筛选/应用 WHERE/清空 WHERE。切表（父组件已切换）改为两选一：放弃修改 / 保存到原表并继续（保存用捕获的原表行列快照；失败额外 notice 说明编辑已丢弃）。
+- 测试：data_grid_batch_edit_test 7/7（新增脏回调三例）、新增 table_view_dirty_guard_test 4/4（翻页取消/放弃/保存后翻页并验证真实写库、切页签、切表保存到原表/放弃、保存失败停留）。
+
+### 13.2 PG 事务路径 live 测试（ROUND49 P1）
+
+- 环境：PostgreSQL 17.11（DBPILOT_TEST_PG_*，默认本机 postgres/空密码）；测试用自建 schema，结束 DROP SCHEMA CASCADE。
+- **apply_row_changes（PG）**：符合设计——整批一个事务，任一失败全部回滚（合法的 UPDATE 也回滚），错误带失败序号与服务端消息（新增 #[ignore] live 测试）。
+- **restore_sql（PG）**：实测整段脚本**不是原子的**（ops.rs 已注释的设计）：DDL/SET 是 barrier 逐条 autocommit；连续 DML 进事务；DML 批次失败时回滚后会重放已成功前缀，且失败语句之后的语句继续执行。除失败语句外都会生效。新增 live 测试如实断言该现状；若未来改为整段原子，需要同步更新该测试与内部注释。
+

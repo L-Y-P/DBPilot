@@ -314,6 +314,12 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   int _page = 1;
   int _perPage = 25;
 
+  /// 当前页批量编辑里尚未保存的单元格改动（由 DataGrid.onDirtyChanges 上报）。
+  ///
+  /// 翻页 / 改每页条数 / 刷新 / 切页签 / 切表前都先用 [_confirmLeaveDirty]
+  /// 询问「取消 / 放弃 / 保存后继续」，避免未保存的编辑被静默丢弃（第 57 轮）。
+  List<DirtyCell> _stagedEdits = <DirtyCell>[];
+
   /// Keyset cursors, one per loaded page.
   ///
   /// Index 0 is always `null` (page 1 starts at the table head); index `i` holds
@@ -424,8 +430,163 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     if (oldWidget.db != widget.db || oldWidget.table != widget.table) {
       _sqlText = _defaultTableSql();
       _sqlController.text = _sqlText;
-      _reloadAll();
+      // 第 57 轮：切表前上一张表可能还有未保存的批量编辑。didUpdateWidget 在
+      // build 期间，不能直接弹框/setState，所以 postFrame 里先问「放弃 / 保存到
+      // 原表」再 reload 新表。限制：如果父组件给 TableView 加了 key（导致 State
+      // 被销毁）就没有机会提示，只能寄望于翻页/页签守卫。
+      if (_stagedEdits.isNotEmpty) {
+        final edits = List<DirtyCell>.of(_stagedEdits);
+        final oldDb = oldWidget.db;
+        final oldTable = oldWidget.table;
+        // 此刻 _data 还是原表的数据，把原表的行列快照一起带进 postFrame。
+        final oldColumns = _columns;
+        final oldRows = _rows;
+        final oldPrimaryKey = _primaryKey;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          _handleTableSwitchWithDirty(
+            oldDb,
+            oldTable,
+            oldColumns,
+            oldRows,
+            oldPrimaryKey,
+            edits,
+          );
+        });
+      } else {
+        _reloadAll();
+      }
     }
+  }
+
+  /// 切表时处理上一张表未保存的批量编辑：先问「放弃 / 保存到原表」，再 reload。
+  Future<void> _handleTableSwitchWithDirty(
+    String oldDb,
+    String oldTable,
+    List<Json> oldColumns,
+    List<List<dynamic>> oldRows,
+    List<String> oldPrimaryKey,
+    List<DirtyCell> edits,
+  ) async {
+    final choice = await _showTableSwitchDirtyDialog(
+      oldTable,
+      widget.table,
+      edits.length,
+    );
+    if (!mounted) return;
+    var saveFailed = false;
+    if (choice == 2) {
+      final applied = await _saveBatchEdits(
+        oldDb,
+        oldTable,
+        oldColumns,
+        oldRows,
+        oldPrimaryKey,
+        edits,
+      );
+      if (!mounted) return;
+      if (applied != null) {
+        widget.notice.show(
+          pickText(
+            '已保存 $applied 行到原表 $oldTable',
+            'Saved $applied row(s) to the previous table $oldTable',
+          ),
+        );
+      } else {
+        // 原表保存失败：_reloadAll 会清掉错误横幅，所以切完新表后再提示一次，
+        // 免得用户以为修改已经保存。限制：失败后的编辑无法在这里重试。
+        saveFailed = true;
+      }
+    }
+    _stagedEdits = <DirtyCell>[];
+    await _reloadAll();
+    if (saveFailed && mounted) {
+      widget.notice.show(
+        pickText(
+          '保存到原表 $oldTable 失败，上一张表未保存的修改已丢弃。',
+          'Saving to the previous table $oldTable failed; its unsaved changes '
+              'were discarded.',
+        ),
+      );
+    }
+  }
+
+  /// 切表时的两选一确认（没有「取消」：父组件已经切到新表，停留在旧数据上会
+  /// 让后续操作把旧行写到新表里）。
+  Future<int?> _showTableSwitchDirtyDialog(
+    String oldTable,
+    String newTable,
+    int count,
+  ) {
+    return showDialog<int>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => Dialog(
+        alignment: Alignment.topCenter,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 48),
+        backgroundColor: AppColors.panel,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppMetrics.radiusModal),
+          side: BorderSide(color: AppColors.border),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 620),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  pickText(
+                    '上一张表有未保存的修改',
+                    'The previous table has unsaved changes',
+                  ),
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  pickText(
+                    '正在切换到表 $newTable。上一张表 $oldTable 还有 $count 处'
+                        '批量编辑没保存：可以先保存到原表，也可以放弃后继续。',
+                    'Switching to table $newTable. The previous table $oldTable '
+                        'still has $count unsaved batch edit(s): save them to the '
+                        'old table, or discard them and continue.',
+                  ),
+                  style: kSmall,
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Btn(
+                      pickText('放弃修改并继续', 'Discard changes and continue'),
+                      key: const ValueKey<String>('table-switch-discard'),
+                      danger: true,
+                      onPressed: () => Navigator.of(dialogContext).pop(1),
+                    ),
+                    const SizedBox(width: 8),
+                    Btn(
+                      pickText(
+                        '保存到原表并继续',
+                        'Save to the previous table and continue',
+                      ),
+                      key: const ValueKey<String>('table-switch-save'),
+                      primary: true,
+                      onPressed: () => Navigator.of(dialogContext).pop(2),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   /// Reset per-table state and reload data + structure, like the web reloadAll.
@@ -550,6 +711,127 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// number from whenever the table was last counted (round34 P2-01).
   Future<void> _reloadAfterWrite() => _loadData(refreshCount: true);
 
+  /// DataGrid 的暂存编辑变更回调（第 57 轮）。
+  void _onDirtyChanges(List<DirtyCell> edits) {
+    if (!mounted) return;
+    // DataGrid 只在事件处理或 postFrame 里回调，这里 setState 是安全的。
+    setState(() => _stagedEdits = List<DirtyCell>.of(edits));
+  }
+
+  /// 离开当前页 / 当前批次前的未保存批量编辑确认。
+  ///
+  /// 返回 true 表示可以继续（没有编辑，或用户选择放弃 / 保存成功）；false 表示
+  /// 用户取消或保存失败，调用方必须停留。保存走既有 [_applyDirtyEdits]（单事务、
+  /// 自带 reload），失败时错误横幅已经显示。
+  Future<bool> _confirmLeaveDirty() async {
+    if (_stagedEdits.isEmpty) return true;
+    final edits = List<DirtyCell>.of(_stagedEdits);
+    final count = edits.length;
+    final choice = await showAppModal<int>(
+      context: context,
+      title: pickText('有未保存的修改', 'Unsaved changes'),
+      builder: (context) => ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 620),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              pickText(
+                '当前页有 $count 处批量编辑还没保存。继续操作会离开当前页，这些'
+                    '修改会丢失；也可以先保存再继续。',
+                'This page has $count unsaved batch edit(s). Continuing leaves '
+                    'this page and discards them; you can also save first and then '
+                    'continue.',
+              ),
+              style: kSmall,
+            ),
+            const SizedBox(height: 10),
+            AlertBox(
+              pickText(
+                '选择「放弃修改并继续」会丢弃这些编辑，且无法撤销。',
+                '"Discard changes and continue" drops these edits without undo.',
+              ),
+              tone: AlertTone.warn,
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        Builder(
+          builder: (context) => Btn(
+            pickText('取消', 'Cancel'),
+            key: const ValueKey<String>('batch-leave-cancel'),
+            onPressed: () => Navigator.of(context).pop(0),
+          ),
+        ),
+        Builder(
+          builder: (context) => Btn(
+            pickText('放弃修改并继续', 'Discard changes and continue'),
+            key: const ValueKey<String>('batch-leave-discard'),
+            danger: true,
+            onPressed: () => Navigator.of(context).pop(1),
+          ),
+        ),
+        Builder(
+          builder: (context) => Btn(
+            pickText('保存后继续', 'Save and continue'),
+            key: const ValueKey<String>('batch-leave-save'),
+            primary: true,
+            onPressed: () => Navigator.of(context).pop(2),
+          ),
+        ),
+      ],
+    );
+    if (!mounted) return false;
+    switch (choice) {
+      case 1:
+        // 放弃：清掉本地记录。DataGrid 的内部暂存会在随后的 reload / 切页签
+        // 卸载时被替换或丢弃。
+        _stagedEdits = <DirtyCell>[];
+        setState(() {});
+        return true;
+      case 2:
+        final saved = await _applyDirtyEdits(edits);
+        if (!mounted) return false;
+        if (!saved) return false; // 保存失败：留在当前页，错误横幅已显示
+        _stagedEdits = <DirtyCell>[];
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // ---------- 第 57 轮：会 reload / 换页的入口统一先过 _confirmLeaveDirty ----------
+
+  Future<void> _goToPage(int target) async {
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
+    setState(() => _page = target);
+    await _loadData();
+  }
+
+  Future<void> _refreshData() async {
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
+    await _loadData(refreshCount: true);
+  }
+
+  Future<void> _applyWhere() async {
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
+    setState(() => _page = 1);
+    await _loadData();
+  }
+
+  Future<void> _clearWhere() async {
+    if (_where.text.isEmpty) return;
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
+    _where.text = '';
+    setState(() => _page = 1);
+    await _loadData();
+  }
+
   Future<void> _loadStructure() async {
     try {
       final res = await Api.instance.structure(widget.db, widget.table);
@@ -650,7 +932,10 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     }
   }
 
-  void _onSort(String column, bool additive) {
+  Future<void> _onSort(String column, bool additive) async {
+    // 排序会 reload 当前页，未保存的批量编辑会随 rows 替换被清掉。
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
     setState(() {
       final existing = _sorts.indexWhere((s) => s.column == column);
       if (existing >= 0) {
@@ -667,12 +952,14 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       }
       _page = 1;
     });
-    _loadData();
+    await _loadData();
   }
 
   /// Build a WHERE clause from the DataGrid filter row, quoting identifiers
   /// for the active driver exactly like the web filtersToWhere().
-  void _onFilters(List<GridFilter> filters) {
+  Future<void> _onFilters(List<GridFilter> filters) async {
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
     final q = AppState.instance.quoteIdent;
     final conditions = <String>[];
     for (var i = 0; i < _columns.length && i < filters.length; i++) {
@@ -703,7 +990,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       _where.text = conditions.join(' AND ');
       _page = 1;
     });
-    _loadData();
+    await _loadData();
   }
 
   @override
@@ -802,7 +1089,11 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     );
   }
 
-  void _switchTab(String tab) {
+  Future<void> _switchTab(String tab) async {
+    if (tab == _tab) return;
+    // 切页签会卸载 DataGrid：暂存的批量编辑会丢，先确认。
+    if (!await _confirmLeaveDirty()) return;
+    if (!mounted) return;
     setState(() => _tab = tab);
     if (tab == 'ddl' && _ddl == null) _loadDdl();
   }
@@ -858,10 +1149,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                     child: TextField(
                       controller: _where,
                       style: monoStyle(size: 12),
-                      onSubmitted: (_) {
-                        setState(() => _page = 1);
-                        _loadData();
-                      },
+                      onSubmitted: (_) => _applyWhere(),
                       decoration: InputDecoration(
                         isDense: true,
                         hintText: I18n.current == AppLang.en ? 'Optional WHERE condition' : '可选 WHERE 条件',
@@ -869,29 +1157,24 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                       ),
                     ),
                   ),
-                  Btn(t('filter'),
-                      primary: true,
-                      onPressed: () {
-                        setState(() => _page = 1);
-                        _loadData();
-                      }),
+                  Btn(t('filter'), primary: true, onPressed: _applyWhere),
                   if (_where.text.isNotEmpty)
-                    Btn(t('clear'), onPressed: () {
-                      _where.text = '';
-                      setState(() => _page = 1);
-                      _loadData();
-                    }),
+                    Btn(t('clear'), onPressed: _clearWhere),
                   const Sep(),
                   Text((I18n.current == AppLang.en ? 'Per page' : '每页'), style: kSmall),
                   SelectBox<int>(
                     width: 90,
                     value: _perPage,
-                    onChanged: (v) {
+                    onChanged: (v) async {
+                      final next = v ?? 25;
+                      if (next == _perPage) return;
+                      if (!await _confirmLeaveDirty()) return;
+                      if (!mounted) return;
                       setState(() {
-                        _perPage = v ?? 25;
+                        _perPage = next;
                         _page = 1;
                       });
-                      _loadData();
+                      await _loadData();
                     },
                     items: const [
                       DropdownMenuItem(value: 10, child: Text('10')),
@@ -901,11 +1184,19 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                       DropdownMenuItem(value: 250, child: Text('250')),
                     ],
                   ),
+                  // 第 57 轮：刷新会丢掉未保存的批量编辑，先确认。
                   // An explicit refresh must re-count even on a cursor page,
                   // otherwise the pill keeps the pre-refresh number and only
                   // walking back to page 1 updates it.
-                  Btn(t('refresh'),
-                      onPressed: () => _loadData(refreshCount: true)),
+                  Btn(t('refresh'), onPressed: _refreshData),
+                  if (_stagedEdits.isNotEmpty)
+                    Pill(
+                      pickText(
+                        '未保存 ${_stagedEdits.length} 处',
+                        '${_stagedEdits.length} unsaved edit(s)',
+                      ),
+                      tone: PillTone.warn,
+                    ),
                 ],
               ),
               if (_primaryKey.isEmpty) ...[
@@ -933,6 +1224,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           onDeleteSelected: _deleteRows,
           onSaveCell: _saveCell,
           onApplyEdits: _applyDirtyEdits,
+          onDirtyChanges: _onDirtyChanges,
         ),
         const SizedBox(height: 8),
         _pager(),
@@ -960,12 +1252,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
             key: const ValueKey('pager-prev'),
             tooltip: '上一页',
             small: true,
-            onPressed: canPrev
-                ? () {
-                    setState(() => _page = page - 1);
-                    _loadData();
-                  }
-                : null),
+            onPressed: canPrev ? () => _goToPage(page - 1) : null),
         const SizedBox(width: 8),
         Text(pageLabel, style: kSmall),
         const SizedBox(width: 8),
@@ -973,12 +1260,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
             key: const ValueKey('pager-next'),
             tooltip: '下一页',
             small: true,
-            onPressed: hasNext
-                ? () {
-                    setState(() => _page = page + 1);
-                    _loadData();
-                  }
-                : null),
+            onPressed: hasNext ? () => _goToPage(page + 1) : null),
         const Spacer(),
         Text(countLabel, style: kSmallMuted),
       ],
@@ -1005,24 +1287,45 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// Unlike [_saveCell] (one immediate UPDATE per cell), the grid stages edits
   /// and hands them over together; the Rust side validates all of them before
   /// opening the transaction and rolls the whole batch back on the first error.
-  Future<bool> _applyDirtyEdits(List<DirtyCell> edits) async {
+  /// 把一批单元格编辑写到显式的 db/table（切表保存到原表也复用它）。
+  ///
+  /// 返回实际影响的行数；失败返回 null，并在页面错误横幅里显示原因。
+  Future<int?> _saveBatchEdits(
+    String db,
+    String table,
+    List<Json> columns,
+    List<List<dynamic>> rows,
+    List<String> primaryKey,
+    List<DirtyCell> edits,
+  ) async {
     final changes = buildRowChanges(
-      columns: _columns,
-      rows: _rows,
-      primaryKey: _primaryKey,
+      columns: columns,
+      rows: rows,
+      primaryKey: primaryKey,
       edits: edits,
     );
     try {
-      final result =
-          await Api.instance.applyRowChanges(widget.db, widget.table, changes);
-      final applied = (result['rows_affected'] as num?)?.toInt() ?? 0;
-      widget.notice.show('已保存 $applied 行');
-      await _reloadAfterWrite();
-      return true;
+      final result = await Api.instance.applyRowChanges(db, table, changes);
+      return (result['rows_affected'] as num?)?.toInt() ?? 0;
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
-      return false;
+      return null;
     }
+  }
+
+  Future<bool> _applyDirtyEdits(List<DirtyCell> edits) async {
+    final applied = await _saveBatchEdits(
+      widget.db,
+      widget.table,
+      _columns,
+      _rows,
+      _primaryKey,
+      edits,
+    );
+    if (applied == null) return false;
+    widget.notice.show('已保存 $applied 行');
+    await _reloadAfterWrite();
+    return true;
   }
 
   Future<void> _saveCell(

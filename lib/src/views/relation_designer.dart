@@ -224,6 +224,8 @@ class RelationDesigner extends StatefulWidget {
     this.height = 460,
     this.compact = false,
     this.onRequestEditFields,
+    this.driverOverride,
+    this.alterTableOverride,
   });
 
   final String database;
@@ -233,6 +235,22 @@ class RelationDesigner extends StatefulWidget {
   final double height;
   final bool compact;
   final VoidCallback? onRequestEditFields;
+
+  /// 测试注入：覆盖驱动名（第 56 轮）。
+  ///
+  /// 本机测试库是 SQLite，而 SQLite 不支持 ALTER 增删外键；用 'mysql' 注入可以
+  /// 覆盖「真实外键删除按钮 / 批量建议直接建立」这类只有 MySQL / PostgreSQL 才
+  /// 会走到的 UI 路径。产品代码不传，行为与 [AppState.instance.driver] 一致。
+  @visibleForTesting
+  final String? driverOverride;
+
+  /// 测试注入：拦截所有真实 ALTER（第 56 轮）。
+  ///
+  /// 注入后不再调用 [Api.instance.alterTableChecked]，测试可以断言收到的
+  /// drop_foreign_keys / add_foreign_keys SQL 体，而不用真的改库；未注入时
+  /// 行为完全不变。产品代码不传。
+  @visibleForTesting
+  final Future<Json> Function(String table, Json body)? alterTableOverride;
 
   @override
   State<RelationDesigner> createState() => _RelationDesignerState();
@@ -329,9 +347,21 @@ class _RelationDesignerState extends State<RelationDesigner> {
   /// 表 / 外键结构发生变化后调用（必须在 setState 里或之后再 build 之前）。
   void _bumpGraph() => _graphRevision++;
 
-  bool get _isSqlite => AppState.instance.isSqlite;
+  /// 当前驱动名：测试注入优先（第 56 轮），否则取活动连接。
+  String get _driverName => widget.driverOverride ?? AppState.instance.driver;
 
-  ErDriver get _driver => ErDriver.fromName(AppState.instance.driver);
+  bool get _isSqlite => _driver == ErDriver.sqlite;
+
+  ErDriver get _driver => ErDriver.fromName(_driverName);
+
+  /// 所有真实 ALTER 的统一入口（第 56 轮）：测试注入优先。
+  ///
+  /// 未注入时与原来直接调用 [Api.instance.alterTableChecked] 完全一致。
+  Future<Json> _alterTable(String table, Map<String, dynamic> body) {
+    final override = widget.alterTableOverride;
+    if (override != null) return override(table, body);
+    return Api.instance.alterTableChecked(widget.database, table, body);
+  }
 
   ErNodeMetrics get _metrics => ErNodeMetrics.forMode(widget.compact);
 
@@ -905,8 +935,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
             if (relation.name.isNotEmpty) relation.name,
         };
         try {
-          await Api.instance.alterTableChecked(
-            widget.database,
+          await _alterTable(
             suggestion.localTable,
             <String, dynamic>{
               'add_foreign_keys': <Map<String, dynamic>>[
@@ -1230,8 +1259,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
   ) async {
     // P0-1：Rust 把 ALTER 失败写在返回体里，必须走 checked 版本才会抛错，
     // 否则「创建外键」在数据库拒绝时也会静默关窗。
-    await Api.instance.alterTableChecked(
-      widget.database,
+    await _alterTable(
       localTable,
       <String, dynamic>{
         'add_foreign_keys': <Map<String, dynamic>>[payload],
@@ -1250,8 +1278,7 @@ class _RelationDesignerState extends State<RelationDesigner> {
       constraintName: name,
     );
     if (!confirmed || !mounted) return false;
-    await Api.instance.alterTableChecked(
-      widget.database,
+    await _alterTable(
       localTable,
       <String, dynamic>{
         'drop_foreign_keys': <String>[name],
@@ -1780,11 +1807,14 @@ class _RelationDesignerState extends State<RelationDesigner> {
       ),
     };
     // 只有真实外键能删；SQLite / 无名约束的判定与画布关系详情共用纯函数。
+    final deleteName = item.kind == ErRelationListItemKind.foreignKey
+        ? _relationDeleteName(item)
+        : '';
     final canDelete =
         item.kind == ErRelationListItemKind.foreignKey &&
         relationListCanDelete(
-          driver: AppState.instance.driver,
-          constraintName: item.constraintName,
+          driver: _driverName,
+          constraintName: deleteName,
         );
     return Container(
       key: ValueKey('er-relation-item-${item.key}'),
@@ -1834,14 +1864,13 @@ class _RelationDesignerState extends State<RelationDesigner> {
                 if (canDelete)
                   IconBtn(
                     Icons.delete_outline,
-                    key: ValueKey(
-                      'er-relation-delete-${item.relation.name}',
-                    ),
+                    key: ValueKey('er-relation-delete-$deleteName'),
                     tooltip: pickText('删除外键', 'Delete foreign key'),
                     dimension: 20,
                     glyphSize: 12,
                     danger: true,
-                    onPressed: () => _deleteRelationFromList(item.relation),
+                    onPressed: () =>
+                        _deleteRelationFromList(item.relation, deleteName),
                   ),
               ],
             ),
@@ -1867,16 +1896,31 @@ class _RelationDesignerState extends State<RelationDesigner> {
     }
   }
 
+  /// 侧栏行用于删除/展示的外键名。
+  ///
+  /// 真实 MySQL / PostgreSQL 的外键一定有约束名；只有测试注入 driverOverride
+  /// 时底层数据可能来自 SQLite（约束名为空）。这种情况按默认命名规则补一个
+  /// 名字，让删除入口的可用性与 override 参数可以被测试覆盖；生产环境（没有
+  /// override）仍然返回空串，不会出现「猜一个名字去删」的行为。
+  String _relationDeleteName(ErRelationListItem item) {
+    if (item.constraintName.isNotEmpty) return item.constraintName;
+    if (widget.driverOverride == null) return item.constraintName;
+    return defaultFkName(item.localTable, item.localColumn);
+  }
+
   /// 侧栏删除真实外键：复用 [_deleteForeignKey]（自带二次确认）。
-  Future<void> _deleteRelationFromList(ErRelation relation) async {
+  Future<void> _deleteRelationFromList(
+    ErRelation relation,
+    String constraintName,
+  ) async {
     // 与列表行共用同一可删判定（SQLite / 无名约束不可删）。
     if (!relationListCanDelete(
-      driver: AppState.instance.driver,
-      constraintName: relation.name,
+      driver: _driverName,
+      constraintName: constraintName,
     )) {
       return;
     }
-    final deleted = await _deleteForeignKey(relation.localTable, relation.name);
+    final deleted = await _deleteForeignKey(relation.localTable, constraintName);
     if (deleted && mounted) await widget.onChanged?.call();
   }
 
@@ -2612,16 +2656,27 @@ class _RelationDesignerState extends State<RelationDesigner> {
   }
 
   /// 两端实体表之间的「多对多 · 中间表」标签；点击折叠 / 展开中间表节点。
+  ///
+  /// 第 56 轮：窄画布放不下完整标签时（[_m2mLabelAnchor] 返回 null）不再 clamp
+  /// 把标签压回连线上，而是折叠态默认隐藏、只在 hover 到连线时临时显示，位置
+  /// 退回两卡片中心中点；tooltip 里仍带完整名称。
   Widget _manyToManyLabel(ErManyToManyLink link) {
     final junction = link.junctionTable;
     final collapsed = _collapsedJunctions.contains(junction);
-    final hint = collapsed ? '展开中间表' : '折叠中间表';
+    final action = collapsed ? '展开中间表' : '折叠中间表';
     final label = pickText('多对多 · $junction', 'many-to-many · $junction');
-    // 标签降噪：多对多标签只在折叠状态或 hover 到这条线时显示。
-    final visible = collapsed || _hoverM2MKey == link.key;
+    final anchor = _m2mLabelAnchor(link);
+    final hovered = _hoverM2MKey == link.key;
+    // 标签降噪：多对多标签只在折叠状态或 hover 到这条线时显示；放不下时
+    // （anchor == null）折叠态也隐藏，避免 clamp 回连线上挡住线。
+    final visible = anchor == null ? hovered : (collapsed || hovered);
     return _edgeLabel(
-      left: _m2mLabelAnchor(link),
-      tooltip: hint,
+      left: anchor ?? _m2mMidpointAnchor(link),
+      tooltip: pickText(
+        '$action（$label）',
+        '${collapsed ? 'Expand junction table' : 'Collapse junction table'}'
+            ' ($label)',
+      ),
       keyValue: 'er-m2m-$junction',
       visible: visible,
       background: AppColors.infoBg,
@@ -2720,16 +2775,8 @@ class _RelationDesignerState extends State<RelationDesigner> {
     );
   }
 
-  /// 多对多标签锚点：按标签尺寸自适应净空，并尽量把 210×18 的标签盒留在画布内。
-  ///
-  /// 第 53 / 55 轮：锚点在中点法线上，净空见 [m2mLabelClearance]（水平仍 18px、
-  /// 垂直约 111px、斜线介于两者之间）。画布边缘的处理顺序：
-  ///  1. 优先用偏上的法线方向；
-  ///  2. 越界时换到法线另一侧（垂直连线即左右换边，水平即上下换边，净空不变）；
-  ///  3. 两侧都越界时沿**连线方向**平移——沿线平移不改变法线净空，所以标签不会
-  ///     重新压到线上；
-  ///  4. 仍放不下（画布比标签还窄等极端情况）才退回 clamp，此时可能牺牲净空。
-  Offset _m2mLabelAnchor(ErManyToManyLink link) {
+  /// 多对多链路两端实体表的卡片中心；表不在画布 / 未布局时返回 null。
+  (Offset, Offset)? _m2mCardCenters(ErManyToManyLink link) {
     final layout = _layout;
     final tableA = layout.tableNamed(link.tableA);
     final tableB = layout.tableNamed(link.tableB);
@@ -2739,82 +2786,106 @@ class _RelationDesignerState extends State<RelationDesigner> {
         tableB == null ||
         positionA == null ||
         positionB == null) {
-      return Offset.zero;
+      return null;
     }
     final metrics = layout.metrics;
-    final a = Offset(
-      positionA.dx + metrics.cardWidth / 2,
-      positionA.dy + metrics.heightOf(tableA) / 2,
+    return (
+      Offset(
+        positionA.dx + metrics.cardWidth / 2,
+        positionA.dy + metrics.heightOf(tableA) / 2,
+      ),
+      Offset(
+        positionB.dx + metrics.cardWidth / 2,
+        positionB.dy + metrics.heightOf(tableB) / 2,
+      ),
     );
-    final b = Offset(
-      positionB.dx + metrics.cardWidth / 2,
-      positionB.dy + metrics.heightOf(tableB) / 2,
+  }
+
+  /// 两卡片中心连线的中点（窄画布放不下标签时的临时定位点）。
+  Offset _m2mMidpointAnchor(ErManyToManyLink link) {
+    final centers = _m2mCardCenters(link);
+    if (centers == null) return Offset.zero;
+    final (a, b) = centers;
+    return Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
+  }
+
+  /// 多对多标签锚点：按估算标签宽度自适应净空，并尽量把标签盒留在画布内。
+  ///
+  /// 第 53 / 55 / 56 轮：锚点在中点法线上，净空见 [m2mLabelClearance]（水平仍
+  /// 18px；垂直 = 半个标签宽度 + padding，短标签不再固定 111px）。标签宽度用
+  /// [estimatedM2MLabelWidth] 按文案估算，而不是固定 210。
+  ///
+  /// 画布边缘的处理顺序：
+  ///  1. 优先用偏上的法线方向；
+  ///  2. 越界时换到法线另一侧（垂直连线即左右换边，水平即上下换边，净空不变）；
+  ///  3. 两侧都越界时沿**连线方向**平移——沿线平移不改变法线净空；
+  ///  4. 仍放不下时返回 null：调用方不再 clamp（那会把标签压回连线上），而是
+  ///     折叠态隐藏、只在 hover 到连线时临时显示。
+  Offset? _m2mLabelAnchor(ErManyToManyLink link) {
+    final centers = _m2mCardCenters(link);
+    if (centers == null) return null;
+    final (a, b) = centers;
+    final labelSize = Size(
+      estimatedM2MLabelWidth(
+        pickText(
+          '多对多 · ${link.junctionTable}',
+          'many-to-many · ${link.junctionTable}',
+        ),
+      ),
+      18,
     );
-    final primary = m2mLabelAnchorFor(start: a, end: b);
-    final content = layout.contentSize(margin: 40);
-    // 与 m2mLabelClearance 的默认标签尺寸一致；标签以锚点为中心（画布上的
-    // FractionalTranslation -0.5），所以锚点可用范围要扣掉半个标签盒。
-    const labelWidth = 210.0;
-    const labelHeight = 18.0;
+    final content = _layout.contentSize(margin: 40);
     const edgeMargin = 4.0;
-    // 画布比标签还窄时退化成居中（min == max），避免 min > max 的 clamp 异常。
-    final minX = math.min(labelWidth / 2 + edgeMargin, content.width / 2);
-    final maxX = math.max(
-      content.width - labelWidth / 2 - edgeMargin,
-      content.width / 2,
+    bool fits(Offset point) => m2mLabelFitsCanvas(
+      anchor: point,
+      labelSize: labelSize,
+      canvasSize: content,
+      margin: edgeMargin,
     );
-    final minY = math.min(labelHeight / 2 + edgeMargin, content.height / 2);
-    final maxY = math.max(
-      content.height - labelHeight / 2 - edgeMargin,
-      content.height / 2,
-    );
-    bool fits(Offset point) =>
-        point.dx >= minX &&
-        point.dx <= maxX &&
-        point.dy >= minY &&
-        point.dy <= maxY;
+
+    final primary = m2mLabelAnchorFor(start: a, end: b, labelSize: labelSize);
     if (fits(primary)) return primary;
     final direction = b - a;
     final length = direction.distance;
-    if (length > 0.0001) {
-      final midpoint = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
-      // 法线另一侧：关于中点镜像，法线净空相同。
-      final mirror = Offset(
-        2 * midpoint.dx - primary.dx,
-        2 * midpoint.dy - primary.dy,
-      );
-      if (fits(mirror)) return mirror;
-      // 沿连线方向平移：只把越界的坐标推回画布，法线净空保持不变。
-      final unit = direction / length;
-      Offset slide(Offset point) {
-        final shifts = <double>[
-          if (point.dx < minX && unit.dx.abs() >= 0.2)
-            (minX - point.dx) / unit.dx,
-          if (point.dx > maxX && unit.dx.abs() >= 0.2)
-            (maxX - point.dx) / unit.dx,
-          if (point.dy < minY && unit.dy.abs() >= 0.2)
-            (minY - point.dy) / unit.dy,
-          if (point.dy > maxY && unit.dy.abs() >= 0.2)
-            (maxY - point.dy) / unit.dy,
-        ];
-        for (final shift in shifts) {
-          final moved = point + unit * shift;
-          if (fits(moved)) return moved;
-        }
-        return point;
-      }
-
-      final slid = slide(primary);
-      if (fits(slid)) return slid;
-      final slidMirror = slide(mirror);
-      if (fits(slidMirror)) return slidMirror;
-    }
-    // 极端情况（画布比标签窄，或连线方向与越界轴几乎平行）：只能 clamp，
-    // 标签可能压到连线，但至少不会被 Stack 裁掉——保留旧行为作为兜底。
-    return Offset(
-      primary.dx.clamp(minX, maxX).toDouble(),
-      primary.dy.clamp(minY, maxY).toDouble(),
+    if (length <= 0.0001) return null;
+    final midpoint = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
+    // 法线另一侧：关于中点镜像，法线净空相同。
+    final mirror = Offset(
+      2 * midpoint.dx - primary.dx,
+      2 * midpoint.dy - primary.dy,
     );
+    if (fits(mirror)) return mirror;
+    // 沿连线方向平移：只把越界的坐标推回画布，法线净空保持不变。
+    final unit = direction / length;
+    Offset slide(Offset point) {
+      final shifts = <double>[
+        if (point.dx - labelSize.width / 2 < edgeMargin &&
+            unit.dx.abs() >= 0.2)
+          (edgeMargin + labelSize.width / 2 - point.dx) / unit.dx,
+        if (point.dx + labelSize.width / 2 > content.width - edgeMargin &&
+            unit.dx.abs() >= 0.2)
+          (content.width - edgeMargin - labelSize.width / 2 - point.dx) /
+              unit.dx,
+        if (point.dy - labelSize.height / 2 < edgeMargin &&
+            unit.dy.abs() >= 0.2)
+          (edgeMargin + labelSize.height / 2 - point.dy) / unit.dy,
+        if (point.dy + labelSize.height / 2 > content.height - edgeMargin &&
+            unit.dy.abs() >= 0.2)
+          (content.height - edgeMargin - labelSize.height / 2 - point.dy) /
+              unit.dy,
+      ];
+      for (final shift in shifts) {
+        final moved = point + unit * shift;
+        if (fits(moved)) return moved;
+      }
+      return point;
+    }
+
+    final slid = slide(primary);
+    if (fits(slid)) return slid;
+    final slidMirror = slide(mirror);
+    if (fits(slidMirror)) return slidMirror;
+    return null;
   }
 }
 

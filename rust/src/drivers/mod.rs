@@ -1116,3 +1116,282 @@ mod wording_tests {
         assert_eq!(twice, message);
     }
 }
+/// 第 56 轮补充：列重命名（rename_columns）必须是独立的 ALTER 语句，并且排在
+/// 其余改动之前。MySQL 实测同一条 ALTER 里 "MODIFY old_b ..., RENAME old_b TO new_b"
+/// 会报 "Unknown column 'old_b'"（RENAME 先于 MODIFY 生效）；PG 也不支持一条
+/// ALTER 里多个 RENAME COLUMN。设计器（Dart）会把改名后的 MODIFY 用新列名发来，
+/// 所以顺序必须是「先 rename，再其余语句」。
+#[cfg(test)]
+mod alter_rename_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 由 JSON 构造 AlterTableSpec：与 Dart 经 serde 发来的载荷走同一条路径。
+    fn spec(value: Value) -> AlterTableSpec {
+        serde_json::from_value(value).expect("alter table spec")
+    }
+
+    /// 断言前 N 条是逐列 RENAME（顺序与入参一致），其余语句不含 RENAME COLUMN。
+    /// 返回其余语句供各驱动补充断言。
+    fn assert_renames_lead(statements: &[String], renames: &[(&str, &str)]) -> Vec<String> {
+        assert!(
+            statements.len() >= renames.len(),
+            "rename 语句应当在前: {statements:?}"
+        );
+        for (index, (from, to)) in renames.iter().enumerate() {
+            assert!(
+                statements[index].contains("RENAME COLUMN")
+                    && statements[index].contains(from)
+                    && statements[index].contains(to),
+                "第 {index} 条应当是 RENAME COLUMN {from} TO {to}: {}",
+                statements[index]
+            );
+        }
+        let rest = statements[renames.len()..].to_vec();
+        for statement in &rest {
+            assert!(
+                !statement.contains("RENAME COLUMN"),
+                "除前置 rename 外不应再出现 RENAME COLUMN: {statement}"
+            );
+        }
+        rest
+    }
+
+    #[test]
+    fn mysql_rename_column_statements_lead_and_modify_uses_the_new_name() {
+        let d = DriverKind::Mysql;
+        let target = qualify(d, "db", "t");
+        let rename = |from: &str, to: &str| {
+            format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                target,
+                qi(d, from),
+                qi(d, to)
+            )
+        };
+        let renames = [("old_a", "new_a"), ("old_b", "new_b")];
+        let with_renames = spec(json!({
+            "rename_columns": [
+                {"from": "old_a", "to": "new_a"},
+                {"from": "old_b", "to": "new_b"}
+            ],
+            "add_columns": [{"name": "added", "type": "INT"}],
+            "modify_columns": [{"name": "new_b", "type": "BIGINT", "nullable": false}],
+            "drop_columns": ["gone"],
+            "add_indexes": [{"name": "idx_new", "columns": ["new_a"]}],
+            "rename_to": "t2"
+        }));
+        let without_renames = spec(json!({
+            "add_columns": [{"name": "added", "type": "INT"}],
+            "modify_columns": [{"name": "new_b", "type": "BIGINT", "nullable": false}],
+            "drop_columns": ["gone"],
+            "add_indexes": [{"name": "idx_new", "columns": ["new_a"]}],
+            "rename_to": "t2"
+        }));
+
+        let statements =
+            mysql::alter_table_statements(d, "db", "t", &with_renames).expect("mysql alter");
+        let rest = assert_renames_lead(&statements, &renames);
+
+        // 每个 rename 恰好一条独立语句，顺序与入参一致。
+        assert_eq!(statements[0], rename("old_a", "new_a"));
+        assert_eq!(statements[1], rename("old_b", "new_b"));
+        // 其余语句与「本来就没有 rename」逐字相同：空 rename 时语句形态不变。
+        assert_eq!(
+            rest,
+            mysql::alter_table_statements(d, "db", "t", &without_renames)
+                .expect("mysql alter without renames")
+        );
+        assert_eq!(
+            rest.len(),
+            2,
+            "其余语句应为 1 条 ALTER + 1 条表重命名: {rest:?}"
+        );
+        assert!(
+            rest[0].starts_with(&format!("ALTER TABLE {} ", target)),
+            "{}",
+            rest[0]
+        );
+        assert!(
+            rest[0].contains(&format!("MODIFY COLUMN {} BIGINT NOT NULL", qi(d, "new_b"))),
+            "MODIFY 必须指向改名后的新列名: {}",
+            rest[0]
+        );
+        assert!(
+            rest[0].contains(&format!("ADD COLUMN {} INT NULL", qi(d, "added"))),
+            "{}",
+            rest[0]
+        );
+        assert!(
+            rest[0].contains(&format!("DROP COLUMN {}", qi(d, "gone"))),
+            "{}",
+            rest[0]
+        );
+        assert!(
+            rest[0].contains(&format!(
+                "ADD INDEX {} ({})",
+                qi(d, "idx_new"),
+                qi(d, "new_a")
+            )),
+            "{}",
+            rest[0]
+        );
+        assert!(!rest[0].contains("RENAME COLUMN"), "{}", rest[0]);
+        // 表重命名仍然是最后一条。
+        assert_eq!(
+            rest[1],
+            format!("RENAME TABLE {} TO {}", target, qi(d, "t2"))
+        );
+        // 语句总数 = rename 个数 + 其余语句数。
+        assert_eq!(statements.len(), renames.len() + rest.len());
+    }
+
+    #[test]
+    fn mysql_empty_rename_keeps_the_original_single_alter_shape() {
+        let d = DriverKind::Mysql;
+        let target = qualify(d, "db", "t");
+        let plain = spec(json!({
+            "add_columns": [{"name": "added", "type": "INT"}],
+            "drop_columns": ["gone"]
+        }));
+        let expected = format!(
+            "ALTER TABLE {} ADD COLUMN {} INT NULL, DROP COLUMN {}",
+            target,
+            qi(d, "added"),
+            qi(d, "gone")
+        );
+        assert_eq!(
+            mysql::alter_table_statements(d, "db", "t", &plain).expect("mysql alter"),
+            vec![expected]
+        );
+    }
+
+    #[test]
+    fn mysql_rename_only_does_not_emit_an_empty_alter() {
+        let d = DriverKind::Mysql;
+        let target = qualify(d, "db", "t");
+        let only_rename = spec(json!({
+            "rename_columns": [{"from": "a", "to": "b"}]
+        }));
+        let expected = format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            target,
+            qi(d, "a"),
+            qi(d, "b")
+        );
+        assert_eq!(
+            mysql::alter_table_statements(d, "db", "t", &only_rename).expect("mysql alter"),
+            vec![expected]
+        );
+    }
+
+    #[test]
+    fn postgres_rename_column_statements_are_leading_and_standalone() {
+        let d = DriverKind::Postgres;
+        let target = qualify(d, "public", "t");
+        let rename = |from: &str, to: &str| {
+            format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                target,
+                qi(d, from),
+                qi(d, to)
+            )
+        };
+        let renames = [("old_a", "new_a"), ("old_b", "new_b")];
+        let with_renames = spec(json!({
+            "rename_columns": [
+                {"from": "old_a", "to": "new_a"},
+                {"from": "old_b", "to": "new_b"}
+            ],
+            "add_columns": [{"name": "added", "type": "INT"}],
+            "modify_columns": [{"name": "new_b", "type": "BIGINT"}],
+            "drop_columns": ["gone"],
+            "add_indexes": [{"name": "idx_new", "columns": ["new_a"]}],
+            "rename_to": "t2"
+        }));
+        let without_renames = spec(json!({
+            "add_columns": [{"name": "added", "type": "INT"}],
+            "modify_columns": [{"name": "new_b", "type": "BIGINT"}],
+            "drop_columns": ["gone"],
+            "add_indexes": [{"name": "idx_new", "columns": ["new_a"]}],
+            "rename_to": "t2"
+        }));
+
+        let statements =
+            postgres::alter_table_statements("public", "t", &with_renames).expect("pg alter");
+        let rest = assert_renames_lead(&statements, &renames);
+
+        // PG 单条 ALTER 只允许一个 RENAME COLUMN：每个 rename 都是独立语句。
+        assert_eq!(statements[0], rename("old_a", "new_a"));
+        assert_eq!(statements[1], rename("old_b", "new_b"));
+        assert_eq!(
+            rest,
+            postgres::alter_table_statements("public", "t", &without_renames)
+                .expect("pg alter without renames")
+        );
+        assert!(
+            rest.iter()
+                .any(|s| s.contains(&format!("ALTER COLUMN {} TYPE BIGINT", qi(d, "new_b")))),
+            "改类型必须引用改名后的新列名: {rest:?}"
+        );
+        assert!(
+            rest.iter()
+                .any(|s| s.contains(&format!("ADD COLUMN {} INT", qi(d, "added")))),
+            "{rest:?}"
+        );
+        assert_eq!(
+            rest.last().map(String::as_str),
+            Some(format!("ALTER TABLE {} RENAME TO {}", target, qi(d, "t2")).as_str()),
+            "表重命名仍然最后: {rest:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rename_column_statements_lead_the_batch() {
+        let d = DriverKind::Sqlite;
+        let target = qualify(d, "main", "t");
+        let renames = [("old_a", "new_a")];
+        let with_renames = spec(json!({
+            "rename_columns": [{"from": "old_a", "to": "new_a"}],
+            "add_columns": [{"name": "added", "type": "INT"}],
+            "drop_columns": ["gone"],
+            "add_indexes": [{"name": "idx_new", "columns": ["new_a"]}],
+            "rename_to": "t2"
+        }));
+        let without_renames = spec(json!({
+            "add_columns": [{"name": "added", "type": "INT"}],
+            "drop_columns": ["gone"],
+            "add_indexes": [{"name": "idx_new", "columns": ["new_a"]}],
+            "rename_to": "t2"
+        }));
+
+        let statements =
+            sqlite::alter_table_statements("main", "t", &with_renames).expect("sqlite alter");
+        let rest = assert_renames_lead(&statements, &renames);
+
+        assert_eq!(
+            statements[0],
+            format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                target,
+                qi(d, "old_a"),
+                qi(d, "new_a")
+            )
+        );
+        assert_eq!(
+            rest,
+            sqlite::alter_table_statements("main", "t", &without_renames)
+                .expect("sqlite alter without renames")
+        );
+        assert!(
+            rest.iter()
+                .any(|s| s.contains(&format!("ADD COLUMN {} INT", qi(d, "added")))),
+            "{rest:?}"
+        );
+        assert_eq!(
+            rest.last().map(String::as_str),
+            Some(format!("ALTER TABLE {} RENAME TO {}", target, qi(d, "t2")).as_str()),
+            "表重命名仍然最后: {rest:?}"
+        );
+    }
+}

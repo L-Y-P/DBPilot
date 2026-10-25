@@ -940,6 +940,17 @@ pub fn alter_table_statements(
     let d = DriverKind::Postgres;
     let target = qualify(d, ns, table);
     let mut out: Vec<String> = Vec::new();
+    // 列重命名必须是独立语句并排在最前面：PG 不支持一条 ALTER 里多个
+    // RENAME COLUMN，而且设计器会把改名后的 MODIFY 用新列名发过来，只有
+    // 先把 RENAME 跑完，后面的 ALTER COLUMN 才能找到新列。
+    for r in &spec.rename_columns {
+        out.push(format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            target,
+            qi(d, &r.from),
+            qi(d, &r.to)
+        ));
+    }
     for c in &spec.add_columns {
         let col = qi(d, c.name.trim());
         let mut s = format!("ALTER TABLE {} ADD COLUMN {} {}", target, col, c.col_type.trim());
@@ -995,14 +1006,6 @@ pub fn alter_table_statements(
     }
     for name in &spec.drop_columns {
         out.push(format!("ALTER TABLE {} DROP COLUMN {}", target, qi(d, name)));
-    }
-    for r in &spec.rename_columns {
-        out.push(format!(
-            "ALTER TABLE {} RENAME COLUMN {} TO {}",
-            target,
-            qi(d, &r.from),
-            qi(d, &r.to)
-        ));
     }
     if let Some(cols) = &spec.set_primary_key {
         if !cols.is_empty() {

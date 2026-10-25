@@ -725,6 +725,21 @@ pub fn alter_table_statements(
     spec: &crate::drivers::AlterTableSpec,
 ) -> AppResult<Vec<String>> {
     let target = qualify(driver, ns, table);
+    // 列重命名必须是独立语句，并排在其他改动之前：
+    // - MySQL 会先应用 RENAME COLUMN，同一条 ALTER 里的
+    //   `MODIFY COLUMN old_b ..., RENAME COLUMN old_b TO new_b` 会报
+    //   `Unknown column 'old_b'`（RENAME 先于 MODIFY 生效，已用 mysql CLI 实测）；
+    // - PG 也不支持一条 ALTER 里多个 RENAME COLUMN。
+    // 所以先逐条生成 RENAME，再生成一条不含 rename 的其余 ALTER。
+    let mut statements: Vec<String> = Vec::new();
+    for r in &spec.rename_columns {
+        statements.push(format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            target,
+            qi(driver, &r.from),
+            qi(driver, &r.to)
+        ));
+    }
     let mut clauses: Vec<String> = Vec::new();
     for c in &spec.add_columns {
         clauses.push(format!("ADD COLUMN {}", column_clause(driver, c)?));
@@ -734,13 +749,6 @@ pub fn alter_table_statements(
     }
     for name in &spec.drop_columns {
         clauses.push(format!("DROP COLUMN {}", qi(driver, name)));
-    }
-    for r in &spec.rename_columns {
-        clauses.push(format!(
-            "RENAME COLUMN {} TO {}",
-            qi(driver, &r.from),
-            qi(driver, &r.to)
-        ));
     }
     if let Some(cols) = &spec.set_primary_key {
         if !cols.is_empty() {
@@ -792,7 +800,6 @@ pub fn alter_table_statements(
         clauses.push(format!("COMMENT={}", quote_str_for(driver, comment)));
     }
 
-    let mut statements = Vec::new();
     if !clauses.is_empty() {
         statements.push(format!("ALTER TABLE {} {}", target, clauses.join(", ")));
     }

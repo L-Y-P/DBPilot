@@ -66,7 +66,8 @@ TLS / mTLS（`disable` / `require` / `verify-ca` / `verify-full` + 自定义 CA 
 ![库与对象浏览](docs/images/db-objects.png)
 
 **表设计器** —— 可视化 ALTER TABLE：表选项、字段、索引、外键，全部带 SQL 预览后再应用；独立 DDL 页签；
-改动未应用前可点「撤销未应用的修改」一键回到数据库当前结构（确认后仅丢弃待应用的改动，不改数据库）。
+改动未应用前可点「撤销未应用的修改」一键回到数据库当前结构（确认后仅丢弃待应用的改动，不改数据库）；
+每列可单独「还原该列」、表名/注释可单独重置；字段改名会真正执行 RENAME COLUMN（驱动拆成独立语句保证 MySQL/PG 顺序正确）。
 
 ![表设计器](docs/images/table-design.png)
 

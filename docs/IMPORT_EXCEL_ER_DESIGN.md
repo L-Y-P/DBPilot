@@ -412,3 +412,23 @@ Future<void> showRelationDesigner(
   >5 GiB 断言 GiB 口径 warning 且耗时 < 10s（抓「整文件读取」跑偏，实测 0.00s）；恰好 5 GiB 不提示；Drop guard 清理临时文件。
   平台不支持稀疏文件时显式跳过（unix 校验物理占用）。
 
+
+## 12. 第 56 轮修订（标签宽度精细化 / 逐列撤销 / 列重命名真正生效）
+
+### 12.1 多对多标签宽度与窄画布
+
+- `estimatedM2MLabelWidth` 改为逐 rune 估宽：CJK / 假名 / 谚文 / 全角符号按 1.0 × fontSize，ASCII/半角按 0.6 × fontSize，末尾 +20，clamp [64, 210]；标签净空按实际估算宽度计算（短标签垂直净空 ~42px，长标签 111px，水平仍 18px）。
+- 新增 `m2mLabelFitsCanvas`：画布放不下时 `_m2mLabelAnchor` 返回 null（不再 clamp 压线），折叠态标签隐藏、hover 连线时临时显示完整 tooltip。
+
+### 12.2 表设计器逐项撤销与列重命名
+
+- 逐列还原：`tableDesignColumnBaseline` / `tableDesignColumnRowDirty` / `tableDesignResetColumnRow`；字段行操作列新增「还原该列」（仅 dirty 时可用），表名/注释输入旁也可单独重置。
+- **列重命名真正生效**：`tableDesignRenameColumns` 生成 `rename_columns`；重命名 + 改类型时 MODIFY 使用**新列名**（见 12.3），仅改名不产生 MODIFY。撞名/互换名/空名会安全跳过（UI 暂无重名提示）。
+- 待应用检测：rename_columns 非空即 dirty，「撤销全部」与「还原该列」都能恢复。
+
+### 12.3 ALTER 列重命名改为独立语句（MySQL/PG/SQLite 顺序一致）
+
+- 背景：MySQL 同一条 ALTER 里 `MODIFY old, RENAME old TO new` 实测报 Unknown column（RENAME 先于 MODIFY 生效）；PG 不允许一条 ALTER 多个 RENAME COLUMN。
+- 实现：三个驱动的 `alter_table_statements` 在 rename_columns 非空时，先按顺序为每个 rename 生成独立 `ALTER TABLE … RENAME COLUMN a TO b`，其余改动合并且不含 RENAME；`rename_to` 仍最后；只有 rename 时不产生空 ALTER。Dart 侧 MODIFY 改为使用新列名。
+- 验证：新增 MySQL live（test/table_design_live_test.dart）：只改名、改名+改类型（新列名 MODIFY）两条真实 ALTER 成功；驱动层 5 个单测覆盖 MySQL/PG/SQLite 语句顺序与形态。
+

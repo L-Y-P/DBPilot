@@ -1555,6 +1555,74 @@ Offset m2mLabelAnchorFor({
   return midpoint + normal * clearance;
 }
 
+/// 估算多对多标签的像素宽度（第 56 轮）。
+///
+/// 标签文案是「多对多 · junction」/「many-to-many · junction」的中英混排，精确
+/// 宽度要等 widget 布局；这里按 rune 类型估一个偏保守的值：
+///  * 中日韩全角字符（CJK 统一表意 / 假名 / 谚文 / 全角标点与符号）≈ 1.0 * fontSize；
+///  * 其余（ASCII / 半角符号 / 数字 / 空格）≈ 0.6 * fontSize；
+/// 再 +20（padding / 图标 / 边框），clamp 到 [64, maxWidth]。
+///
+/// 只用于决定标签避让净空，不参与布局。第 56 轮补充：中文全角按 1.0 估算，
+/// 长中文中间表名不会再被低估宽度（净空偏小、标签仍压线）；短标签（例如
+/// 「多对多 · a」）约 71px，垂直净空仍远小于固定 210px 时的 111px。
+double estimatedM2MLabelWidth(
+  String label, {
+  double fontSize = 9.5,
+  double maxWidth = 210,
+}) {
+  var width = 0.0;
+  for (final rune in label.runes) {
+    width += fontSize * (_isWideM2MRune(rune) ? 1.0 : 0.6);
+  }
+  final floor = math.min(64.0, maxWidth);
+  return (width + 20).clamp(floor, maxWidth).toDouble();
+}
+
+/// [rune] 是否按全角（1.0 * fontSize）计入标签宽度。
+///
+/// 覆盖 CJK 统一表意文字（基本区 / 扩展 A / 兼容表意 / 扩展 B 及以后）、平假名、
+/// 片假名、谚文音节、全角 ASCII 与符号、CJK 标点。其余按半角 0.6。
+bool _isWideM2MRune(int rune) {
+  // CJK 统一表意文字（基本区 + 扩展 A）、兼容表意文字、扩展 B 及以后。
+  if ((rune >= 0x3400 && rune <= 0x9FFF) ||
+      (rune >= 0xF900 && rune <= 0xFAFF) ||
+      rune >= 0x20000) {
+    return true;
+  }
+  // 平假名 / 片假名。
+  if (rune >= 0x3040 && rune <= 0x30FF) return true;
+  // 谚文音节。
+  if (rune >= 0xAC00 && rune <= 0xD7AF) return true;
+  // 全角 ASCII / 符号（！＂＃…）与 CJK 标点（、。「」等）。
+  if ((rune >= 0xFF00 && rune <= 0xFFEF) ||
+      (rune >= 0x3000 && rune <= 0x303F)) {
+    return true;
+  }
+  return false;
+}
+
+/// 标签盒（中心 [anchor]，尺寸 [labelSize]）是否完整落在 [canvasSize] 内。
+///
+/// [margin] 是四周至少保留的边距。第 56 轮用于窄画布兜底：法线换侧 / 沿线平移
+/// 后仍放不下时，designer 不再 clamp（那会把标签压回连线上），而是返回 null，
+/// 让标签只在 hover 到连线时临时显示。
+bool m2mLabelFitsCanvas({
+  required Offset anchor,
+  required Size labelSize,
+  required Size canvasSize,
+  double margin = 4,
+}) {
+  final left = anchor.dx - labelSize.width / 2;
+  final right = anchor.dx + labelSize.width / 2;
+  final top = anchor.dy - labelSize.height / 2;
+  final bottom = anchor.dy + labelSize.height / 2;
+  return left >= margin &&
+      top >= margin &&
+      right <= canvasSize.width - margin &&
+      bottom <= canvasSize.height - margin;
+}
+
 // -------------------------------------------------- 关系列表（侧栏，第 54 轮 P2-5）
 
 /// 侧栏「关系列表」里的三类条目。

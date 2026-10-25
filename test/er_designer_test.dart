@@ -500,6 +500,12 @@ void main() {
           .first,
     );
     expect(rowTooltip.message, contains('books.author_id → authors.id'));
+    // 未注入 driverOverride 时是 SQLite：真实外键行不显示删除图标。
+    expect(
+      find.descendant(of: panel, matching: find.byIcon(Icons.delete_outline)),
+      findsNothing,
+      reason: 'SQLite 下不显示删除图标（未注入 driverOverride）',
+    );
 
     // 搜索大小写不敏感：AUTHORS 只命中「books.author_id → authors.id」。
     await tester.enterText(
@@ -652,6 +658,118 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('driverOverride=mysql：关系列表删除图标走 alterTableOverride（第 56 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    String? capturedTable;
+    Json? capturedBody;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books'],
+          height: 520,
+          driverOverride: 'mysql',
+          alterTableOverride: (table, body) async {
+            capturedTable = table;
+            capturedBody = body;
+            return <String, dynamic>{'failed': 0, 'results': <dynamic>[]};
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    // 注入 mysql 后不再显示 SQLite 的「不支持 ALTER」提示。
+    expect(find.byKey(const ValueKey('er-sqlite-hint')), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final panel = find.byKey(const ValueKey('er-relation-list-panel'));
+    expect(panel, findsOneWidget);
+    // SQLite 库的外键没有约束名；只有测试注入 driverOverride 时按默认命名规则
+    // 补一个可操作的名字（books.author_id → fk_books_author_id）。
+    final deleteIcon = find.byKey(
+      const ValueKey('er-relation-delete-fk_books_author_id'),
+    );
+    expect(deleteIcon, findsOneWidget);
+    await tester.tap(deleteIcon);
+    await settle(tester, rounds: 6);
+    expect(find.text('请确认'), findsOneWidget);
+    expect(find.textContaining('fk_books_author_id'), findsWidgets);
+    await tester.tap(find.widgetWithText(Btn, '删除'));
+    await settle(tester, rounds: 10);
+
+    expect(capturedTable, 'books');
+    expect(
+      (capturedBody!['drop_foreign_keys'] as List).single,
+      'fk_books_author_id',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('driverOverride=mysql：建议行点击走 alterTableOverride 并成功提示（第 56 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    // 临时建两张没有外键的表，制造「按列名推导」的建议关系：
+    // s_child.s_parent_id → s_parent.id。
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS s_parent '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS s_child '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, s_parent_id INTEGER, note TEXT)',
+      );
+    });
+    String? capturedTable;
+    Json? capturedBody;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['s_child', 's_parent'],
+          height: 520,
+          driverOverride: 'mysql',
+          alterTableOverride: (table, body) async {
+            capturedTable = table;
+            capturedBody = body;
+            return <String, dynamic>{'failed': 0, 'results': <dynamic>[]};
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final panel = find.byKey(const ValueKey('er-relation-list-panel'));
+    expect(panel, findsOneWidget);
+    expect(find.descendant(of: panel, matching: find.text('建议')), findsOneWidget);
+    await tester.tap(
+      find.descendant(
+        of: panel,
+        matching: find.text('s_child.s_parent_id → s_parent.id'),
+      ),
+    );
+    await settle(tester, rounds: 8);
+
+    expect(capturedTable, 's_child');
+    final payload = (capturedBody!['add_foreign_keys'] as List).single as Map;
+    expect(payload['name'], 'fk_s_child_s_parent_id');
+    expect((payload['columns'] as List).single, 's_parent_id');
+    expect(payload['ref_table'], 's_parent');
+    expect((payload['ref_columns'] as List).single, 'id');
+    // 成功路径：工具栏下方出现「已建立建议外键」提示。
+    final notice = tester.widget<AlertBox>(
+      find.byKey(const ValueKey('er-action-notice')),
+    );
+    expect(notice.message, contains('已建立建议外键'));
+    expect(notice.message, contains('s_child.s_parent_id'));
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('中间表徽标、多对多连线与折叠 / 展开', (tester) async {
     await setSurface(tester);
     await tester.pumpWidget(
@@ -678,6 +796,16 @@ void main() {
     await settle(tester);
     expect(find.byKey(const ValueKey('er-node-order_items')), findsNothing);
     expect(find.text('多对多 · order_items'), findsOneWidget);
+    // 第 56 轮：标签 tooltip 带完整名称（窄画布隐藏标签时仍能看全名）。
+    final m2mTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .ancestor(
+            of: find.byKey(const ValueKey('er-m2m-order_items')),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(m2mTooltip.message, contains('多对多 · order_items'));
 
     // P2-6：标签不能压住橙色多对多连线的中段。渲染出的标签中心必须离开
     // 「两张卡片中心连线的中点」，且偏移方向与连线垂直、优先向上。
@@ -1365,6 +1493,17 @@ void main() {
     await settle(tester);
     expect(find.text('Junction table (many-to-many)'), findsWidgets);
     expect(find.text('many-to-many · order_items'), findsOneWidget);
+    // 第 56 轮：多对多标签 tooltip 在英文模式下也带完整英文名称。
+    final m2mTooltip = tester.widget<app_tooltip.Tooltip>(
+      find
+          .ancestor(
+            of: find.byKey(const ValueKey('er-m2m-order_items')),
+            matching: find.byType(app_tooltip.Tooltip),
+          )
+          .first,
+    );
+    expect(m2mTooltip.message, contains('many-to-many · order_items'));
+    expect(m2mTooltip.message, contains('Collapse junction table'));
 
     // P2-5：关系列表侧栏里的多对多条目也必须是英文（画布上还有一份隐藏
     // 标签，所以限定在面板内查找）。

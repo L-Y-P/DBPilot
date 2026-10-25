@@ -1188,9 +1188,180 @@ void main() {
     });
   });
 
-  group('多对多标签矩形与连线不相交（第 54/55 轮几何回归）', () {
-    const labelWidth = 210.0;
+  group('多对多标签宽度估算 / 画布适配（第 56 轮）', () {
+    test('宽度估算：短标签下限 64，长标签上限 210，字号 / maxWidth 可调', () {
+      // 3 个全角汉字 + 4 个半角字符（空格 / · / 空格 / a）：
+      // 3*9.5 + 4*0.6*9.5 + 20 = 71.3。
+      expect(estimatedM2MLabelWidth('多对多 · a'), closeTo(71.3, 0.0001));
+      // 很短的纯半角标签取下限 64。
+      expect(estimatedM2MLabelWidth('a'), 64);
+      // 英文标签 16 个半角字符：16*0.6*9.5 + 20。
+      expect(
+        estimatedM2MLabelWidth('many-to-many · a'),
+        closeTo(16 * 9.5 * 0.6 + 20, 0.0001),
+      );
+      final medium = estimatedM2MLabelWidth('多对多 · order_items');
+      expect(medium, closeTo(3 * 9.5 + 14 * 9.5 * 0.6 + 20, 0.0001));
+      expect(medium, greaterThan(64));
+      expect(medium, lessThan(210));
+      final long = estimatedM2MLabelWidth('多对多 · ${'x' * 60}');
+      expect(long, 210);
+      expect(
+        estimatedM2MLabelWidth('多对多 · ${'x' * 60}', maxWidth: 120),
+        120,
+      );
+      expect(
+        estimatedM2MLabelWidth('多对多 · order_items', fontSize: 14),
+        greaterThan(medium),
+      );
+    });
+
+    test('同 rune 数下中文标签宽度 > ASCII 标签（全角 1.0 / 半角 0.6）', () {
+      const chinese = '多对多标签宽度估算'; // 9 个全角汉字
+      const ascii = 'abcdefghi'; // 9 个半角字母
+      expect(chinese.runes.length, ascii.runes.length);
+      final chineseWidth = estimatedM2MLabelWidth(chinese);
+      final asciiWidth = estimatedM2MLabelWidth(ascii);
+      expect(chineseWidth, greaterThan(asciiWidth));
+      expect(chineseWidth, closeTo(9 * 9.5 + 20, 0.0001));
+      expect(asciiWidth, closeTo(9 * 9.5 * 0.6 + 20, 0.0001));
+    });
+
+    test('CJK / 假名 / 谚文 / 全角标点 / 扩展表意都按全角计宽', () {
+      final narrow = estimatedM2MLabelWidth('a' * 8);
+      expect(narrow, closeTo(8 * 9.5 * 0.6 + 20, 0.0001));
+      for (final wide in <String>[
+        '中' * 8, // CJK 统一表意
+        'あ' * 8, // 平假名
+        'ア' * 8, // 片假名
+        '한' * 8, // 谚文音节
+        '、' * 8, // CJK 标点（0x3001）
+        'Ａ' * 8, // 全角 ASCII（0xFF21）
+        String.fromCharCode(0x20000) * 8, // CJK 扩展 B
+      ]) {
+        expect(
+          estimatedM2MLabelWidth(wide),
+          closeTo(8 * 9.5 + 20, 0.0001),
+          reason: '全角字符应按 1.0*fontSize 计宽: $wide',
+        );
+        expect(estimatedM2MLabelWidth(wide), greaterThan(narrow));
+      }
+    });
+
+    test('长中文 junction 名宽度接近 maxWidth 且垂直净空 > 60', () {
+      final label = '多对多 · ${'订单项目' * 10}';
+      final width = estimatedM2MLabelWidth(label);
+      expect(width, 210);
+      final clearance = m2mLabelClearance(
+        start: const Offset(300, 100),
+        end: const Offset(300, 600),
+        labelSize: Size(width, 18),
+      );
+      expect(clearance, greaterThan(60));
+      expect(clearance, closeTo(111, 0.0001));
+    });
+
+    test('垂直净空随估算宽度收敛：短标签 < 70，长标签仍 111', () {
+      const start = Offset(300, 100);
+      const end = Offset(300, 600);
+      final shortWidth = estimatedM2MLabelWidth('多对多 · a');
+      final longWidth = estimatedM2MLabelWidth('多对多 · ${'x' * 60}');
+      expect(shortWidth, closeTo(71.3, 0.0001));
+      expect(longWidth, 210);
+      final shortClearance = m2mLabelClearance(
+        start: start,
+        end: end,
+        labelSize: Size(shortWidth, 18),
+      );
+      final longClearance = m2mLabelClearance(
+        start: start,
+        end: end,
+        labelSize: Size(longWidth, 18),
+      );
+      expect(shortClearance, lessThan(70));
+      expect(shortClearance, closeTo(shortWidth / 2 + 6, 0.0001));
+      expect(longClearance, closeTo(111, 0.0001));
+    });
+
+    test('m2mLabelFitsCanvas：宽 / 窄画布与 margin 边界', () {
+      const size = Size(100, 18);
+      const canvas = Size(400, 300);
+      // 宽画布：放得下。
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(150, 150),
+          labelSize: size,
+          canvasSize: canvas,
+        ),
+        isTrue,
+      );
+      // 左 / 右 / 上 / 下越界：放不下。
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(40, 150),
+          labelSize: size,
+          canvasSize: canvas,
+        ),
+        isFalse,
+      );
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(370, 150),
+          labelSize: size,
+          canvasSize: canvas,
+        ),
+        isFalse,
+      );
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(150, 8),
+          labelSize: size,
+          canvasSize: canvas,
+        ),
+        isFalse,
+      );
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(150, 296),
+          labelSize: size,
+          canvasSize: canvas,
+        ),
+        isFalse,
+      );
+      // margin 边界：left 只有 2px，默认 margin 4 放不下，margin 0 可以。
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(52, 150),
+          labelSize: size,
+          canvasSize: canvas,
+        ),
+        isFalse,
+      );
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(52, 150),
+          labelSize: size,
+          canvasSize: canvas,
+          margin: 0,
+        ),
+        isTrue,
+      );
+      // 画布比标签窄：任何位置都放不下。
+      expect(
+        m2mLabelFitsCanvas(
+          anchor: const Offset(50, 150),
+          labelSize: const Size(120, 18),
+          canvasSize: const Size(100, 300),
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  group('多对多标签矩形与连线不相交（第 54~56 轮几何回归）', () {
     const labelHeight = 18.0;
+    final mediumLabel = '多对多 · order_items';
+    final mediumWidth = estimatedM2MLabelWidth(mediumLabel);
 
     Offset midpointOf(Offset a, Offset b) =>
         Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
@@ -1206,13 +1377,13 @@ void main() {
     }
 
     /// 轴对齐标签矩形在连线法线方向上的「半径」：|nx|*半宽 + |ny|*半高。
-    double rectNormalSupport(Offset start, Offset end) {
+    double rectNormalSupport(Offset start, Offset end, double width) {
       final delta = end - start;
       final length = delta.distance;
-      if (length == 0) return labelWidth / 2;
+      if (length == 0) return width / 2;
       final nx = (-delta.dy / length).abs();
       final ny = (delta.dx / length).abs();
-      return nx * (labelWidth / 2) + ny * (labelHeight / 2);
+      return nx * (width / 2) + ny * (labelHeight / 2);
     }
 
     /// 轴对齐矩形与线段是否相交（Liang–Barsky 参数裁剪）。
@@ -1240,19 +1411,23 @@ void main() {
           clip(dy, rect.bottom - start.dy);
     }
 
-    Rect labelRect(Offset start, Offset end) => Rect.fromCenter(
-      center: m2mLabelAnchorFor(start: start, end: end),
-      width: labelWidth,
+    Rect labelRect(Offset start, Offset end, double width) => Rect.fromCenter(
+      center: m2mLabelAnchorFor(
+        start: start,
+        end: end,
+        labelSize: Size(width, labelHeight),
+      ),
+      width: width,
       height: labelHeight,
     );
 
-    test('水平连线：轴对齐标签矩形（210×18）与连线段不相交，净空 9px', () {
+    test('水平连线：估算宽度标签矩形与连线段不相交，净空 9px', () {
       const a = Offset(100, 300);
       const b = Offset(600, 300);
-      final rect = labelRect(a, b);
+      final rect = labelRect(a, b, mediumWidth);
       expect(rectIntersectsSegment(rect, a, b), isFalse);
       expect(rect.contains(midpointOf(a, b)), isFalse);
-      // 锚点距离仍是 18px（第 53 轮行为不回归）；减去半高 9px = 9px 净空。
+      // 水平时法线是竖直的，净空仍取 minOffset 18；减去半高 9px = 9px。
       expect(distanceToLine(rect.center, a, b), closeTo(18, 0.0001));
       expect(
         distanceToLine(rect.center, a, b) - labelHeight / 2,
@@ -1260,28 +1435,54 @@ void main() {
       );
     });
 
-    test('垂直连线：自适应净空 111px，轴对齐矩形与连线段不相交', () {
+    test('垂直连线：估算宽度决定净空，矩形与连线段不相交且短标签 < 70', () {
       const a = Offset(300, 100);
       const b = Offset(300, 600);
-      final rect = labelRect(a, b);
-      final clearance = m2mLabelClearance(start: a, end: b);
-      expect(clearance, closeTo(111, 0.0001));
-      expect(distanceToLine(rect.center, a, b), closeTo(clearance, 0.0001));
-      expect(rectIntersectsSegment(rect, a, b), isFalse);
-      // 矩形朝向连线的一边到连线 = padding（6px），线不会被横向长边擦到。
-      expect(clearance - rectNormalSupport(a, b), closeTo(6, 0.0001));
+      final shortWidth = estimatedM2MLabelWidth('多对多 · a');
+      final longWidth = estimatedM2MLabelWidth('多对多 · ${'x' * 60}');
+      expect(shortWidth, closeTo(71.3, 0.0001));
+      expect(longWidth, 210);
+      for (final width in <double>[shortWidth, mediumWidth, longWidth]) {
+        final rect = labelRect(a, b, width);
+        final clearance = m2mLabelClearance(
+          start: a,
+          end: b,
+          labelSize: Size(width, labelHeight),
+        );
+        expect(distanceToLine(rect.center, a, b), closeTo(clearance, 0.0001));
+        expect(rectIntersectsSegment(rect, a, b), isFalse);
+        expect(
+          clearance - rectNormalSupport(a, b, width),
+          closeTo(6, 0.0001),
+        );
+      }
+      expect(
+        m2mLabelClearance(
+          start: a,
+          end: b,
+          labelSize: Size(shortWidth, labelHeight),
+        ),
+        lessThan(70),
+      );
     });
 
-    test('斜线：自适应净空介于 18~111，轴对齐矩形与连线段不相交', () {
+    test('斜线：估算宽度净空介于 18~111，矩形与连线段不相交', () {
       const a = Offset(100, 100);
       const b = Offset(500, 420);
-      final rect = labelRect(a, b);
-      final clearance = m2mLabelClearance(start: a, end: b);
+      final rect = labelRect(a, b, mediumWidth);
+      final clearance = m2mLabelClearance(
+        start: a,
+        end: b,
+        labelSize: Size(mediumWidth, labelHeight),
+      );
       expect(clearance, greaterThan(18));
       expect(clearance, lessThan(111));
       expect(distanceToLine(rect.center, a, b), closeTo(clearance, 0.0001));
       expect(rectIntersectsSegment(rect, a, b), isFalse);
-      expect(clearance - rectNormalSupport(a, b), closeTo(6, 0.0001));
+      expect(
+        clearance - rectNormalSupport(a, b, mediumWidth),
+        closeTo(6, 0.0001),
+      );
     });
   });
 

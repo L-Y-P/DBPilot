@@ -1174,6 +1174,16 @@ pub fn alter_table_statements(
         return Err(AppError::bad("SQLite 不支持用 ALTER 增删外键，请在新建表时指定或重建表"));
     }
     let mut out: Vec<String> = Vec::new();
+    // 列重命名单独成句并排在最前面：与 MySQL/PG 的语句顺序保持一致（设计器
+    // 用改名后的新列名构造后续 ADD / 索引），也不受同批其它 ALTER 子句顺序影响。
+    for r in &spec.rename_columns {
+        out.push(format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            target,
+            qi(d, &r.from),
+            qi(d, &r.to)
+        ));
+    }
     for c in &spec.add_columns {
         if c.auto_increment || c.comment.as_deref().map(|v| !v.is_empty()).unwrap_or(false) {
             return Err(AppError::bad("SQLite 新增字段不支持自增 / 注释"));
@@ -1195,14 +1205,6 @@ pub fn alter_table_statements(
     }
     for name in &spec.drop_columns {
         out.push(format!("ALTER TABLE {} DROP COLUMN {}", target, qi(d, name)));
-    }
-    for r in &spec.rename_columns {
-        out.push(format!(
-            "ALTER TABLE {} RENAME COLUMN {} TO {}",
-            target,
-            qi(d, &r.from),
-            qi(d, &r.to)
-        ));
     }
     // Drop before add: a replaced index keeps its name, and the other order
     // would create the new definition and then drop it again.

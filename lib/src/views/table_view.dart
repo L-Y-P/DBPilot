@@ -93,6 +93,178 @@ String currentTableComment(Json structure) {
   return (info['TABLE_COMMENT'] ?? '').toString().trim();
 }
 
+/// 设计器字段行的「可编辑字段」（从 structure 的列定义规范化后的基线）。
+///
+/// 只包含可编辑的 6 个字段（不含 isNew/original/charset 这些 UI/元数据键），
+/// 便于 [tableDesignColumnRowDirty] 做纯粹的字段比较。按原列名索引。
+Map<String, Json> tableDesignColumnBaseline(Json structure) {
+  final columns = structure['columns'];
+  if (columns is! List) return <String, Json>{};
+  final baseline = <String, Json>{};
+  for (final raw in columns) {
+    if (raw is! Map) continue;
+    final name = (raw['name'] ?? '').toString();
+    if (name.isEmpty) continue;
+    baseline[name] = <String, dynamic>{
+      'name': name,
+      'type': (raw['type_name'] ?? '').toString(),
+      'nullable': raw['IS_NULLABLE'] == 'YES',
+      'default': raw['COLUMN_DEFAULT']?.toString() ?? '',
+      'auto_increment': (raw['EXTRA'] ?? '').toString().contains(
+        'auto_increment',
+      ),
+      'comment': (raw['COLUMN_COMMENT'] ?? '').toString(),
+    };
+  }
+  return baseline;
+}
+
+/// 设计器里的一列相对于 [baseline] 是否被改过（第 56 轮：逐列还原）。
+///
+/// 只比较可编辑字段，UI 附加键（isNew/original/charset…）忽略。空值口径与
+/// _buildAlter 一致：default/comment 的 null 与空串等价（空的默认值/注释不会
+/// 被写进 ALTER 载荷）；列名按 trim 后比较（载荷里的列名也是 trim 过的）。
+bool tableDesignColumnRowDirty(Json baseline, Json current) {
+  String text(Json row, String key) => (row[key] ?? '').toString();
+  bool optionTextChanged(String key) {
+    // text() 已把 null/缺失统一成空串：null 与空串等价，只有值不同才算改。
+    return text(baseline, key) != text(current, key);
+  }
+
+  if (text(baseline, 'name').trim() != text(current, 'name').trim()) {
+    return true;
+  }
+  if (text(baseline, 'type') != text(current, 'type')) return true;
+  if ((baseline['nullable'] == true) != (current['nullable'] == true)) {
+    return true;
+  }
+  if (optionTextChanged('default')) return true;
+  if ((baseline['auto_increment'] == true) !=
+      (current['auto_increment'] == true)) {
+    return true;
+  }
+  if (optionTextChanged('comment')) return true;
+  return false;
+}
+
+/// 由基线生成一行可直接替换进 _designColumns 的深拷贝。
+///
+/// 六个可编辑字段与 [baseline] 等值；另外补上设计器需要的 UI 元数据
+/// （isNew=false、original=列名），这样替换后的行会立刻被当作「数据库里的
+/// 现有列」，不显示 changed/new，也不会在 _buildAlter 里丢掉 kept 映射。
+Json tableDesignResetColumnRow(Json baseline) {
+  final name = (baseline['name'] ?? '').toString();
+  return <String, dynamic>{
+    'name': name,
+    'type': (baseline['type'] ?? '').toString(),
+    'nullable': baseline['nullable'] == true,
+    'default': baseline['default']?.toString() ?? '',
+    'auto_increment': baseline['auto_increment'] == true,
+    'comment': baseline['comment']?.toString() ?? '',
+    'isNew': false,
+    'original': name,
+  };
+}
+
+/// 设计器里需要重命名的列（第 56 轮补充：列重命名真正生效）。
+///
+/// 只输出「数据库里已存在（isNew != true）且名字真的变了」的列，按设计器里的
+/// 列顺序返回 `{'from': 原名, 'to': 新名}`。以下情况不生成，避免 ALTER 指向
+/// 不存在/冲突的列（UI 如需更细的提示可另做校验）：
+///   * 新加的列（isNew）没有原名，不能 RENAME；
+///   * 原名/新名为空（不会产生空 to）；
+///   * 新旧名相同（trim 后比较）；
+///   * 新名和其它列的现有名（或其它列的原名）撞名，包括两列互换名——MySQL/
+///     PostgreSQL 的 RENAME COLUMN 是逐条执行的，中间态撞名会直接失败。
+///
+/// Rust 会把每个 RENAME 拆成独立语句并**先**执行，然后再执行其余 ALTER（第 56
+/// 轮 MySQL 实测：同一条 ALTER 里用旧名 MODIFY 会报 Unknown column）。所以既改
+/// 类型又改名的列，modify payload 必须用**新**列名（见
+/// [tableDesignColumnAlterPayload]）；未改名或改名因撞名被跳过时仍用原名。
+/// SQLite 由驱动按自己的重建/rename 语义处理同一个 spec。
+List<Json> tableDesignRenameColumns(List<Json> designColumns) {
+  final count = designColumns.length;
+  final originals = <String>[];
+  final currentNames = <String>[];
+  final candidates = <bool>[];
+  for (var i = 0; i < count; i++) {
+    final column = designColumns[i];
+    final original = (column['original'] ?? '').toString().trim();
+    final name = (column['name'] ?? '').toString().trim();
+    originals.add(original.toLowerCase());
+    currentNames.add(name.toLowerCase());
+    candidates.add(
+      column['isNew'] != true &&
+          original.isNotEmpty &&
+          name.isNotEmpty &&
+          original != name,
+    );
+  }
+  final out = <Json>[];
+  final taken = <String>{};
+  for (var i = 0; i < count; i++) {
+    if (!candidates[i]) continue;
+    final from = (designColumns[i]['original'] ?? '').toString().trim();
+    final to = (designColumns[i]['name'] ?? '').toString().trim();
+    final key = to.toLowerCase();
+    if (taken.contains(key)) continue;
+    var conflict = false;
+    for (var j = 0; j < count && !conflict; j++) {
+      if (j == i) continue;
+      if (originals[j] == key) {
+        // 目标名还是另一列的原名：逐条 RENAME 时该列尚未改名 → 撞名。
+        conflict = true;
+      } else if (!candidates[j] && currentNames[j] == key) {
+        // 目标名被一个不参与重命名的列占用。
+        conflict = true;
+      }
+    }
+    if (conflict) continue;
+    taken.add(key);
+    out.add(<String, dynamic>{'from': from, 'to': to});
+  }
+  return out;
+}
+
+/// 现有列在 ALTER 载荷里的列名（第 56 轮补充：rename 改成独立语句先执行后，
+/// 被改名列的 MODIFY 必须用新列名）。
+///
+/// * 该列有 [tableDesignRenameColumns] 生成的重命名 → 用 `to`（新名字此时
+///   已经存在）；
+/// * 没有重命名（没改名，或改名因撞名被跳过）→ 用原列名，避免 MODIFY 指向
+///   不存在的列；
+/// * 新列（original 为空）→ 用当前名。
+String tableDesignColumnAlterName(Json column, List<Json> renameColumns) {
+  final original = (column['original'] ?? '').toString().trim();
+  final current = (column['name'] ?? '').toString().trim();
+  if (column['isNew'] == true || original.isEmpty) return current;
+  for (final rename in renameColumns) {
+    if ((rename['from'] ?? '').toString().trim() != original) continue;
+    final to = (rename['to'] ?? '').toString().trim();
+    if (to.isNotEmpty) return to;
+  }
+  return original;
+}
+
+/// 构造一列的 ALTER payload（add_columns / modify_columns 共用）。
+///
+/// 名字规则见 [tableDesignColumnAlterName]；其余字段与旧实现一致：空默认值 /
+/// 空注释发送 null（表示不改），只有真实差异才由调用方放进列表。
+Json tableDesignColumnAlterPayload(Json column, List<Json> renameColumns) {
+  return <String, dynamic>{
+    'name': tableDesignColumnAlterName(column, renameColumns),
+    'type': (column['type'] ?? '').toString(),
+    'nullable': column['nullable'] == true,
+    'default': (column['default'] ?? '').toString().isEmpty
+        ? null
+        : column['default'].toString(),
+    'auto_increment': column['auto_increment'] == true,
+    'comment': (column['comment'] ?? '').toString().isEmpty
+        ? null
+        : column['comment'].toString(),
+  };
+}
+
 /// Single-table workbench with tabs: Browse, Structure, Design, DDL, Insert,
 /// SQL, Export, Import and Operations.
 ///
@@ -213,11 +385,14 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   final _renameTo = TextEditingController();
   final _tableComment = TextEditingController();
 
-  /// 设计器的文本输入（重命名/注释/字段名…）不会重建整页（TextField 自己维护
-  /// 光标），所以「撤销未应用的修改」按钮额外监听这个 notifier：用户第一次
-  /// 输入时置 true，让按钮的可用态刷新一次。真正是否可撤销仍由
-  /// [tableDesignBodyEmpty] 对 ALTER 载荷的判断决定。
-  final ValueNotifier<bool> _designEdited = ValueNotifier<bool>(false);
+  /// 设计的「文本修改版本号」：字段名/类型/默认值/注释、表名、表注释这些
+  /// TextField 的 onChanged 不重建整页（否则光标会跳），所以每次文本变化 +1，
+  /// 依赖它的按钮/单元格（撤销全部、逐列还原、表名/注释重置）重新计算可用态，
+  /// 而输入框本身保持原状、不丢光标。
+  final ValueNotifier<int> _designRevision = ValueNotifier<int>(0);
+
+  /// 设计器字段行的数据库基线（按原列名索引，来自 structure）；逐列还原用。
+  Map<String, Json> _designColumnBaseline = <String, Json>{};
 
   @override
   void initState() {
@@ -239,7 +414,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       controller.dispose();
     }
     _tableComment.dispose();
-    _designEdited.dispose();
+    _designRevision.dispose();
     super.dispose();
   }
 
@@ -278,6 +453,8 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       _designNewFks.clear();
       _designDropIndexes.clear();
       _designDropFks.clear();
+      _designColumnBaseline = <String, Json>{};
+      _designRevision.value = 0;
       _designSql = null;
       _designResults = <Json>[];
       _designError = null;
@@ -442,6 +619,8 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
 
   /// Copy the current columns into the designer snapshot.
   void _seedDesigner() {
+    // 逐列还原的基线：与设计器快照同时刷新。
+    _designColumnBaseline = tableDesignColumnBaseline(_structure);
     _designColumns.clear();
     for (final column in _structureColumns) {
       _designColumns.add(<String, dynamic>{
@@ -459,7 +638,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       });
     }
     // 重新播种 = 回到数据库里的基线：清掉「用户动过设计器」的标记。
-    _designEdited.value = false;
+    _designRevision.value = 0;
     final info = _structure['info'];
     if (info is Map) {
       _renameTo.clear();
@@ -1192,14 +1371,15 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           title: (I18n.current == AppLang.en ? 'Table options' : '表选项'),
           actions: [
             // 第 55 轮（ROUND51 P3-7）：设计器没有撤销时的兜底出口。只有真的
-            // 有未应用的修改才可点；文本输入类改动通过 _designEdited 通知刷新。
-            ValueListenableBuilder<bool>(
-              valueListenable: _designEdited,
-              builder: (context, edited, _) {
+            // 有未应用的修改才可点；文本输入类改动通过 _designRevision 触发重算。
+            ValueListenableBuilder<int>(
+              valueListenable: _designRevision,
+              builder: (context, revision, _) {
                 // 结构/数据加载中不要点亮：此时 _designColumns 可能还是空的，
                 // 算出来的 drop_columns 会是整张表，用户误点会重置成旧快照。
-                final dirty = !_loading &&
-                    (edited || !tableDesignBodyEmpty(_buildAlter()));
+                // revision 只负责在文本输入后触发重算，是否 dirty 仍由载荷判断。
+                final dirty =
+                    !_loading && !tableDesignBodyEmpty(_buildAlter());
                 return Btn(
                   pickText('撤销未应用的修改', 'Discard pending changes'),
                   key: const ValueKey<String>('table-design-reset'),
@@ -1216,12 +1396,40 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                 label: (I18n.current == AppLang.en ? 'Rename to' : '重命名为'),
                 child: Field(label: '', controller: _renameTo,
                   hint: I18n.current == AppLang.en ? 'New table name (leave blank to keep)' : '新表名（留空不改）',
-                  onChanged: (_) => _designEdited.value = true),
+                  onChanged: (_) => _designRevision.value++,
+                  trailing: ValueListenableBuilder<int>(
+                    valueListenable: _designRevision,
+                    builder: (context, revision, _) {
+                      // 留空 = 不重命名（与 _buildAlter 的口径一致）；只有真的
+                      // 填了一个和当前表名不同的新名字才可重置。
+                      final text = _renameTo.text.trim();
+                      final dirty = text.isNotEmpty && text != widget.table;
+                      return IconBtn(
+                        Icons.restore,
+                        key: const ValueKey<String>('table-design-reset-name'),
+                        tooltip: pickText('恢复表名', 'Reset table name'),
+                        onPressed: dirty ? _resetDesignName : null,
+                      );
+                    },
+                  )),
               ),
               FormRow(
                 label: t('table_comment'),
                 child: Field(label: '', controller: _tableComment,
-                  onChanged: (_) => _designEdited.value = true),
+                  onChanged: (_) => _designRevision.value++,
+                  trailing: ValueListenableBuilder<int>(
+                    valueListenable: _designRevision,
+                    builder: (context, revision, _) {
+                      final dirty = _tableComment.text.trim() !=
+                          currentTableComment(_structure);
+                      return IconBtn(
+                        Icons.restore,
+                        key: const ValueKey<String>('table-design-reset-comment'),
+                        tooltip: pickText('恢复注释', 'Reset comment'),
+                        onPressed: dirty ? _resetDesignComment : null,
+                      );
+                    },
+                  )),
               ),
             ],
           ),
@@ -1375,6 +1583,9 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   TableRow _designColumnRow(int index) {
     final column = _designColumns[index];
     final changed = _columnChanged(column);
+    // 逐列还原的基线按「原列名」查找；新加的列没有基线。
+    final baseline =
+        _designColumnBaseline[(column['original'] ?? '').toString()];
     return TableRow(
       decoration: BoxDecoration(
         color: changed ? AppColors.rowSelected : Colors.transparent,
@@ -1413,10 +1624,37 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-          child: Btn(t('delete'),
-              small: true,
-              danger: true,
-              onPressed: () => setState(() => _designColumns.removeAt(index))),
+          child: ValueListenableBuilder<int>(
+            valueListenable: _designRevision,
+            builder: (context, revision, _) {
+              // 只有改过的现有列可还原：新列没有数据库基线，只能删除。
+              final canRevert = column['isNew'] != true &&
+                  baseline != null &&
+                  tableDesignColumnRowDirty(baseline, column);
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconBtn(
+                    Icons.restore,
+                    key: ValueKey<String>('table-design-revert-$index'),
+                    tooltip: pickText(
+                      '还原该列到数据库当前定义',
+                      'Revert this column to the database definition',
+                    ),
+                    onPressed: canRevert
+                        ? () => _revertDesignColumn(index)
+                        : null,
+                  ),
+                  const SizedBox(width: 4),
+                  Btn(t('delete'),
+                      small: true,
+                      danger: true,
+                      onPressed: () =>
+                          setState(() => _designColumns.removeAt(index))),
+                ],
+              );
+            },
+          ),
         ),
       ],
     );
@@ -1452,9 +1690,9 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           style: mono ? monoStyle(size: 12) : const TextStyle(fontSize: 12),
           onChanged: (value) {
             onChanged(value);
-            // 文本编辑不触发整页重建（TextField 自己维护光标）：这里通知
-            // 「撤销未应用的修改」按钮重新计算可用态。
-            _designEdited.value = true;
+            // 文本编辑不触发整页重建（TextField 自己维护光标）：这里递增版本号，
+            // 让撤销/还原按钮重新计算可用态。
+            _designRevision.value++;
           },
           decoration: const InputDecoration(
             isDense: true,
@@ -1695,27 +1933,26 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     final modifyColumns = <Json>[];
     final dropColumns = <String>[];
     final kept = <String>{};
+    // 第 56 轮补充：列重命名真正进入 ALTER 载荷（之前 rename_columns 恒为空，
+    // 设计器里改字段名既不生效也不显示为待应用修改）。
+    final renameColumns = tableDesignRenameColumns(_designColumns);
 
     for (final column in _designColumns) {
       final name = (column['name'] ?? '').toString().trim();
       if (name.isEmpty) continue;
-      final payload = <String, dynamic>{
-        'name': name,
-        'type': (column['type'] ?? '').toString(),
-        'nullable': column['nullable'] == true,
-        'default': (column['default'] ?? '').toString().isEmpty
-            ? null
-            : column['default'].toString(),
-        'auto_increment': column['auto_increment'] == true,
-        'comment': (column['comment'] ?? '').toString().isEmpty
-            ? null
-            : column['comment'].toString(),
-      };
+      final payload = tableDesignColumnAlterPayload(column, renameColumns);
       if (column['isNew'] == true) {
         addColumns.add(payload);
       } else {
-        kept.add((column['original'] ?? name).toString());
-        if (_columnChanged(column)) modifyColumns.add(payload);
+        final original = (column['original'] ?? name).toString();
+        kept.add(original);
+        if (_columnChanged(column)) {
+          // 现有列只有字段定义（类型/NULL/默认值/自增/注释）变了才进
+          // modify_columns；仅改名只会出现在 rename_columns 里。payload 的
+          // 列名规则见 tableDesignColumnAlterName：改名的列用新名（RENAME 先
+          // 作为独立语句执行），未改名/改名被跳过时用原名。
+          modifyColumns.add(payload);
+        }
       }
     }
     // A column that existed before and is neither kept nor renamed is dropped.
@@ -1765,7 +2002,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       'add_columns': addColumns,
       'modify_columns': modifyColumns,
       'drop_columns': dropColumns,
-      'rename_columns': <dynamic>[],
+      'rename_columns': renameColumns,
       'add_indexes': addIndexes,
       'drop_indexes': _designDropIndexes.toList(),
       'add_foreign_keys': addFks,
@@ -1816,11 +2053,54 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       _designSql = null;
       _designResults = <Json>[];
       _designError = null;
-      _designEdited.value = false;
+      _designRevision.value = 0;
     });
     widget.notice.show(
       pickText('已撤销未应用的修改', 'Pending changes discarded'),
     );
+  }
+
+  /// 把某一列还原成数据库当前定义（逐列撤销，第 56 轮）。
+  ///
+  /// 原位替换 _designColumns[index]，不改变列顺序，也不动索引/外键配置；旧预览
+  /// 与执行结果和还原后的草稿对不上，一并清空。
+  void _revertDesignColumn(int index) {
+    if (index < 0 || index >= _designColumns.length) return;
+    final current = _designColumns[index];
+    final baseline =
+        _designColumnBaseline[(current['original'] ?? '').toString()];
+    if (baseline == null) return;
+    final name = (baseline['name'] ?? '').toString();
+    setState(() {
+      _designColumns[index] = tableDesignResetColumnRow(baseline);
+      _designSql = null;
+      _designResults = <Json>[];
+      _designError = null;
+    });
+    widget.notice.show(pickText('已还原列 $name', 'Column $name reverted'));
+  }
+
+  /// 表名输入「恢复原表名」：丢弃尚未应用的重命名（rename_to 为空）。
+  void _resetDesignName() {
+    if (_renameTo.text.trim() == widget.table) return;
+    setState(() {
+      _renameTo.text = widget.table;
+      _designSql = null;
+      _designResults = <Json>[];
+      _designError = null;
+    });
+  }
+
+  /// 表注释输入「恢复数据库当前注释」。
+  void _resetDesignComment() {
+    final baseline = currentTableComment(_structure);
+    if (_tableComment.text.trim() == baseline) return;
+    setState(() {
+      _tableComment.text = baseline;
+      _designSql = null;
+      _designResults = <Json>[];
+      _designError = null;
+    });
   }
 
   Future<void> _previewDesign() async {

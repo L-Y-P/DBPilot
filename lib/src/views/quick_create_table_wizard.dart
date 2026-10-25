@@ -1,3 +1,6 @@
+// 外键预检/失败面板的提示语由「固定文案 + 计数 + 表名」拼成，显式拼接比插值
+// 更易读（同 builder_labels.dart 的约定）。
+// ignore_for_file: prefer_interpolation_to_compose_strings
 import 'dart:async';
 
 import 'package:flutter/material.dart' hide Text, Tooltip;
@@ -756,12 +759,462 @@ String? relationSeedWarning(
   );
 }
 
+
+// =========================================================================
+// 外键预检 / 导入顺序 / 外键失败解析（第 52 轮，纯逻辑可单测）
+// =========================================================================
+
+/// 本次向导内创建的一条外键。
+///
+/// builderSchema 的 foreign_keys 只有 column / ref_table / ref_column（没有约束
+/// 名），所以 [name] 可能为空；外键失败消息里解析到的约束名会补到失败对象上。
+class QuickForeignKey {
+  const QuickForeignKey({
+    required this.name,
+    required this.childTable,
+    required this.columns,
+    required this.refTable,
+    required this.refColumns,
+  });
+
+  final String name;
+  final String childTable;
+  final List<String> columns;
+  final String refTable;
+  final List<String> refColumns;
+
+  String get childColumn => columns.isEmpty ? '' : columns.first;
+  String get refColumn => refColumns.isEmpty ? '' : refColumns.first;
+
+  /// 「子表.列 → 父表.列」的可读路径。
+  String get path => '$childTable.$childColumn → $refTable.$refColumn';
+
+  /// 用于预检结果缓存的稳定签名。
+  String get signature =>
+      '$name|$childTable|$childColumn|$refTable|$refColumn';
+}
+
+/// 从单个值里取「最后一个标识符」：`db`.`table` / "table" / schema.table。
+String stripSchemaIdentifier(String raw) {
+  final text = raw.trim();
+  final backticks =
+      RegExp(r'`([^`]+)`').allMatches(text).map((m) => m.group(1)!).toList();
+  if (backticks.isNotEmpty) return backticks.last;
+  final doubleQuotes =
+      RegExp(r'"([^"]+)"').allMatches(text).map((m) => m.group(1)!).toList();
+  if (doubleQuotes.isNotEmpty) return doubleQuotes.last;
+  var value = text;
+  final dot = value.lastIndexOf('.');
+  if (dot >= 0 && dot < value.length - 1) value = value.substring(dot + 1);
+  for (final quote in <String>['`', '"', "'"]) {
+    value = value.replaceAll(quote, '');
+  }
+  return value;
+}
+
+List<String> _stringListOf(Object? raw) {
+  if (raw is List) {
+    return <String>[
+      for (final value in raw)
+        if (value != null && value.toString().trim().isNotEmpty)
+          value.toString().trim(),
+    ];
+  }
+  final text = (raw ?? '').toString().trim();
+  return text.isEmpty ? const <String>[] : <String>[text];
+}
+
+/// 从 builderSchema 里挑出「子表与父表都在本次向导已建表里」的外键。
+List<QuickForeignKey> foreignKeysInWizard(
+  Json schema,
+  Set<String> createdTables,
+) {
+  final byLower = <String, String>{
+    for (final name in createdTables) name.toLowerCase(): name,
+  };
+  final out = <QuickForeignKey>[];
+  for (final rawTable
+      in (schema['tables'] as List? ?? const <dynamic>[]).map(asJsonMap)) {
+    final childName = (rawTable['name'] ?? '').toString();
+    if (!byLower.containsKey(childName.toLowerCase())) continue;
+    for (final rawFk
+        in (rawTable['foreign_keys'] as List? ?? const <dynamic>[])
+            .map(asJsonMap)) {
+      final refTable = (rawFk['ref_table'] ?? '').toString();
+      if (!byLower.containsKey(refTable.toLowerCase())) continue;
+      final columns = _stringListOf(rawFk['columns'] ?? rawFk['column']);
+      final refColumns =
+          _stringListOf(rawFk['ref_columns'] ?? rawFk['ref_column']);
+      if (columns.isEmpty || refColumns.isEmpty) continue;
+      out.add(QuickForeignKey(
+        name: (rawFk['name'] ?? rawFk['constraint_name'] ?? '').toString(),
+        childTable: byLower[childName.toLowerCase()]!,
+        columns: columns,
+        refTable: byLower[refTable.toLowerCase()]!,
+        refColumns: refColumns,
+      ));
+    }
+  }
+  return out;
+}
+
+/// 按「父表先、子表后」对导入计划排序。
+///
+/// 只考虑两端都在 [plans] 里的外键；环（互相引用）无法拓扑排序时，把剩余表按
+/// 原计划顺序补在末尾，保证不会死循环、也不会漏表。
+List<QuickTablePlan> importOrderFor(
+  List<QuickTablePlan> plans,
+  List<QuickForeignKey> foreignKeys,
+) {
+  if (plans.length < 2) return List<QuickTablePlan>.of(plans);
+  final byLower = <String, QuickTablePlan>{
+    for (final plan in plans) plan.name.toLowerCase(): plan,
+  };
+  final edges = <String, Set<String>>{};
+  final indegree = <String, int>{
+    for (final plan in plans) plan.name.toLowerCase(): 0,
+  };
+  for (final fk in foreignKeys) {
+    final parent = fk.refTable.toLowerCase();
+    final child = fk.childTable.toLowerCase();
+    if (!byLower.containsKey(parent) ||
+        !byLower.containsKey(child) ||
+        parent == child) {
+      continue;
+    }
+    final children = edges.putIfAbsent(parent, () => <String>{});
+    if (children.add(child)) {
+      indegree[child] = (indegree[child] ?? 0) + 1;
+    }
+  }
+  final ordered = <QuickTablePlan>[];
+  final remaining = <String>{
+    for (final plan in plans) plan.name.toLowerCase(),
+  };
+  while (remaining.isNotEmpty) {
+    String? next;
+    for (final plan in plans) {
+      final key = plan.name.toLowerCase();
+      if (!remaining.contains(key)) continue;
+      if ((indegree[key] ?? 0) == 0) {
+        next = key;
+        break;
+      }
+    }
+    if (next == null) break; // 环：剩下的按原顺序补在末尾
+    ordered.add(byLower[next]!);
+    remaining.remove(next);
+    for (final child in edges[next] ?? const <String>{}) {
+      indegree[child] = (indegree[child] ?? 1) - 1;
+    }
+  }
+  for (final plan in plans) {
+    if (remaining.contains(plan.name.toLowerCase())) ordered.add(plan);
+  }
+  return ordered;
+}
+
+/// 外键样本比较时的值归一化：去空白、数字按数值比较、NULL/空串返回 null。
+///
+/// 数字用 double 规范化，'1'、'1.0'、1 会得到同一个键；非数字只 trim，不改大小写
+/// （标识符/学号可能区分大小写）。
+String? normalizeForeignKeyValue(Object? raw) {
+  if (raw == null) return null;
+  if (raw is bool) return 'b:$raw';
+  if (raw is num) {
+    if (raw is double && raw == raw.roundToDouble() && raw.abs() < 1e15) {
+      return 'n:${raw.toInt()}';
+    }
+    return 'n:$raw';
+  }
+  final text = raw.toString().trim();
+  if (text.isEmpty) return null;
+  final number = double.tryParse(text);
+  if (number != null) {
+    if (number == number.roundToDouble() && number.abs() < 1e15) {
+      return 'n:${number.toInt()}';
+    }
+    return 'n:$number';
+  }
+  return 's:$text';
+}
+
+/// 一条外键的样本比对结果。
+class FkSampleIssue {
+  const FkSampleIssue({
+    required this.foreignKey,
+    required this.mismatched,
+    required this.total,
+    required this.examples,
+    this.generatedParentColumn = false,
+    this.cannotCompare = false,
+  });
+
+  final QuickForeignKey foreignKey;
+  final int mismatched;
+  final int total;
+  final List<String> examples;
+
+  /// 父表被引用列是本向导「添加自增 id 主键」生成的列 → 无法用源文件核对。
+  final bool generatedParentColumn;
+
+  /// 无法比较（例如父表列没找到）；同样按高风险提示。
+  final bool cannotCompare;
+
+  bool get isHighRisk => generatedParentColumn || cannotCompare;
+  bool get isMismatch => mismatched > 0;
+}
+
+/// 比较父/子两张表前 N 行样本：子表外键值在父表被引用列里不存在则记一条问题。
+///
+/// 跳过 NULL/空串；数值宽松比较；父表的 generated 自增列无法用源文件核对，
+/// 直接按高风险返回。没有问题时返回 null。
+FkSampleIssue? compareForeignKeySamples({
+  required QuickForeignKey foreignKey,
+  required List<Object?> parentValues,
+  required List<Object?> childValues,
+  bool generatedParentColumn = false,
+}) {
+  if (generatedParentColumn) {
+    return FkSampleIssue(
+      foreignKey: foreignKey,
+      mismatched: 0,
+      total: 0,
+      examples: const <String>[],
+      generatedParentColumn: true,
+      cannotCompare: true,
+    );
+  }
+  final parentKeys = <String>{
+    for (final value in parentValues)
+      if (normalizeForeignKeyValue(value) != null)
+        normalizeForeignKeyValue(value)!,
+  };
+  var total = 0;
+  var mismatched = 0;
+  final examples = <String>[];
+  for (final value in childValues) {
+    final key = normalizeForeignKeyValue(value);
+    if (key == null) continue;
+    total++;
+    if (parentKeys.contains(key)) continue;
+    mismatched++;
+    final text = value.toString().trim();
+    if (!examples.contains(text) && examples.length < 5) examples.add(text);
+  }
+  if (mismatched == 0) return null;
+  return FkSampleIssue(
+    foreignKey: foreignKey,
+    mismatched: mismatched,
+    total: total,
+    examples: examples,
+  );
+}
+
+/// 从 importPreview 的 records 里取某一个源列（按 sourceIndex）的样本值。
+List<Object?> previewColumnSample(Json preview, QuickColumn column) {
+  if (column.generated || column.sourceIndex < 0) return const <Object?>[];
+  final header = (preview['header'] as List? ?? const <dynamic>[])
+      .map((value) => value.toString())
+      .toList();
+  final out = <Object?>[];
+  for (final record
+      in (preview['records'] as List? ?? const <dynamic>[]).map(asJsonMap)) {
+    if (record['header'] == true) continue;
+    final values = record['values'];
+    if (values is List) {
+      if (column.sourceIndex < values.length) {
+        out.add(values[column.sourceIndex]);
+      }
+    } else if (values is Map) {
+      final key = header.length > column.sourceIndex
+          ? header[column.sourceIndex]
+          : column.sourceLabel;
+      if (key.isNotEmpty && values.containsKey(key)) out.add(values[key]);
+    }
+  }
+  return out;
+}
+
+/// 导入时被数据库外键拒绝的解析结果。
+///
+/// MySQL 的 message 里同时有子表名、约束名与「FOREIGN KEY (col) REFERENCES t(c)」；
+/// SQLite 只有一句 FOREIGN KEY constraint failed；PostgreSQL 走 23503 + DETAIL。
+class QuickFkFailure {
+  const QuickFkFailure({
+    required this.message,
+    this.constraintName = '',
+    this.childTable = '',
+    this.childColumn = '',
+    this.refTable = '',
+    this.refColumn = '',
+    this.foreignKey,
+  });
+
+  final String message;
+  final String constraintName;
+  final String childTable;
+  final String childColumn;
+  final String refTable;
+  final String refColumn;
+
+  /// 匹配到的本次向导外键（可能为空：消息里信息不足）。
+  final QuickForeignKey? foreignKey;
+
+  /// 可以在失败面板里删除的外键名（约束名优先）。
+  String get droppableName {
+    if (constraintName.isNotEmpty) return constraintName;
+    return foreignKey?.name ?? '';
+  }
+
+  String get path {
+    final matched = foreignKey;
+    if (matched != null) return matched.path;
+    if (childTable.isEmpty && refTable.isEmpty) return '';
+    final left = childTable.isEmpty
+        ? childColumn
+        : (childColumn.isEmpty ? childTable : '$childTable.$childColumn');
+    final right = refTable.isEmpty
+        ? refColumn
+        : (refColumn.isEmpty ? refTable : '$refTable.$refColumn');
+    return '$left → $right';
+  }
+}
+
+String _stripOuterQuotes(String value) {
+  var text = value.trim();
+  for (final quote in <String>['`', '"', "'"]) {
+    if (text.startsWith(quote) && text.endsWith(quote) && text.length >= 2) {
+      text = text.substring(1, text.length - 1);
+    }
+  }
+  return text;
+}
+
+/// 是否是外键类失败（MySQL 23000 / PG 23503 / SQLite 787 / 通用外键文案）。
+bool isForeignKeyError(String message) {
+  final lower = message.toLowerCase();
+  if (lower.contains('foreign key constraint fails')) return true;
+  if (lower.contains('foreign key constraint failed')) return true;
+  if (lower.contains('violates foreign key constraint')) return true;
+  if (lower.contains('外键')) return true;
+  if (lower.contains('23000')) return true;
+  if (lower.contains('23503')) return true;
+  if (RegExp(r'(^|[^0-9])787([^0-9]|$)').hasMatch(lower)) return true;
+  return false;
+}
+
+/// 解析导入失败消息里的外键信息；不是外键错误时返回 null。
+///
+/// [foreignKeys] 用来把解析结果对齐到本次向导创建的外键（约束名/列/表名匹配）。
+QuickFkFailure? parseForeignKeyFailure(
+  String message,
+  List<QuickForeignKey> foreignKeys,
+) {
+  if (!isForeignKeyError(message)) return null;
+
+  var constraintName = '';
+  // "constraint fails / constraint failed" 不是约束名，用负向先行断言排除。
+  final constraintMatch = RegExp(
+    r'''constraint\s+[`"']?(?!fail(?:s|ed)\b)([A-Za-z0-9_]+)''',
+    caseSensitive: false,
+  ).firstMatch(message);
+  if (constraintMatch != null) constraintName = constraintMatch.group(1)!;
+
+  // 子表：MySQL 的 "... fails (`db`.`child`, CONSTRAINT ..." / 通用 "(child, ..."。
+  var childTable = '';
+  final childMatch = RegExp(
+    r'''fails\s*\(\s*(?:`?[^`",.\s]+`?\s*\.\s*)?`?([^`",\s]+)`?\s*,''',
+    caseSensitive: false,
+  ).firstMatch(message);
+  if (childMatch != null) {
+    childTable = stripSchemaIdentifier(childMatch.group(1)!);
+  }
+  if (childTable.isEmpty) {
+    final onTable = RegExp(r'''on table\s+"([^"]+)"''', caseSensitive: false)
+        .firstMatch(message);
+    if (onTable != null) childTable = stripSchemaIdentifier(onTable.group(1)!);
+  }
+
+  var childColumn = '';
+  var refTable = '';
+  var refColumn = '';
+  final fkMatch = RegExp(
+    r'''foreign\s+key\s*\(([^)]+)\)\s*references\s+([^\s(]+)\s*\(([^)]+)\)''',
+    caseSensitive: false,
+  ).firstMatch(message);
+  if (fkMatch != null) {
+    childColumn = stripSchemaIdentifier(fkMatch.group(1)!.split(',').first);
+    refTable = stripSchemaIdentifier(fkMatch.group(2)!);
+    refColumn = stripSchemaIdentifier(fkMatch.group(3)!.split(',').first);
+  }
+  if (childColumn.isEmpty) {
+    // PostgreSQL: Key (col)=(value) is not present in table "parent".
+    final detail = RegExp(
+      r'''key\s*\(([^)]+)\)\s*=\s*\([^)]*\)\s+is not present in table\s+"([^"]+)"''',
+      caseSensitive: false,
+    ).firstMatch(message);
+    if (detail != null) {
+      childColumn = stripSchemaIdentifier(detail.group(1)!);
+      refTable = stripSchemaIdentifier(detail.group(2)!);
+    }
+  }
+  childTable = _stripOuterQuotes(childTable);
+
+  QuickForeignKey? matched;
+  for (final fk in foreignKeys) {
+    final byName = constraintName.isNotEmpty &&
+        fk.name.isNotEmpty &&
+        fk.name.toLowerCase() == constraintName.toLowerCase();
+    final byChildColumn = childColumn.isNotEmpty &&
+        fk.childColumn.toLowerCase() == childColumn.toLowerCase();
+    final byRef =
+        refTable.isEmpty || fk.refTable.toLowerCase() == refTable.toLowerCase();
+    final byRefColumn = refColumn.isEmpty ||
+        fk.refColumn.toLowerCase() == refColumn.toLowerCase();
+    final byTable = childTable.isNotEmpty &&
+        fk.childTable.toLowerCase() == childTable.toLowerCase();
+    if (byName ||
+        (byChildColumn && byRef && byRefColumn) ||
+        (byTable &&
+            byRef &&
+            byRefColumn &&
+            (refTable.isNotEmpty || refColumn.isNotEmpty))) {
+      matched = fk;
+      break;
+    }
+  }
+  if (matched != null) {
+    if (constraintName.isEmpty) constraintName = matched.name;
+    return QuickFkFailure(
+      message: message,
+      constraintName: constraintName,
+      childTable: matched.childTable,
+      childColumn: matched.childColumn,
+      refTable: matched.refTable,
+      refColumn: matched.refColumn,
+      foreignKey: matched,
+    );
+  }
+  return QuickFkFailure(
+    message: message,
+    constraintName: constraintName,
+    childTable: childTable,
+    childColumn: childColumn,
+    refTable: refTable,
+    refColumn: refColumn,
+  );
+}
+
 // =========================================================================
 // 运行期模型
 // =========================================================================
 
+/// 外键数据预检确认框的选择。
+enum _PrecheckChoice { backToRelations, continueImport }
+
 /// 单张表的导入状态（建表在字段步骤完成，这里只跟踪导入）。
-enum _RunStatus { idle, importing, done, failed }
+enum _RunStatus { idle, importing, done, failed, skipped }
 
 String _statusLabel(_RunStatus status) {
   return switch (status) {
@@ -769,6 +1222,7 @@ String _statusLabel(_RunStatus status) {
     _RunStatus.importing => pickText('导入中', 'Importing'),
     _RunStatus.done => pickText('完成', 'Done'),
     _RunStatus.failed => pickText('失败', 'Failed'),
+    _RunStatus.skipped => pickText('已跳过', 'Skipped'),
   };
 }
 
@@ -778,6 +1232,7 @@ PillTone _statusTone(_RunStatus status) {
     _RunStatus.importing => PillTone.info,
     _RunStatus.done => PillTone.ok,
     _RunStatus.failed => PillTone.danger,
+    _RunStatus.skipped => PillTone.warn,
   };
 }
 
@@ -867,6 +1322,25 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
   Json? _jobStatus;
   String? _currentJobId;
   int _currentFormIndex = -1;
+
+  // ---- 第 52 轮：外键预检 / 导入顺序 / 外键失败恢复 ----
+  /// 本次向导内创建的外键（builderSchema 过滤后 / 测试注入）。
+  List<QuickForeignKey> _foreignKeys = <QuickForeignKey>[];
+  /// 用户确认过的预检签名（同一组外键 + 同一份数据不重复弹框）。
+  String? _precheckApprovedSignature;
+  /// 预检无法执行时的提示（不阻断导入）。
+  String? _precheckNote;
+  /// 导入失败被识别为外键错误时的解析结果。
+  QuickFkFailure? _fkFailure;
+  /// 测试注入：表名 -> 源数据行（不含表头），用于样本比对，不访问真实文件。
+  Map<String, List<List<Object?>>> _previewRowsOverride =
+      <String, List<List<Object?>>>{};
+  /// 预检时读取预览失败的表（只提示，不阻断导入）。
+  Set<String> _previewFailureTables = <String>{};
+  /// 测试注入：拦截 alterTable(drop_foreign_keys) 调用。
+  Future<Json> Function(String table, Json body)? _alterTableOverride;
+  /// 测试注入：固定外键列表，不调用 builderSchema。
+  List<QuickForeignKey>? _foreignKeysOverride;
 
   @override
   void initState() {
@@ -967,6 +1441,76 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
   @visibleForTesting
   String? get validationErrorForTest => _validationError();
 
+  // ---- 第 52 轮：外键预检 / 失败恢复的测试钩子 ----
+  // SQLite 不支持 ALTER 增删外键，UI 测试无法真的在关系画布上建外键；这些钩子
+  // 注入与真实 builderSchema 同形的数据，其余状态机与产品代码完全一致。
+
+  /// 注入「本次向导内创建的外键」，替代 builderSchema 的读取。
+  @visibleForTesting
+  void setForeignKeysForTest(List<QuickForeignKey> foreignKeys) {
+    _foreignKeysOverride = List<QuickForeignKey>.of(foreignKeys);
+    _foreignKeys = List<QuickForeignKey>.of(foreignKeys);
+    _precheckApprovedSignature = null;
+  }
+
+  /// 当前用于导入顺序/预检的外键列表。
+  @visibleForTesting
+  List<QuickForeignKey> get foreignKeysForTest =>
+      List<QuickForeignKey>.unmodifiable(_foreignKeys);
+
+  /// 注入每张表前 N 行源数据（不含表头），预检样本比对用它代替真实文件预览。
+  @visibleForTesting
+  void setPreviewRowsForTest(Map<String, List<List<Object?>>> rows) {
+    _previewRowsOverride = <String, List<List<Object?>>>{
+      for (final entry in rows.entries)
+        entry.key: <List<Object?>>[
+          for (final row in entry.value) List<Object?>.of(row),
+        ],
+    };
+  }
+
+  /// 注入一次外键导入失败（模拟数据库拒绝子表插入）。
+  @visibleForTesting
+  void setFkFailureForTest(String message, {String? table}) {
+    final failure = parseForeignKeyFailure(message, _foreignKeys);
+    _fkFailure = failure;
+    _error = message;
+    final target = (table ?? failure?.childTable ?? '').toLowerCase();
+    for (final form in _forms) {
+      if (target.isNotEmpty && form.plan.name.toLowerCase() == target) {
+        form.status = _RunStatus.failed;
+        form.error = message;
+      }
+    }
+    setState(() {});
+  }
+
+  /// 当前识别到的外键失败（测试断言解析结果用）。
+  @visibleForTesting
+  QuickFkFailure? get fkFailureForTest => _fkFailure;
+
+  /// 拦截 alterTable（删除外键）以便在 SQLite 测试里断言调用。
+  @visibleForTesting
+  void setAlterTableOverrideForTest(
+    Future<Json> Function(String table, Json body)? handler,
+  ) {
+    _alterTableOverride = handler;
+  }
+
+  /// 当前外键优先的导入顺序（表名）。
+  @visibleForTesting
+  List<String> get importOrderForTest => <String>[
+        for (final plan in importOrderFor(
+          <QuickTablePlan>[for (final form in _forms) form.plan],
+          _foreignKeys,
+        ))
+          plan.name,
+      ];
+
+  /// 当前失败面板识别到的外键路径（测试断言「子表.列 → 父表.列」用）。
+  @visibleForTesting
+  String? get fkFailurePathForTest => _fkFailure?.path;
+
   String get _driver => AppState.instance.driver;
 
   String get _fileName =>
@@ -998,10 +1542,11 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
   bool get _hasPendingWork =>
       _forms.any((form) => !form.imported && form.rowsInserted == 0);
 
-  /// 失败且可以安全重试的表（已经写入过部分行的表不在此列：重试会重复导入）。
+  /// 失败/被跳过且可以安全重试的表（写入了部分行的表不在此列：重试会重复导入）。
   bool get _hasRetryableFailure => _forms.any((form) =>
       !form.imported &&
-      form.status == _RunStatus.failed &&
+      (form.status == _RunStatus.failed ||
+          form.status == _RunStatus.skipped) &&
       form.rowsInserted == 0);
 
   /// 还没有主键的表（第 1 步卡片/全局提示用）。
@@ -1076,6 +1621,11 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       _jobStatus = null;
       _currentJobId = null;
       _importsDone = false;
+      _foreignKeys = <QuickForeignKey>[];
+      _foreignKeysOverride = null;
+      _precheckApprovedSignature = null;
+      _precheckNote = null;
+      _fkFailure = null;
       _disposeForms();
     });
     try {
@@ -1184,6 +1734,11 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
         _step = 1;
         _busy = false;
         _importsDone = false;
+        _foreignKeys = <QuickForeignKey>[];
+        _foreignKeysOverride = null;
+        _precheckApprovedSignature = null;
+        _precheckNote = null;
+        _fkFailure = null;
       });
     } catch (error) {
       if (!mounted) return;
@@ -1384,25 +1939,501 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
     });
   }
 
-  // ------------------------------------------------------------- step 4 run
+  // --------------------------------------------- 第 52 轮：外键数据预检
 
-  /// 第 3 步：只导入数据（表已经在第 1→2 步创建好），不再调用 createTable。
+  /// 读取「本次向导内创建的外键」：真实环境用 builderSchema，测试走注入。
+  Future<List<QuickForeignKey>> _loadForeignKeys() async {
+    final override = _foreignKeysOverride;
+    if (override != null) return List<QuickForeignKey>.of(override);
+    try {
+      final schema = await Api.instance.builderSchema(widget.database);
+      return foreignKeysInWizard(schema, _createdTables.toSet());
+    } catch (_) {
+      // 拿不到 schema 时不做预检（导入本身仍会被数据库校验）。
+      return <QuickForeignKey>[];
+    }
+  }
+
+  /// 为参与预检的表各取一次前 500 行预览（注入过样本的表不读文件）。
+  Future<Map<String, Json>> _loadSamplePreviews(
+    List<_TableForm> forms,
+  ) async {
+    final previews = <String, Json>{};
+    _previewFailureTables = <String>{};
+    final path = _path;
+    final inspect = _inspect;
+    if (path == null || inspect == null) return previews;
+    for (final form in forms) {
+      if (_previewRowsOverride.containsKey(form.plan.name)) continue;
+      try {
+        previews[form.plan.name] =
+            await Api.instance.importPreview(path, <String, dynamic>{
+          'read': readParamsFor(
+            asJsonMap(inspect['read']),
+            sheet: form.plan.sheet,
+            skipRows: form.plan.skipRows,
+          ),
+          'fields': fieldParamsFor(
+            asJsonMap(inspect['fields']),
+            header: form.header,
+          ),
+          'limit': 500,
+        });
+      } catch (_) {
+        // 单张表预览失败：该表样本为空，比对会按高风险/无数据处理。
+        _previewFailureTables.add(form.plan.name);
+      }
+    }
+    return previews;
+  }
+
+  List<Object?> _sampleValuesFor(
+    _TableForm form,
+    QuickColumn column,
+    Map<String, Json> previews,
+  ) {
+    if (column.generated || column.sourceIndex < 0) {
+      return const <Object?>[];
+    }
+    final injected = _previewRowsOverride[form.plan.name];
+    if (injected != null) {
+      return <Object?>[
+        for (final row in injected)
+          if (column.sourceIndex < row.length) row[column.sourceIndex],
+      ];
+    }
+    final preview = previews[form.plan.name];
+    if (preview == null) return const <Object?>[];
+    return previewColumnSample(preview, column);
+  }
+
+  QuickColumn? _columnByName(QuickTablePlan plan, String name) {
+    for (final column in plan.columns) {
+      if (column.name.toLowerCase() == name.toLowerCase()) return column;
+    }
+    return null;
+  }
+
+  /// 对每条外键做样本比对；返回需要提示的问题（空 = 可以放心导入）。
+  Future<List<FkSampleIssue>> _foreignKeySampleIssues(
+    List<QuickForeignKey> foreignKeys,
+  ) async {
+    final byLower = <String, _TableForm>{
+      for (final form in _forms) form.plan.name.toLowerCase(): form,
+    };
+    final involved = <String, _TableForm>{};
+    for (final fk in foreignKeys) {
+      final child = byLower[fk.childTable.toLowerCase()];
+      final parent = byLower[fk.refTable.toLowerCase()];
+      if (child != null) involved[child.plan.name] = child;
+      if (parent != null) involved[parent.plan.name] = parent;
+    }
+    final previews = await _loadSamplePreviews(involved.values.toList());
+    final issues = <FkSampleIssue>[];
+    for (final fk in foreignKeys) {
+      final child = byLower[fk.childTable.toLowerCase()];
+      final parent = byLower[fk.refTable.toLowerCase()];
+      if (child == null || parent == null) continue;
+      final childColumn = _columnByName(child.plan, fk.childColumn);
+      final parentColumn = _columnByName(parent.plan, fk.refColumn);
+      if (childColumn == null) continue;
+      if (parentColumn == null) {
+        issues.add(FkSampleIssue(
+          foreignKey: fk,
+          mismatched: 0,
+          total: 0,
+          examples: const <String>[],
+          cannotCompare: true,
+        ));
+        continue;
+      }
+      final issue = compareForeignKeySamples(
+        foreignKey: fk,
+        parentValues: _sampleValuesFor(parent, parentColumn, previews),
+        childValues: _sampleValuesFor(child, childColumn, previews),
+        generatedParentColumn: parentColumn.generated,
+      );
+      if (issue != null) issues.add(issue);
+    }
+    return issues;
+  }
+
+  String _precheckSignature(List<QuickForeignKey> foreignKeys) =>
+      foreignKeys.map((fk) => fk.signature).join('|');
+
+  /// 进入/开始导入前的阻断式预检；返回 false 表示用户选择「返回建立关联修改」。
+  Future<bool> _precheckForeignKeys() async {
+    if (_createdTables.isEmpty) return true;
+    _syncForms();
+    final foreignKeys = await _loadForeignKeys();
+    if (!mounted) return false;
+    _foreignKeys = foreignKeys;
+    if (foreignKeys.isEmpty) {
+      _precheckApprovedSignature = null;
+      return true;
+    }
+    final signature = _precheckSignature(foreignKeys);
+    // 同一组外键 + 同一份数据，用户已经确认过「仍然继续」，不要每次点按钮都弹。
+    if (_precheckApprovedSignature == signature) return true;
+    List<FkSampleIssue> issues;
+    try {
+      issues = await _foreignKeySampleIssues(foreignKeys);
+    } catch (_) {
+      if (!mounted) return false;
+      setState(() => _precheckNote = pickText(
+            '无法预检外键数据，导入时会直接写入数据库。',
+            'Could not pre-check foreign-key data; the import will write directly.',
+          ));
+      return true;
+    }
+    if (!mounted) return false;
+    if (_previewFailureTables.isNotEmpty) {
+      // 读取文件预览失败：不阻断导入，但明确告诉用户预检不完整。
+      _precheckNote = pickText(
+        '无法预检部分外键数据（读取文件预览失败），导入时会直接写入数据库。',
+        'Some foreign-key data could not be pre-checked (reading the file preview '
+            'failed); the import will write directly.',
+      );
+    }
+    if (issues.isEmpty) {
+      _precheckApprovedSignature = signature;
+      return true;
+    }
+    final choice = await _showForeignKeyPrecheckDialog(issues);
+    if (!mounted) return false;
+    if (choice == _PrecheckChoice.backToRelations) {
+      setState(() {
+        _step = 2;
+        _error = null;
+      });
+      return false;
+    }
+    _precheckApprovedSignature = signature;
+    return true;
+  }
+
+  Widget _precheckIssueCard(FkSampleIssue issue) {
+    final fk = issue.foreignKey;
+    final details = <String>[];
+    if (issue.generatedParentColumn) {
+      details.add(pickText(
+        '父表被引用列是本向导「添加自增 id 主键」自动生成的列：源文件里没有这些值，'
+            '子表数据几乎不可能匹配，导入会被外键拒绝。',
+        'The referenced parent column is auto-generated by this wizard: those values '
+            'do not exist in the source file, so the child rows cannot match and the '
+            'import will be rejected by the foreign key.',
+      ));
+    } else if (issue.cannotCompare) {
+      details.add(pickText(
+        '无法比较：父表或子表缺少这一列，或样本里没有可比较的值。',
+        'Cannot compare: the column is missing on one side, or the sample has no '
+            'comparable values.',
+      ));
+    } else {
+      details.add(pickText(
+        '前 500 行样本中有 ${issue.mismatched}/${issue.total} 个子表值在父表被引用列里不存在。',
+        'In the first 500 sample rows, ${issue.mismatched}/${issue.total} child '
+            'values do not exist in the referenced parent column.',
+      ));
+    }
+    if (issue.examples.isNotEmpty) {
+      details.add(pickText(
+        '示例值：${issue.examples.join('、')}',
+        'Examples: ${issue.examples.join(', ')}',
+      ));
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: AppColors.panel,
+        border: Border.all(
+          color: issue.isHighRisk ? AppColors.danger : AppColors.border,
+        ),
+        borderRadius: BorderRadius.circular(AppMetrics.radiusControl),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Text(fk.path,
+                  style: monoStyle(size: 12, weight: FontWeight.w600)),
+              if (issue.isHighRisk)
+                Pill(pickText('高风险', 'High risk'), tone: PillTone.danger),
+            ],
+          ),
+          const SizedBox(height: 4),
+          for (final text in details)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                text,
+                style: TextStyle(
+                  fontSize: 12,
+                  color:
+                      issue.isHighRisk ? AppColors.danger : AppColors.bodyText,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 外键数据预检确认框：列出问题与修复建议，两个明确出口。
+  Future<_PrecheckChoice> _showForeignKeyPrecheckDialog(
+    List<FkSampleIssue> issues,
+  ) async {
+    final result = await showDialog<_PrecheckChoice>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => Dialog(
+        alignment: Alignment.topCenter,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 48),
+        backgroundColor: AppColors.panel,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppMetrics.radiusModal),
+          side: BorderSide(color: AppColors.border),
+        ),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: 760,
+            maxHeight: MediaQuery.of(dialogContext).size.height * 0.82,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(
+                  children: [
+                    Icon(Icons.warning_amber_rounded,
+                        size: 20, color: AppColors.danger),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        pickText('外键数据可能不匹配，导入会失败',
+                            'Foreign-key data may not match; the import could fail'),
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.bodyText,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Divider(height: 1, color: AppColors.border),
+              Flexible(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        pickText(
+                          '导入前按每张表前 500 行样本做了比对，发现下面这些外键在源数据里匹配不上：',
+                          'The first 500 rows of each table were compared before '
+                              'importing; these foreign keys do not match the source data:',
+                        ),
+                        style: kSmallMuted,
+                      ),
+                      const SizedBox(height: 10),
+                      for (final issue in issues) _precheckIssueCard(issue),
+                      const SizedBox(height: 6),
+                      AlertBox(
+                        pickText(
+                          '常见原因：外键连到了父表自动生成的 id 列，而源数据里是学号/编号。'
+                              '建议返回「建立关联」改连有对应数据的列（该列需要先设为唯一或主键）；'
+                              '也可以先删除该外键导入数据，之后再从关系图补建。',
+                          'Common cause: the foreign key points at an auto-generated id '
+                              'column while the source data holds student/order numbers. '
+                              'Go back to "Connect tables" and point it at a column that '
+                              'actually has matching data (make it unique or a primary key '
+                              'first), or drop the foreign key for now and rebuild it later.',
+                        ),
+                        tone: AlertTone.warn,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              Divider(height: 1, color: AppColors.border),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Btn(
+                      pickText('返回建立关联修改', 'Back to relationships'),
+                      key: const ValueKey<String>('precheck-back'),
+                      onPressed: () => Navigator.of(dialogContext)
+                          .pop(_PrecheckChoice.backToRelations),
+                    ),
+                    const SizedBox(width: 8),
+                    Btn(
+                      pickText('仍然继续导入', 'Import anyway'),
+                      key: const ValueKey<String>('precheck-continue'),
+                      primary: true,
+                      onPressed: () => Navigator.of(dialogContext)
+                          .pop(_PrecheckChoice.continueImport),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    return result ?? _PrecheckChoice.backToRelations;
+  }
+
+  // --------------------------------------- 第 52 轮：外键失败后的恢复动作
+
+  /// 失败面板：「返回建立关联修改」——保留已建表与已导入数据，只切回第 2 步。
+  void _backToRelationsFromFailure() {
+    if (_executing) return;
+    setState(() {
+      _step = 2;
+      _fkFailure = null;
+      _error = null;
+      _precheckApprovedSignature = null;
+    });
+  }
+
+  /// 失败面板：「删除该外键并重试导入」。
+  ///
+  /// 删除后数据能导入，但约束暂时失效；之后可以从数据库页的关系图重建。
+  Future<void> _dropForeignKeyAndRetry() async {
+    final failure = _fkFailure;
+    if (failure == null || _executing) return;
+    final name = failure.droppableName;
+    final childTable = failure.foreignKey?.childTable ?? failure.childTable;
+    if (name.isEmpty || childTable.isEmpty) return;
+    final ok = await confirmDialog(
+      context,
+      message: pickText(
+        '删除外键 $name 后重试导入吗？删除后数据可以导入，但关系约束暂时失效，'
+            '之后可以在数据库页的「关系图」里重建。',
+        'Drop foreign key $name and retry the import? The data can then be '
+            'imported, but the constraint stays removed until you rebuild it from '
+            'the relationship designer.',
+      ),
+      confirmLabel: pickText('删除并重试', 'Drop and retry'),
+      danger: true,
+    );
+    if (!ok || !mounted) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final body = <String, dynamic>{
+        'drop_foreign_keys': <String>[name],
+      };
+      final override = _alterTableOverride;
+      if (override != null) {
+        await override(childTable, body);
+      } else {
+        await Api.instance.alterTable(widget.database, childTable, body);
+      }
+      if (!mounted) return;
+      // 外键已删除：从预检列表里移除（测试注入的 override 也要同步）。
+      _foreignKeys = <QuickForeignKey>[
+        for (final fk in _foreignKeys)
+          if (!(fk.childTable.toLowerCase() == childTable.toLowerCase() &&
+              fk.childColumn.toLowerCase() ==
+                  failure.childColumn.toLowerCase()))
+            fk,
+      ];
+      final overrideFks = _foreignKeysOverride;
+      if (overrideFks != null) {
+        _foreignKeysOverride = <QuickForeignKey>[
+          for (final fk in overrideFks)
+            if (!(fk.childTable.toLowerCase() == childTable.toLowerCase() &&
+                fk.childColumn.toLowerCase() ==
+                    failure.childColumn.toLowerCase()))
+              fk,
+        ];
+      }
+      _fkFailure = null;
+      _precheckApprovedSignature = null;
+      for (final form in _forms) {
+        if (!form.imported && form.rowsInserted == 0) {
+          form.status = _RunStatus.idle;
+          form.error = null;
+        }
+      }
+      setState(() => _busy = false);
+      await _runImport();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _fkFailure = failure;
+        _error = describeDbError(error);
+      });
+    }
+  }
+
   Future<void> _runImport() async {
     final path = _path;
     final inspect = _inspect;
     if (path == null || inspect == null) return;
+    if (!await _precheckForeignKeys()) return;
+    if (!mounted) return;
+    _syncForms();
     setState(() {
       _executing = true;
       _error = null;
+      _fkFailure = null;
     });
-    for (var index = 0; index < _forms.length; index++) {
-      final form = _forms[index];
+    final byLower = <String, _TableForm>{
+      for (final form in _forms) form.plan.name.toLowerCase(): form,
+    };
+    final orderedPlans = importOrderFor(
+      <QuickTablePlan>[for (final form in _forms) form.plan],
+      _foreignKeys,
+    );
+    String? firstFailure;
+    for (var orderIndex = 0; orderIndex < orderedPlans.length; orderIndex++) {
+      final plan = orderedPlans[orderIndex];
+      final form = byLower[plan.name.toLowerCase()];
+      if (form == null) continue;
       if (form.imported) continue;
       // 上次中断时已经写入过部分行：再导入会重复，留给用户手工检查。
       if (form.rowsInserted > 0) continue;
       if (!mounted) return;
+      // 父表失败/未导入时跳过子表，不要继续插入导致同样的外键错误。
+      String? blockedBy;
+      for (final fk in _foreignKeys) {
+        if (fk.childTable.toLowerCase() != plan.name.toLowerCase()) continue;
+        final parent = byLower[fk.refTable.toLowerCase()];
+        if (parent != null && !parent.imported) {
+          blockedBy = fk.refTable;
+          break;
+        }
+      }
+      if (blockedBy != null) {
+        form.status = _RunStatus.skipped;
+        form.error = pickText(
+          '父表 $blockedBy 未导入成功，已跳过',
+          'Parent table $blockedBy was not imported; skipped',
+        );
+        setState(() {});
+        continue;
+      }
       setState(() {
-        _currentFormIndex = index;
+        _currentFormIndex = _forms.indexOf(form);
         form.status = _RunStatus.importing;
         form.error = null;
       });
@@ -1427,22 +2458,31 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
         form.rowsInserted = (result['rows_inserted'] as num?)?.toInt() ?? 0;
         form.rowsFailed = (result['rows_failed'] as num?)?.toInt() ?? 0;
         if (result['ok'] != true) {
-          form.status = _RunStatus.failed;
-          form.error = (result['message'] ?? '').toString().isEmpty
+          final message = (result['message'] ?? '').toString().isEmpty
               ? pickText('导入结束但有问题', 'The import finished with errors')
               : result['message'].toString();
-          setState(() => _error = form.error);
-          break;
+          form.status = _RunStatus.failed;
+          form.error = message;
+          firstFailure ??= message;
+          final parsed = parseForeignKeyFailure(message, _foreignKeys);
+          if (parsed != null) _fkFailure = parsed;
+          setState(() => _error = firstFailure);
+          // 继续处理后面的表：依赖失败表的子表会被上面的父表检查跳过。
+          continue;
         }
         form.status = _RunStatus.done;
         form.imported = true;
       } catch (runError) {
         if (!mounted) return;
         _currentJobId = null;
+        final message = describeDbError(runError);
         form.status = _RunStatus.failed;
-        form.error = describeDbError(runError);
-        setState(() => _error = form.error);
-        break;
+        form.error = message;
+        firstFailure ??= message;
+        final parsed = parseForeignKeyFailure(message, _foreignKeys);
+        if (parsed != null) _fkFailure = parsed;
+        setState(() => _error = firstFailure);
+        continue;
       }
       setState(() {});
     }
@@ -1489,6 +2529,12 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       _busy = false;
       _importsDone = false;
       _step = 1;
+      // 表都被删掉重建了，本次关系步骤创建的外键也随之消失。
+      _foreignKeys = <QuickForeignKey>[];
+      _foreignKeysOverride = null;
+      _precheckApprovedSignature = null;
+      _precheckNote = null;
+      _fkFailure = null;
       if (droppedFailures.isNotEmpty) {
         _error = pickText(
           '返回时未能删除这些已建表（可以改表名后重试）：${droppedFailures.join('；')}',
@@ -1528,8 +2574,12 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
   }
 
   Future<void> _retry() async {
+    _fkFailure = null;
+    _precheckApprovedSignature = null;
     for (final form in _forms) {
-      if (!form.imported && form.status == _RunStatus.failed) {
+      if (!form.imported &&
+          (form.status == _RunStatus.failed ||
+              form.status == _RunStatus.skipped)) {
         form.status = _RunStatus.idle;
         form.error = null;
       }
@@ -2202,6 +3252,8 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
     final rows = (progress['rows'] as num?)?.toInt() ?? 0;
     final failedTotal =
         _forms.where((form) => form.status == _RunStatus.failed).length;
+    final skippedTotal =
+        _forms.where((form) => form.status == _RunStatus.skipped).length;
     final currentName =
         _currentFormIndex >= 0 && _currentFormIndex < _forms.length
             ? _forms[_currentFormIndex].plan.name
@@ -2211,8 +3263,12 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       children: [
         Text(
           pickText(
-            '表已经在前面创建好；这一步只按列映射把数据逐表导入。失败会停下，已建表会保留，可以重试。',
-            'The tables were created earlier; this step only imports each table with its column mapping. On failure the run stops, created tables are kept and you can retry.',
+            '表已经在前面创建好；这一步按列映射逐表导入，会先导入被引用的父表。失败的表会保留，'
+                '依赖它的子表会自动跳过；可以重试或先在关系步骤处理外键。',
+            'The tables were created earlier; this step imports them with their column '
+                'mappings, parent tables first. Failed tables are kept and their child '
+                'tables are skipped automatically; you can retry or fix the relationship '
+                'first.',
           ),
           style: kSmallMuted,
         ),
@@ -2264,12 +3320,36 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
             ),
             style: kSmallMuted,
           ),
-        ] else if (failedTotal > 0) ...[
+        ],
+        if (_precheckNote != null && !_executing) ...[
+          const SizedBox(height: 6),
+          AlertBox(_precheckNote!, tone: AlertTone.warn),
+        ],
+        if (_fkFailure != null && !_executing) ...[
+          const SizedBox(height: 10),
+          _fkFailureCard(_fkFailure!),
+        ],
+        if (!_executing && (failedTotal > 0 || skippedTotal > 0)) ...[
           const SizedBox(height: 6),
           AlertBox(
             pickText(
-              '有 $failedTotal 张表导入失败；已建表会保留（不会自动删除），修正后可以重试。',
-              '$failedTotal table(s) failed to import; the created tables are kept (not dropped). Retry after fixing the problem.',
+              '有 ' +
+                  failedTotal.toString() +
+                  ' 张表导入失败' +
+                  (skippedTotal > 0
+                      ? '（另有 ' +
+                          skippedTotal.toString() +
+                          ' 张因父表失败被跳过）'
+                      : '') +
+                  '；已建表会保留（不会自动删除），修正后可以重试。',
+              failedTotal.toString() +
+                  ' table(s) failed to import' +
+                  (skippedTotal > 0
+                      ? ' and ' +
+                          skippedTotal.toString() +
+                          ' were skipped'
+                      : '') +
+                  '; the created tables are kept (not dropped). Retry after fixing the problem.',
             ),
             tone: AlertTone.warn,
           ),
@@ -2329,6 +3409,80 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
               child: Text(form.error!,
                   style: TextStyle(fontSize: 12, color: AppColors.danger)),
             ),
+        ],
+      ),
+    );
+  }
+
+  /// 外键失败面板：解释原因 + 两个恢复动作。
+  Widget _fkFailureCard(QuickFkFailure failure) {
+    final path = failure.path;
+    final name = failure.droppableName;
+    return CardBox(
+      title: pickText('外键约束导致导入失败', 'Import rejected by a foreign key'),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          AlertBox(
+            pickText(
+              '数据库拒绝了子表的写入：子表数据里有父表不存在的值。',
+              'The database rejected the child rows: some values do not exist in '
+                  'the referenced parent table.',
+            ),
+            tone: AlertTone.error,
+          ),
+          if (path.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              pickText('关系：', 'Relationship: ') + path,
+              style: monoStyle(size: 12, weight: FontWeight.w600),
+            ),
+          ],
+          if (name.isNotEmpty) ...[
+            const SizedBox(height: 2),
+            Text(
+              pickText('约束：', 'Constraint: ') + name,
+              style: kSmallMuted,
+            ),
+          ],
+          const SizedBox(height: 6),
+          Text(
+            pickText(
+              '可以先返回「建立关联」修改外键（已建表和已导入的数据都会保留）；'
+                  '也可以临时删除这个外键后重试导入，之后再从数据库页的关系图补建。',
+              'Go back to "Connect tables" to fix the foreign key (created tables and '
+                  'already imported data are kept), or drop this foreign key and retry '
+                  'the import, then rebuild it later from the relationship designer.',
+            ),
+            style: kSmallMuted,
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              Btn(
+                pickText('返回建立关联修改', 'Back to relationships'),
+                key: const ValueKey<String>('fk-back-relations'),
+                onPressed:
+                    _executing ? null : _backToRelationsFromFailure,
+              ),
+              Btn(
+                pickText('删除该外键并重试导入', 'Drop the foreign key and retry'),
+                key: const ValueKey<String>('fk-drop-and-retry'),
+                danger: true,
+                tooltip: name.isEmpty
+                    ? pickText(
+                        '无法从错误信息里解析约束名，不能自动删除',
+                        'The constraint name could not be parsed from the error',
+                      )
+                    : null,
+                onPressed: _executing || name.isEmpty
+                    ? null
+                    : _dropForeignKeyAndRetry,
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -2402,7 +3556,10 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
       _ => true,
     };
     final failed = _forms
-        .where((form) => !form.imported && form.status == _RunStatus.failed)
+        .where((form) =>
+            !form.imported &&
+            (form.status == _RunStatus.failed ||
+                form.status == _RunStatus.skipped))
         .length;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -2476,6 +3633,9 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
         // 先建空表；失败留在本步骤并显示错误。
         await _createTablesAndContinue();
       case 2:
+        // 进入导入前先做外键数据预检；用户选「返回建立关联修改」时留在第 2 步。
+        if (!await _precheckForeignKeys()) return;
+        if (!mounted) return;
         setState(() {
           _step = 3;
           _importsDone = false;
@@ -2518,8 +3678,10 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
               'Everything is done. Press Done to return to the database page.',
             )
           : pickText(
-              '只导入数据，表已经在前面创建；失败会停下并保留已建表。',
-              'Only data is imported here; the tables already exist. On failure the run stops and keeps what was created.',
+              '按父表优先顺序导入；失败的表保留、子表自动跳过，可在失败面板返回关系步骤或删外键重试。',
+              'Tables are imported parent-first; failed tables are kept and child '
+                  'tables are skipped. Use the failure panel to go back to the '
+                  'relationship step or drop the foreign key and retry.',
             ),
     };
   }

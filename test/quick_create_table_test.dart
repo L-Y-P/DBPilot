@@ -633,6 +633,250 @@ void main() {
     });
   });
 
+  group('外键预检与导入顺序', () {
+    QuickTablePlan planNamed(String name) => QuickTablePlan(
+          name: name,
+          sheet: '',
+          header: true,
+          columns: <QuickColumn>[
+            QuickColumn(
+              name: 'id',
+              sourceLabel: 'id',
+              sourceIndex: 0,
+              inferred: 'integer',
+              sqlType: 'INTEGER',
+            ),
+          ],
+        );
+
+    QuickForeignKey fkOf(
+      String child,
+      String column,
+      String parent,
+      String refColumn, {
+      String name = '',
+    }) =>
+        QuickForeignKey(
+          name: name,
+          childTable: child,
+          columns: <String>[column],
+          refTable: parent,
+          refColumns: <String>[refColumn],
+        );
+
+    test('父表先于子表；无关表沿用原顺序；环不死循环', () {
+      final chain = importOrderFor(
+        <QuickTablePlan>[
+          planNamed('child'),
+          planNamed('parent'),
+          planNamed('grand'),
+        ],
+        <QuickForeignKey>[
+          fkOf('child', 'pid', 'parent', 'id'),
+          fkOf('parent', 'gid', 'grand', 'id'),
+        ],
+      );
+      final names = chain.map((plan) => plan.name).toList();
+      expect(names.length, 3);
+      expect(names.indexOf('grand'), lessThan(names.indexOf('parent')));
+      expect(names.indexOf('parent'), lessThan(names.indexOf('child')));
+
+      // 无关表不会被拓扑排序挤掉。
+      final mixed = importOrderFor(
+        <QuickTablePlan>[
+          planNamed('a'),
+          planNamed('other'),
+          planNamed('b'),
+        ],
+        <QuickForeignKey>[fkOf('a', 'bid', 'b', 'id')],
+      );
+      expect(mixed.map((plan) => plan.name).toList().length, 3);
+      expect(mixed.map((plan) => plan.name).toList(),
+          containsAll(<String>['a', 'b', 'other']));
+
+      // 环：两张表互相引用，仍然全部返回（按原顺序补全）。
+      final cycle = importOrderFor(
+        <QuickTablePlan>[planNamed('x'), planNamed('y'), planNamed('z')],
+        <QuickForeignKey>[
+          fkOf('x', 'yid', 'y', 'id'),
+          fkOf('y', 'xid', 'x', 'id'),
+        ],
+      );
+      expect(cycle.map((plan) => plan.name).toList(),
+          containsAll(<String>['x', 'y', 'z']));
+      expect(cycle.length, 3);
+    });
+
+    test('样本比对：全部命中返回 null，NULL/空串跳过', () {
+      expect(
+        compareForeignKeySamples(
+          foreignKey: fkOf('child', 'pid', 'parent', 'id'),
+          parentValues: <Object?>[1, 2, '3'],
+          childValues: <Object?>[1, '2', null, '', 3],
+        ),
+        isNull,
+      );
+    });
+
+    test('样本比对：部分不匹配时统计数量并给示例值', () {
+      final issue = compareForeignKeySamples(
+        foreignKey: fkOf('child', 'pid', 'parent', 'id'),
+        parentValues: <Object?>['A', 'B'],
+        childValues: <Object?>['A', 'C', 'C', null, '', 'D'],
+      );
+      expect(issue, isNotNull);
+      expect(issue!.total, 4);
+      expect(issue.mismatched, 3);
+      expect(issue.examples, <String>['C', 'D']);
+      expect(issue.isHighRisk, isFalse);
+    });
+
+    test('数值宽松比较：数字/字符串/空白/前导零视为同一值', () {
+      expect(normalizeForeignKeyValue(1), normalizeForeignKeyValue(' 1 '));
+      expect(normalizeForeignKeyValue(1.0), normalizeForeignKeyValue('1.0'));
+      expect(normalizeForeignKeyValue(1), normalizeForeignKeyValue('001'));
+      expect(normalizeForeignKeyValue(null), isNull);
+      expect(normalizeForeignKeyValue('  '), isNull);
+      expect(
+        compareForeignKeySamples(
+          foreignKey: fkOf('child', 'pid', 'parent', 'id'),
+          parentValues: <Object?>['1', 2.0],
+          childValues: <Object?>[1, '2'],
+        ),
+        isNull,
+      );
+    });
+
+    test('父表被引用列是 generated 自增列：高风险，即使子表样本为空', () {
+      final issue = compareForeignKeySamples(
+        foreignKey: fkOf('child', 'pid', 'parent', 'id'),
+        parentValues: const <Object?>[],
+        childValues: const <Object?>[],
+        generatedParentColumn: true,
+      );
+      expect(issue, isNotNull);
+      expect(issue!.isHighRisk, isTrue);
+      expect(issue.generatedParentColumn, isTrue);
+      expect(issue.mismatched, 0);
+    });
+
+    test('foreignKeysInWizard 只保留两端都在本次向导表里的外键', () {
+      final schema = <String, dynamic>{
+        'tables': <dynamic>[
+          <String, dynamic>{
+            'name': 'A',
+            'columns': <dynamic>[],
+            'foreign_keys': <dynamic>[
+              <String, dynamic>{
+                'column': 'bid',
+                'ref_table': 'B',
+                'ref_column': 'id',
+              },
+            ],
+          },
+          <String, dynamic>{
+            'name': 'B',
+            'columns': <dynamic>[],
+            'foreign_keys': <dynamic>[],
+          },
+          <String, dynamic>{
+            'name': 'C',
+            'columns': <dynamic>[],
+            'foreign_keys': <dynamic>[
+              <String, dynamic>{
+                'column': 'xid',
+                'ref_table': 'outside',
+                'ref_column': 'id',
+              },
+            ],
+          },
+        ],
+      };
+      final fks = foreignKeysInWizard(
+          schema, <String>{'A', 'B', 'C'});
+      expect(fks.length, 1);
+      expect(fks.first.childTable, 'A');
+      expect(fks.first.childColumn, 'bid');
+      expect(fks.first.refTable, 'B');
+      expect(fks.first.refColumn, 'id');
+    });
+
+    test('解析 MySQL 外键失败：约束名/子表/列/父表/列对齐到注入外键', () {
+      const message = '批量插入失败: Cannot add or update a child row: '
+          'a foreign key constraint fails (web.students, CONSTRAINT '
+          'fk_students_grade FOREIGN KEY (学号) REFERENCES 学生名单 (id) '
+          'ON DELETE CASCADE) (错误码 23000)';
+      final injected = <QuickForeignKey>[
+        fkOf('students', '学号', '学生名单', 'id',
+            name: 'fk_students_grade'),
+      ];
+      final parsed = parseForeignKeyFailure(message, injected);
+      expect(parsed, isNotNull);
+      expect(parsed!.constraintName, 'fk_students_grade');
+      expect(parsed.childTable, 'students');
+      expect(parsed.childColumn, '学号');
+      expect(parsed.refTable, '学生名单');
+      expect(parsed.refColumn, 'id');
+      expect(parsed.foreignKey, isNotNull);
+      expect(parsed.path, 'students.学号 → 学生名单.id');
+      expect(parsed.droppableName, 'fk_students_grade');
+
+      // 用户截图里的真实 MySQL 报错（库名/表名/列名都带反引号）。
+      final quoted = parseForeignKeyFailure(
+        'Cannot add or update a child row: a foreign key constraint fails '
+        '(`web`.`年级成绩单`, CONSTRAINT `fk_tujmxvt_cg09d` '
+        'FOREIGN KEY (`学号`) REFERENCES `学生名单` (`id`) '
+        'ON DELETE CASCADE) (错误码 23000)',
+        <QuickForeignKey>[
+          fkOf('年级成绩单', '学号', '学生名单', 'id',
+              name: 'fk_tujmxvt_cg09d'),
+        ],
+      );
+      expect(quoted, isNotNull);
+      expect(quoted!.constraintName, 'fk_tujmxvt_cg09d');
+      expect(quoted.childTable, '年级成绩单');
+      expect(quoted.childColumn, '学号');
+      expect(quoted.refTable, '学生名单');
+      expect(quoted.refColumn, 'id');
+      expect(quoted.path, '年级成绩单.学号 → 学生名单.id');
+    });
+
+    test('解析 SQLite / PostgreSQL / 非外键错误', () {
+      final sqlite = parseForeignKeyFailure(
+        'FOREIGN KEY constraint failed (code 787)',
+        const <QuickForeignKey>[],
+      );
+      expect(sqlite, isNotNull);
+      expect(isForeignKeyError('FOREIGN KEY constraint failed (code 787)'),
+          isTrue);
+      expect(sqlite!.droppableName, '');
+
+      const pg = 'insert or update on table "grade" violates foreign key '
+          'constraint "fk_grade_student"\n'
+          'DETAIL: Key (student_id)=(9) is not present in table "students".';
+      final parsedPg = parseForeignKeyFailure(
+        pg,
+        <QuickForeignKey>[
+          fkOf('grade', 'student_id', 'students', 'id',
+              name: 'fk_grade_student'),
+        ],
+      );
+      expect(parsedPg, isNotNull);
+      expect(parsedPg!.constraintName, 'fk_grade_student');
+      expect(parsedPg.path, 'grade.student_id → students.id');
+
+      expect(
+        parseForeignKeyFailure(
+          'duplicate key value violates unique constraint',
+          const <QuickForeignKey>[],
+        ),
+        isNull,
+      );
+      expect(isForeignKeyError('duplicate key value violates unique constraint'),
+          isFalse);
+    });
+  });
+
   group('英文模式文案', () {
     test('向导与入口文案都有英文映射', () {
       I18n.setLang(AppLang.en);
@@ -1576,6 +1820,370 @@ void main() {
     await settle(tester, rounds: 6);
     expect(notice.message, contains('未导入数据'));
     await tester.pump(const Duration(seconds: 4));
+  });
+
+  // =====================================================================
+  // 第 52 轮：外键数据预检 / 父表优先导入 / 外键失败恢复
+  // =====================================================================
+
+  /// 两张表、外键数据：父表 id = 1,2；子表 pid = 9,8（默认不匹配）。
+  Future<String> writeFkFixture(
+    WidgetTester tester, {
+    String name = 'fkpre.xls',
+    String parentName = 'ParSheet',
+    String childName = 'ChiSheet',
+    List<Object?> childValues = const <Object?>[9, 8],
+    List<Object?> parentValues = const <Object?>[1, 2],
+  }) async {
+    final fixture = _spreadsheetMl(<String, List<List<Object?>>>{
+      parentName: <List<Object?>>[
+        <Object?>['id', 'label'],
+        for (final value in parentValues) <Object?>[value, 'p'],
+      ],
+      childName: <List<Object?>>[
+        <Object?>['pid', 'note'],
+        for (final value in childValues) <Object?>[value, 'c'],
+      ],
+    });
+    return (await tester.runAsync(() => writeFile(name, fixture)))!;
+  }
+
+  QuickForeignKey fkParChi({
+    String name = 'fk_chi_par',
+    String parentTable = 'ParSheet',
+    String childTable = 'ChiSheet',
+  }) =>
+      QuickForeignKey(
+        name: name,
+        childTable: childTable,
+        columns: <String>['pid'],
+        refTable: parentTable,
+        refColumns: <String>['id'],
+      );
+
+  testWidgets('外键预检不匹配：返回建立关联，已建表保留', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final path = await writeFkFixture(tester);
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, path, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    final state = stateKey.currentState!;
+    state.setForeignKeysForTest(<QuickForeignKey>[fkParChi()]);
+
+    // 先建空表 → 关系步骤。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(state.stepForTest, 2);
+
+    // 下一步：导入数据 → 外键样本比对发现 2/2 不匹配，弹确认框。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    expect(find.textContaining('外键数据可能不匹配'), findsOneWidget);
+    expect(find.textContaining('ChiSheet.pid → ParSheet.id'), findsWidgets);
+    expect(find.textContaining('2/2'), findsOneWidget);
+    expect(find.textContaining('示例值'), findsOneWidget);
+
+    // 返回建立关联：仍在第 2 步，已建表保留，未导入任何数据。
+    await tester.tap(find.byKey(const ValueKey<String>('precheck-back')));
+    await settle(tester, rounds: 12);
+    expect(state.stepForTest, 2);
+    expect(find.textContaining('外键数据可能不匹配'), findsNothing);
+    expect(await tableNames(tester),
+        containsAll(<String>['ParSheet', 'ChiSheet']));
+    expect(await countRows(tester, 'ChiSheet'), 0);
+  });
+
+  testWidgets('外键预检：仍然继续导入 → 进入第 3 步且不重复弹框', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final path = await writeFkFixture(
+      tester,
+      name: 'fkcontinue.xls',
+      parentName: 'ParB',
+      childName: 'ChiB',
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, path, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    final state = stateKey.currentState!;
+    state.setForeignKeysForTest(<QuickForeignKey>[
+      fkParChi(name: 'fk_chi_b', parentTable: 'ParB', childTable: 'ChiB'),
+    ]);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(state.stepForTest, 2);
+
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    expect(find.textContaining('外键数据可能不匹配'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey<String>('precheck-continue')));
+    await settle(tester, rounds: 12);
+    expect(state.stepForTest, 3);
+    expect(find.textContaining('外键数据可能不匹配'), findsNothing);
+
+    // 「开始导入」前会再次预检，但同一组外键 + 数据已确认过 → 不再弹框。
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 8);
+    expect(find.textContaining('外键数据可能不匹配'), findsNothing);
+    final failure = await runUntilImported(tester);
+    expect(failure, isNull, reason: 'continue import failed: $failure');
+    expect(state.importsDoneForTest, isTrue);
+    expect(await countRows(tester, 'ParB'), 2);
+    expect(await countRows(tester, 'ChiB'), 2);
+  });
+
+  testWidgets('外键预检：父表引用 generated 自增列 → 高风险提示', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final fixture = _spreadsheetMl(<String, List<List<Object?>>>{
+      'GenPar': <List<Object?>>[
+        <Object?>['name'],
+        <Object?>['Ada'],
+        <Object?>['Ada'],
+      ],
+      'GenChi': <List<Object?>>[
+        <Object?>['rid'],
+        <Object?>[1],
+        <Object?>[2],
+      ],
+    });
+    final path =
+        (await tester.runAsync(() => writeFile('fkgen.xls', fixture)))!;
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, path, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 30);
+
+    // 父表没有主键：补一个自增 id，子表外键指向它 → 源文件无法核对。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    final state = stateKey.currentState!;
+    expect(state.plansForTest.first.columns.first.generated, isTrue);
+    state.setForeignKeysForTest(<QuickForeignKey>[
+      QuickForeignKey(
+        name: 'fk_gen_chi',
+        childTable: 'GenChi',
+        columns: <String>['rid'],
+        refTable: 'GenPar',
+        refColumns: <String>['id'],
+      ),
+    ]);
+
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(state.stepForTest, 2);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    expect(find.textContaining('外键数据可能不匹配'), findsOneWidget);
+    expect(find.textContaining('高风险'), findsWidgets);
+    expect(find.textContaining('自动生成'), findsWidgets);
+    await tester.tap(find.byKey(const ValueKey<String>('precheck-back')));
+    await settle(tester, rounds: 10);
+    expect(state.stepForTest, 2);
+  });
+
+  /// 走到第 3 步（两张表、外键样本匹配，无预检弹框）。
+  Future<GlobalKey<QuickCreateTableWizardState>> reachImportStep(
+    WidgetTester tester,
+    String path,
+    Notice notice, {
+    String fkName = 'fk_chi_par',
+    String parentTable = 'ParSheet',
+    String childTable = 'ChiSheet',
+    String childColumn = 'pid',
+    String refColumn = 'id',
+  }) async {
+    final stateKey = await pumpWizardWithKey(tester, path, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    final state = stateKey.currentState!;
+    state.setForeignKeysForTest(<QuickForeignKey>[
+      QuickForeignKey(
+        name: fkName,
+        childTable: childTable,
+        columns: <String>[childColumn],
+        refTable: parentTable,
+        refColumns: <String>[refColumn],
+      ),
+    ]);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 40);
+    expect(state.stepForTest, 2);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+    expect(state.stepForTest, 3);
+    return stateKey;
+  }
+
+  testWidgets('外键失败面板：解析约束名并可返回建立关联（保留已建表）',
+      (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final path = await writeFkFixture(
+      tester,
+      name: 'fkfail.xls',
+      parentName: 'ParD',
+      childName: 'ChiD',
+      childValues: const <Object?>[1, 2],
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await reachImportStep(
+      tester,
+      path,
+      notice,
+      fkName: 'fk_d',
+      parentTable: 'ParD',
+      childTable: 'ChiD',
+    );
+    final state = stateKey.currentState!;
+
+    state.setFkFailureForTest(
+      '批量插入失败: Cannot add or update a child row: a foreign key constraint '
+      'fails (web.ChiD, CONSTRAINT fk_d FOREIGN KEY (pid) '
+      'REFERENCES ParD (id) ON DELETE CASCADE) (错误码 23000)',
+      table: 'ChiD',
+    );
+    await settle(tester, rounds: 4);
+    expect(find.textContaining('外键约束导致导入失败'), findsOneWidget);
+    expect(find.textContaining('ChiD.pid → ParD.id'), findsWidgets);
+    expect(find.byKey(const ValueKey<String>('fk-back-relations')),
+        findsOneWidget);
+    expect(find.byKey(const ValueKey<String>('fk-drop-and-retry')),
+        findsOneWidget);
+    expect(state.fkFailureForTest?.constraintName, 'fk_d');
+    expect(state.fkFailurePathForTest, 'ChiD.pid → ParD.id');
+
+    await tester.tap(find.byKey(const ValueKey<String>('fk-back-relations')));
+    await settle(tester, rounds: 10);
+    expect(state.stepForTest, 2);
+    expect(state.fkFailureForTest, isNull);
+    expect(await tableNames(tester), containsAll(<String>['ParD', 'ChiD']));
+    expect(find.byType(RelationDesigner), findsOneWidget);
+  });
+
+  testWidgets('外键失败面板：删除该外键并重试导入', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final path = await writeFkFixture(
+      tester,
+      name: 'fkdrop.xls',
+      parentName: 'ParE',
+      childName: 'ChiE',
+      childValues: const <Object?>[1, 2],
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await reachImportStep(
+      tester,
+      path,
+      notice,
+      fkName: 'fk_e',
+      parentTable: 'ParE',
+      childTable: 'ChiE',
+    );
+    final state = stateKey.currentState!;
+
+    state.setFkFailureForTest(
+      'a foreign key constraint fails (web.ChiE, CONSTRAINT fk_e '
+      'FOREIGN KEY (pid) REFERENCES ParE (id)) (错误码 23000)',
+      table: 'ChiE',
+    );
+    await settle(tester, rounds: 4);
+
+    String? capturedTable;
+    Json? capturedBody;
+    state.setAlterTableOverrideForTest((table, body) async {
+      capturedTable = table;
+      capturedBody = body;
+      return <String, dynamic>{'ok': true};
+    });
+    await tester.tap(find.byKey(const ValueKey<String>('fk-drop-and-retry')));
+    await settle(tester, rounds: 6);
+    expect(find.textContaining('删除外键'), findsOneWidget);
+    await tester.tap(find.text('删除并重试'));
+    await settle(tester, rounds: 8);
+
+    expect(capturedTable, 'ChiE');
+    expect((capturedBody!['drop_foreign_keys'] as List).first, 'fk_e');
+    final failure = await runUntilImported(tester);
+    expect(failure, isNull, reason: 'retry after drop failed: $failure');
+    expect(state.importsDoneForTest, isTrue);
+    expect(await countRows(tester, 'ParE'), 2);
+    expect(await countRows(tester, 'ChiE'), 2);
+  });
+
+  testWidgets('父表导入失败：子表标记已跳过，不再继续插入', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final path = await writeFkFixture(
+      tester,
+      name: 'fkskip.xls',
+      parentName: 'ParF',
+      childName: 'ChiF',
+      childValues: const <Object?>[1, 2],
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await reachImportStep(
+      tester,
+      path,
+      notice,
+      fkName: 'fk_f',
+      parentTable: 'ParF',
+      childTable: 'ChiF',
+    );
+    final state = stateKey.currentState!;
+
+    // 父表优先：ParF 在 ChiF 之前。
+    expect(state.importOrderForTest, <String>['ParF', 'ChiF']);
+
+    // 外部把父表删掉，模拟父表导入失败。
+    await tester.runAsync(() => Api.instance.dropTable('main', 'ParF'));
+    await tester.tap(primaryButton());
+
+    for (var i = 0; i < 160; i++) {
+      await settle(tester, rounds: 1);
+      if (find
+          .textContaining('父表 ParF 未导入成功，已跳过')
+          .evaluate()
+          .isNotEmpty) {
+        break;
+      }
+    }
+    expect(find.textContaining('父表 ParF 未导入成功，已跳过'), findsOneWidget);
+    expect(find.text('已跳过'), findsWidgets);
+    expect(state.importsDoneForTest, isFalse);
+    expect(await countRows(tester, 'ChiF'), 0);
   });
 }
 

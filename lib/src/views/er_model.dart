@@ -2319,3 +2319,394 @@ String erBatchSuggestionConfirmMessage(int count) => pickText(
 /// 批量建立建议外键的执行进度（当前第几条 / 共几条）。
 String erSuggestionProgressText(int current, int total) =>
     pickText('正在建立 $current/$total 条…', 'Creating $current/$total…');
+
+// ------------------------------------------------ 外键数据诊断（第 61 轮）
+//
+// 用户报的线上问题：新建外键时 MySQL 只回一条原始 1452，普通用户看不懂。
+// 这里集中放「按驱动拼诊断 SQL → 解析孤儿行 → 生成可行动文案」的纯逻辑，
+// relation_designer 只负责执行查询与展示。
+
+/// 按驱动给标识符加引号（MySQL 反引号，PostgreSQL/SQLite 双引号）。
+///
+/// 只用于设计器自己生成的诊断 SQL；用户标识符里的引号会被正确转义。
+String quoteIdentForDriver(ErDriver driver, String name) {
+  switch (driver) {
+    case ErDriver.mysql:
+      return '`${name.replaceAll('`', '``')}`';
+    case ErDriver.postgres:
+    case ErDriver.sqlite:
+      return '"${name.replaceAll('"', '""')}"';
+  }
+}
+
+/// 孤儿行 COUNT：子表值非空、但在引用表被引用列里找不到对应行。
+String fkOrphanCountSql({
+  required ErDriver driver,
+  required String childTable,
+  required String childColumn,
+  required String refTable,
+  required String refColumn,
+}) {
+  final child = quoteIdentForDriver(driver, childTable);
+  final ref = quoteIdentForDriver(driver, refTable);
+  final local = quoteIdentForDriver(driver, childColumn);
+  final remote = quoteIdentForDriver(driver, refColumn);
+  return 'SELECT COUNT(*) FROM $child c LEFT JOIN $ref p '
+      'ON c.$local = p.$remote '
+      'WHERE c.$local IS NOT NULL AND p.$remote IS NULL';
+}
+
+/// 子表样本 SQL（最多 5 行非空值），用于让用户一眼看出 20260101 与 1 不同。
+String fkOrphanChildSampleSql({
+  required ErDriver driver,
+  required String childTable,
+  required String childColumn,
+}) {
+  final child = quoteIdentForDriver(driver, childTable);
+  final local = quoteIdentForDriver(driver, childColumn);
+  return 'SELECT c.$local FROM $child c WHERE c.$local IS NOT NULL LIMIT 5';
+}
+
+/// 引用表样本 SQL（最多 5 行），展示被引用列里实际存在的值。
+String fkOrphanParentSampleSql({
+  required ErDriver driver,
+  required String refTable,
+  required String refColumn,
+}) {
+  final ref = quoteIdentForDriver(driver, refTable);
+  final remote = quoteIdentForDriver(driver, refColumn);
+  return 'SELECT p.$remote FROM $ref p LIMIT 5';
+}
+
+/// 引用表「同名列」与子列的匹配数（如 学生名单.学号 vs 年级成绩单.学号）。
+String fkSameNameMatchCountSql({
+  required ErDriver driver,
+  required String childTable,
+  required String childColumn,
+  required String refTable,
+  required String sameNameColumn,
+}) {
+  final child = quoteIdentForDriver(driver, childTable);
+  final ref = quoteIdentForDriver(driver, refTable);
+  final local = quoteIdentForDriver(driver, childColumn);
+  final same = quoteIdentForDriver(driver, sameNameColumn);
+  return 'SELECT COUNT(*) FROM $child c JOIN $ref p '
+      'ON c.$local = p.$same WHERE c.$local IS NOT NULL';
+}
+
+/// 子表非空行数（用来对比同名列的匹配比例）。
+String fkChildNonEmptyCountSql({
+  required ErDriver driver,
+  required String childTable,
+  required String childColumn,
+}) {
+  final child = quoteIdentForDriver(driver, childTable);
+  final local = quoteIdentForDriver(driver, childColumn);
+  return 'SELECT COUNT(*) FROM $child c WHERE c.$local IS NOT NULL';
+}
+
+/// 孤儿行预检报告（第 61 轮）。
+///
+/// [sameNameColumn] / [sameNameMatchCount] / [childNonEmptyCount] 是用户真实
+/// 场景的关键：子列「学号」与引用表同名列「学号」数据完全匹配，但引用表被选中
+/// 的列是 id（全孤儿），而且「学号」列没有唯一索引，所以 MySQL 仍不能直接引用。
+class FkOrphanReport {
+  const FkOrphanReport({
+    required this.count,
+    this.childSamples = const <String>[],
+    this.parentSamples = const <String>[],
+    this.sameNameColumn,
+    this.sameNameMatchCount,
+    this.childNonEmptyCount,
+  });
+
+  /// 孤儿行数（子列非空、在引用列里找不到对应行）。
+  final int count;
+
+  /// 子表列的前几个示例值。
+  final List<String> childSamples;
+
+  /// 引用列的前几个示例值。
+  final List<String> parentSamples;
+
+  /// 引用表里与子列同名、且不是当前引用列的列（可能才是正确的关系列）。
+  final String? sameNameColumn;
+
+  /// 同名列与子列的匹配行数；null 表示没有查询/查询失败。
+  final int? sameNameMatchCount;
+
+  /// 子列非空行数；null 表示没有查询/查询失败。
+  final int? childNonEmptyCount;
+
+  bool get hasOrphans => count > 0;
+
+  /// 同名列的匹配比例（null = 无数据）。
+  double? get sameNameMatchRatio {
+    final total = childNonEmptyCount;
+    final matched = sameNameMatchCount;
+    if (total == null || total <= 0 || matched == null) return null;
+    return matched / total;
+  }
+
+  /// 同名列是否「基本完全匹配」（≥99%），用于给出「改引用它 + 建 UNIQUE」建议。
+  bool get sameNameMostlyMatches {
+    final ratio = sameNameMatchRatio;
+    return ratio != null && ratio >= 0.99;
+  }
+}
+
+/// 从 Api.query 的返回里取第一个语句的行（容忍 results/rows 与 List/Map 行）。
+List<List<Object?>> _fkQueryRows(Map<String, dynamic> payload) {
+  Object? rows;
+  final results = payload['results'];
+  if (results is List && results.isNotEmpty) {
+    final first = results.first;
+    if (first is Map) rows = first['rows'];
+  }
+  rows ??= payload['rows'];
+  if (rows is! List) return const <List<Object?>>[];
+  final out = <List<Object?>>[];
+  for (final row in rows) {
+    if (row is List) {
+      out.add(List<Object?>.from(row));
+    } else if (row is Map) {
+      out.add(row.values.toList());
+    }
+  }
+  return out;
+}
+
+int _fkCountOf(Map<String, dynamic> payload) {
+  final rows = _fkQueryRows(payload);
+  if (rows.isEmpty || rows.first.isEmpty) return 0;
+  final value = rows.first.first;
+  if (value is num) return value.toInt();
+  return int.tryParse(erStringOf(value).trim()) ?? 0;
+}
+
+List<String> _fkSampleValues(Map<String, dynamic> payload, {int limit = 5}) {
+  final out = <String>[];
+  for (final row in _fkQueryRows(payload)) {
+    if (row.isEmpty || row.first == null) continue;
+    final text = erStringOf(row.first).trim();
+    if (text.isEmpty) continue;
+    out.add(text);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/// 解析孤儿预检的查询结果（count / 子表样本 / 引用表样本），可选同名列数据。
+///
+/// 行结构差异（results[].rows、顶层 rows、List 行或 Map 行）都容忍。
+FkOrphanReport parseFkOrphanReport(
+  Map<String, dynamic> countJson,
+  Map<String, dynamic> childSampleJson,
+  Map<String, dynamic> parentSampleJson, {
+  Map<String, dynamic>? sameNameCountJson,
+  Map<String, dynamic>? childNonEmptyCountJson,
+  String? sameNameColumn,
+}) {
+  return FkOrphanReport(
+    count: _fkCountOf(countJson),
+    childSamples: _fkSampleValues(childSampleJson),
+    parentSamples: _fkSampleValues(parentSampleJson),
+    sameNameColumn: sameNameColumn,
+    sameNameMatchCount:
+        sameNameCountJson == null ? null : _fkCountOf(sameNameCountJson),
+    childNonEmptyCount: childNonEmptyCountJson == null
+        ? null
+        : _fkCountOf(childNonEmptyCountJson),
+  );
+}
+
+String _fkSampleLine(String labelZh, String labelEn, List<String> values) {
+  if (values.isEmpty) return '';
+  final prefix = pickText('$labelZh：', '$labelEn: ');
+  final separator = pickText('、', ', ');
+  return '$prefix${values.join(separator)}';
+}
+
+/// 预检发现孤儿行时的可行动警告（中英双语，用户真实场景优化）。
+///
+/// 关键内容：孤儿行数、本表/引用表示例值（一眼看出 20260101 vs 1）、下一步
+/// 建议；若引用表有和子列同名的列且数据基本匹配，明确提示「可能应该引用
+/// 学生名单.学号」，并说明 MySQL 还需要给该列建 UNIQUE 索引。
+String fkOrphanWarningMessage(
+  FkOrphanReport report, {
+  required String localTable,
+  required String localColumn,
+  required String refTable,
+  required String refColumn,
+  String? sameNameColumnInRefTable,
+}) {
+  final sameName = sameNameColumnInRefTable ??
+      (report.sameNameColumn != null && report.sameNameColumn != refColumn
+          ? report.sameNameColumn
+          : null);
+  final lines = <String>[
+    pickText(
+      '引用数据不匹配：本表「$localTable」的「$localColumn」有 ${report.count} 行'
+          '在引用表「$refTable」的「$refColumn」里找不到对应记录，直接创建外键会失败。',
+      'Referenced data does not match: ${report.count} row(s) of '
+          '"$localTable.$localColumn" have no matching record in '
+          '"$refTable.$refColumn", so creating the foreign key will fail.',
+    ),
+  ];
+  final childLine = _fkSampleLine(
+    '本表这些值的示例',
+    'Sample values in this table',
+    report.childSamples,
+  );
+  if (childLine.isNotEmpty) lines.add(childLine);
+  final parentLine = _fkSampleLine(
+    '引用表的示例',
+    'Sample values in the referenced table',
+    report.parentSamples,
+  );
+  if (parentLine.isNotEmpty) lines.add(parentLine);
+  if (sameName != null) {
+    final matched = report.sameNameMatchCount;
+    final total = report.childNonEmptyCount;
+    final counts =
+        (matched != null && total != null && total > 0) ? '$matched/$total' : '';
+    final qualifiedName = '$refTable.$sameName';
+    if (report.sameNameMostlyMatches) {
+      lines.add(
+        pickText(
+          '注意：引用表「$refTable」里也有「$sameName」列，两表该列数据基本完全'
+              '匹配（$counts 行）；但它当前没有唯一索引，MySQL 不能直接引用。若'
+              '该列数据唯一，可以先给它建 UNIQUE 索引，再引用「$qualifiedName」。',
+          'Note: "$refTable" also has a "$sameName" column and the two columns '
+              'match almost perfectly ($counts rows). It currently has no UNIQUE '
+              'index, which MySQL requires for a referenced column. If its values '
+              'are unique, add a UNIQUE index to it and reference '
+              '"$qualifiedName" instead.',
+        ),
+      );
+    } else {
+      final countsClauseZh =
+          counts.isEmpty ? '' : '，两表该列有 $counts 行能匹配';
+      final countsClauseEn = counts.isEmpty ? '' : ' and $counts rows match';
+      lines.add(
+        pickText(
+          '注意：引用表「$refTable」里也有「$sameName」列$countsClauseZh；如果这'
+              '才是正确的关系列，请确认数据是否完整，并先给它建 UNIQUE 索引后再'
+              '引用「$qualifiedName」。',
+          'Note: "$refTable" also has a "$sameName" column$countsClauseEn. If that '
+              'is the right column to reference, check its data and add a UNIQUE '
+              'index before referencing "$qualifiedName".',
+        ),
+      );
+    }
+  }
+  lines.add(
+    pickText(
+      '建议：确认「引用字段」是否选对；补齐引用表数据；或先修正本表这些值。',
+      'Next step: check whether the referenced column is the right one, fill in '
+          'the missing referenced rows, or fix these values in this table.',
+    ),
+  );
+  return lines.join('\n');
+}
+
+String _fkCleanError(Object? error) {
+  final text = error?.toString().trim() ?? '';
+  const prefixes = <String>['Exception: ', 'ApiException: ', 'Bad state: '];
+  for (final prefix in prefixes) {
+    if (text.startsWith(prefix)) return text.substring(prefix.length).trim();
+  }
+  return text;
+}
+
+/// 把新建外键时的数据库错误翻译成可行动文案（第 61 轮）。
+///
+/// * 1452 / 23000 / 子表数据不匹配 → 孤儿数据说明（可带预检报告里的同名列提示）；
+/// * 1826 → 约束名重复；
+/// * 1215 → 无法添加外键（常见原因：类型/字符集不一致、引用列没有索引）；
+/// * 其它 → 保留原始错误（双语前缀 + 原文），不静默吞掉。
+String fkConstraintFailureMessage(
+  Object? error, {
+  String localTable = '',
+  String refTable = '',
+  String localColumn = '',
+  String refColumn = '',
+  FkOrphanReport? report,
+}) {
+  final raw = _fkCleanError(error);
+  final lower = raw.toLowerCase();
+  final sameName = report?.sameNameColumn;
+  final sameNameHint = (sameName != null && sameName != refColumn)
+      ? (report!.sameNameMostlyMatches
+          ? pickText(
+              '\n提示：引用表「$refTable」也有「$sameName」列，两表该列数据基本'
+                  '完全匹配，但它没有唯一索引；先给「$refTable.$sameName」建 UNIQUE '
+                  '索引后可改为引用它。',
+              '\nHint: "$refTable" also has a "$sameName" column whose values '
+                  'match almost perfectly, but it has no UNIQUE index. Add one to '
+                  '"$refTable.$sameName" and reference that column instead.',
+            )
+          : pickText(
+              '\n提示：引用表「$refTable」也有「$sameName」列，可能才是正确的关系'
+                  '列；需要该列有 UNIQUE 索引才能被引用。',
+              '\nHint: "$refTable" also has a "$sameName" column that may be the '
+                  'right one to reference; MySQL requires a UNIQUE index on it.',
+            ))
+      : '';
+  if (lower.contains('1826') ||
+      lower.contains('duplicate foreign key constraint name')) {
+    return pickText(
+      '无法创建外键：外键约束名重复。请换一个名字后重试。',
+      'Could not create the foreign key: the constraint name is already used. '
+          'Choose a different name and retry.',
+    );
+  }
+  if (lower.contains('1215') ||
+      lower.contains('cannot add foreign key constraint')) {
+    return pickText(
+      '无法创建外键：MySQL 拒绝添加该约束（1215）。常见原因是两列类型 / 字符集 / '
+          '排序规则不一致，或引用列没有索引 / 唯一约束；请检查两端字段定义。',
+      'Could not create the foreign key: MySQL refused the constraint (1215). '
+          'Common causes are mismatched column types/charset/collation, or the '
+          'referenced column has no index/unique constraint.',
+    );
+  }
+  if (lower.contains('1452') ||
+      lower.contains('23000') ||
+      lower.contains('cannot add or update a child row') ||
+      lower.contains('foreign key constraint fails')) {
+    final base = pickText(
+      '无法创建外键：本表「$localTable」的「$localColumn」有数据在引用表'
+          '「$refTable」的「$refColumn」里找不到对应记录（MySQL 1452 / 外键约束'
+          '失败）。请补齐引用表数据、修正本表的孤儿值，或改选正确的引用字段。',
+      'Could not create the foreign key: values of "$localTable.$localColumn" '
+          'have no matching record in "$refTable.$refColumn" (MySQL 1452 / foreign '
+          'key constraint failure). Fill in the missing referenced rows, fix the '
+          'orphan values, or reference the right column.',
+    );
+    return sameNameHint.isEmpty ? base : '$base$sameNameHint';
+  }
+  return pickText('创建外键失败：', 'Failed to create the foreign key: ') + raw;
+}
+
+/// 预检发现孤儿行、用户选择「取消」时抛出：让新建外键弹窗保持打开，并把
+/// 可读警告直接写进 _error（不加「创建外键失败：」前缀）。
+class FkPrecheckWarningException implements Exception {
+  const FkPrecheckWarningException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// ALTER 失败但已经翻译成可行动文案时抛出（原始的 [cause] 保留给调试/日志）。
+class FkCreationFailureException implements Exception {
+  const FkCreationFailureException(this.message, {this.cause});
+
+  final String message;
+  final Object? cause;
+
+  @override
+  String toString() => message;
+}

@@ -2193,6 +2193,296 @@ void main() {
       expect(erSuggestionProgressText(2, 5), 'Creating 2/5…');
     });
   });
+
+  // =====================================================================
+  // 第 61 轮：新建外键的数据诊断（用户真实场景：学号 20260101 vs id 1）
+  // =====================================================================
+
+  FkOrphanReport userScenarioReport() => const FkOrphanReport(
+        count: 30,
+        childSamples: <String>['20260101', '20260102', '20260103'],
+        parentSamples: <String>['1', '2', '3'],
+        sameNameColumn: '学号',
+        sameNameMatchCount: 30,
+        childNonEmptyCount: 30,
+      );
+
+  group('外键诊断 SQL（第 61 轮）', () {
+    test('按驱动引号：MySQL 反引号、PG/SQLite 双引号，且转义内部引号', () {
+      expect(quoteIdentForDriver(ErDriver.mysql, 'order'), '`order`');
+      expect(quoteIdentForDriver(ErDriver.postgres, 'order'), '"order"');
+      expect(quoteIdentForDriver(ErDriver.sqlite, 'order'), '"order"');
+      expect(quoteIdentForDriver(ErDriver.mysql, 'a`b'), '`a``b`');
+      expect(quoteIdentForDriver(ErDriver.postgres, 'a"b'), '"a""b"');
+    });
+
+    test('孤儿 COUNT：LEFT JOIN + 子列非空 + 引用列 IS NULL', () {
+      final sql = fkOrphanCountSql(
+        driver: ErDriver.mysql,
+        childTable: '年级成绩单',
+        childColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      );
+      expect(sql, contains('SELECT COUNT(*)'));
+      expect(sql, contains('`年级成绩单`'));
+      expect(sql, contains('`学生名单`'));
+      expect(sql, contains('ON c.`学号` = p.`id`'));
+      expect(sql, contains('c.`学号` IS NOT NULL'));
+      expect(sql, contains('p.`id` IS NULL'));
+    });
+
+    test('样本 SQL 各 LIMIT 5；同名列匹配 / 非空计数', () {
+      final child = fkOrphanChildSampleSql(
+        driver: ErDriver.postgres,
+        childTable: '年级成绩单',
+        childColumn: '学号',
+      );
+      expect(child, contains('"年级成绩单"'));
+      expect(child, contains('"学号" IS NOT NULL'));
+      expect(child, contains('LIMIT 5'));
+      final parent = fkOrphanParentSampleSql(
+        driver: ErDriver.sqlite,
+        refTable: '学生名单',
+        refColumn: 'id',
+      );
+      expect(parent, contains('"学生名单"'));
+      expect(parent, contains('LIMIT 5'));
+      final same = fkSameNameMatchCountSql(
+        driver: ErDriver.mysql,
+        childTable: '年级成绩单',
+        childColumn: '学号',
+        refTable: '学生名单',
+        sameNameColumn: '学号',
+      );
+      expect(same, contains('JOIN'));
+      expect(same, contains('c.`学号` = p.`学号`'));
+      expect(same, contains('c.`学号` IS NOT NULL'));
+      final nonEmpty = fkChildNonEmptyCountSql(
+        driver: ErDriver.mysql,
+        childTable: '年级成绩单',
+        childColumn: '学号',
+      );
+      expect(nonEmpty, contains('IS NOT NULL'));
+    });
+  });
+
+  group('parseFkOrphanReport：解析 Api.query 结果（第 61 轮）', () {
+    test('标准 results[].rows 形状 + 同名列数据', () {
+      final report = parseFkOrphanReport(
+        <String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{
+              'rows': <dynamic>[
+                <dynamic>[30],
+              ],
+            },
+          ],
+        },
+        <String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{
+              'rows': <dynamic>[
+                <dynamic>['20260101'],
+                <dynamic>['20260102'],
+              ],
+            },
+          ],
+        },
+        <String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{
+              'rows': <dynamic>[
+                <dynamic>[1],
+                <dynamic>[2],
+              ],
+            },
+          ],
+        },
+        sameNameCountJson: <String, dynamic>{
+          'rows': <dynamic>[
+            <dynamic>[30],
+          ],
+        },
+        childNonEmptyCountJson: <String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{
+              'rows': <dynamic>[
+                <dynamic>[30],
+              ],
+            },
+          ],
+        },
+        sameNameColumn: '学号',
+      );
+      expect(report.count, 30);
+      expect(report.childSamples, <String>['20260101', '20260102']);
+      expect(report.parentSamples, <String>['1', '2']);
+      expect(report.hasOrphans, isTrue);
+      expect(report.sameNameColumn, '学号');
+      expect(report.sameNameMatchCount, 30);
+      expect(report.childNonEmptyCount, 30);
+      expect(report.sameNameMostlyMatches, isTrue);
+    });
+
+    test('容忍顶层 rows / Map 行 / 缺失', () {
+      final report = parseFkOrphanReport(
+        <String, dynamic>{},
+        <String, dynamic>{
+          'rows': <dynamic>[
+            <String, dynamic>{'value': '20260101'},
+          ],
+        },
+        <String, dynamic>{
+          'results': <dynamic>[<String, dynamic>{}],
+        },
+      );
+      expect(report.count, 0);
+      expect(report.childSamples, <String>['20260101']);
+      expect(report.parentSamples, isEmpty);
+      expect(report.hasOrphans, isFalse);
+      expect(report.sameNameMatchRatio, isNull);
+    });
+  });
+
+  group('fkOrphanWarningMessage：用户真实场景文案（第 61 轮）', () {
+    test('中文：30 行孤儿 + 20260101 vs 1 + 学生名单.学号 + UNIQUE 索引', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkOrphanWarningMessage(
+        userScenarioReport(),
+        localTable: '年级成绩单',
+        localColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      );
+      expect(message, contains('30 行'));
+      expect(message, contains('20260101'));
+      expect(message, contains('学生名单.学号'));
+      expect(message, contains('UNIQUE 索引'));
+      expect(message, contains('找不到对应记录'));
+      expect(message, contains('建议'));
+    });
+
+    test('英文：同样给出示例、同名列与 UNIQUE index 建议', () {
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final message = fkOrphanWarningMessage(
+        userScenarioReport(),
+        localTable: '年级成绩单',
+        localColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      );
+      expect(message, contains('30 row(s)'));
+      expect(message, contains('20260101'));
+      expect(message, contains('学生名单.学号'));
+      expect(message, contains('UNIQUE index'));
+      expect(message, contains('no matching record'));
+    });
+
+    test('同名列只有部分匹配时给出比例提示', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkOrphanWarningMessage(
+        const FkOrphanReport(
+          count: 20,
+          childSamples: <String>['A'],
+          parentSamples: <String>['B'],
+          sameNameColumn: '学号',
+          sameNameMatchCount: 10,
+          childNonEmptyCount: 30,
+        ),
+        localTable: '年级成绩单',
+        localColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      );
+      expect(message, contains('10/30'));
+      expect(message, contains('UNIQUE 索引'));
+    });
+
+    test('没有同名列时只给孤儿数据建议', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkOrphanWarningMessage(
+        const FkOrphanReport(count: 5, childSamples: <String>['x']),
+        localTable: 'child',
+        localColumn: 'parent_id',
+        refTable: 'parent',
+        refColumn: 'id',
+      );
+      expect(message, contains('5 行'));
+      expect(message, isNot(contains('UNIQUE')));
+      expect(message, contains('建议'));
+    });
+  });
+
+  group('fkConstraintFailureMessage：错误映射（第 61 轮）', () {
+    const mysql1452 =
+        'Cannot add or update a child row: a foreign key constraint fails '
+        '(clerk_cn_test.#sql-1004_4e, CONSTRAINT fk_grade_student '
+        'FOREIGN KEY (学号) REFERENCES 学生名单 (id) ON DELETE CASCADE) '
+        '(错误码 23000)';
+
+    test('1452 / 23000 → 孤儿数据说明，带同名列 + UNIQUE 索引提示', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkConstraintFailureMessage(
+        StateError(mysql1452),
+        localTable: '年级成绩单',
+        refTable: '学生名单',
+        localColumn: '学号',
+        refColumn: 'id',
+        report: userScenarioReport(),
+      );
+      expect(message, contains('找不到对应记录'));
+      expect(message, contains('年级成绩单'));
+      expect(message, contains('学生名单.学号'));
+      expect(message, contains('UNIQUE 索引'));
+      expect(message, isNot(contains('Cannot add or update a child row')));
+    });
+
+    test('1452 英文 + 无预检报告时仍给可行动建议', () {
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final message = fkConstraintFailureMessage(
+        mysql1452,
+        localTable: '年级成绩单',
+        refTable: '学生名单',
+        localColumn: '学号',
+        refColumn: 'id',
+      );
+      expect(message, contains('no matching record'));
+      expect(message, contains('MySQL 1452'));
+      expect(message, isNot(contains('Cannot add or update a child row')));
+    });
+
+    test('1826 约束名重复 / 1215 无法添加外键', () {
+      I18n.setLang(AppLang.zh);
+      expect(
+        fkConstraintFailureMessage(
+          'ERROR 1826 (HY000): Duplicate foreign key constraint name fk_x',
+        ),
+        contains('约束名重复'),
+      );
+      expect(
+        fkConstraintFailureMessage('Cannot add foreign key constraint'),
+        contains('1215'),
+      );
+    });
+
+    test('其它错误保留原始文本', () {
+      I18n.setLang(AppLang.zh);
+      final message = fkConstraintFailureMessage('driver says boom');
+      expect(message, contains('创建外键失败'));
+      expect(message, contains('driver says boom'));
+    });
+  });
+
+  group('FkPrecheckWarningException', () {
+    test('toString 就是可读消息（弹窗直接显示）', () {
+      const exception = FkPrecheckWarningException('有 30 行孤儿');
+      expect(exception.toString(), '有 30 行孤儿');
+      expect(exception.message, '有 30 行孤儿');
+    });
+  });
 }
 
 /// 测试辅助：关系的人读标签（模型没有 label 方法，用两端拼）。

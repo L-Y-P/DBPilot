@@ -497,3 +497,14 @@ Future<void> showRelationDesigner(
 - restore allowlist 扩展：PG 新增 ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY（要求前 12 词内同时出现三个关键词，非并发 DETACH 仍允许）；补 CREATE [UNIQUE] INDEX CONCURRENTLY [IF NOT EXISTS]、DROP INDEX CONCURRENTLY [IF EXISTS]、REINDEX (CONCURRENTLY) 等变体；statement_head_words 遇行内注释即停止扫描，避免尾注释 -- CONCURRENTLY 误判；CREATE INDEX 判定收紧为前缀 CREATE [UNIQUE] INDEX，防列名/字符串误伤。
 - 测试：core 41（扩展正反例）、app 271（+3 zero_row_results 单测）、SQLite 集成断言、Dart DataGrid 上限 widget、live SQLite 无主键翻页确认/零行提示（9/9）。
 
+
+## 17. 第 61 轮修订（新建外键 1452 的可行动诊断）
+
+- 背景（用户截图）：关系设计器新建外键「年级成绩单.学号 → 学生名单.id」失败时只显示 MySQL 1452 原文。真实数据中两表『学号』列取值完全匹配（20260101…），而 学生名单.id 是 1…，30 行全部孤儿；正确方向是引用 学生名单.学号，但该列没有唯一索引。
+- er_model 新增公开纯函数：quoteIdentForDriver（MySQL 反引号 / PG·SQLite 双引号）、fkOrphanCountSql、fkOrphanChildSampleSql/fkOrphanParentSampleSql（各 LIMIT 5）、fkSameNameMatchCountSql、fkChildNonEmptyCountSql、parseFkOrphanReport（容忍 Api.query 的 results[].rows / 顶层 rows / List/Map 行）、fkOrphanWarningMessage（双语：孤儿数量 + 本表/引用表示例 + 建议 + 同名列基本匹配时「先建 UNIQUE 索引再引用」提示）、fkConstraintFailureMessage（1452/23000 孤儿数据、1826 约束名重复、1215 类型/索引、其它保留原文）。
+- relation_designer：仅单列直接外键在 ALTER 前预检（Api.query；任何异常静默跳过，绝不阻塞原本能成功的创建）；孤儿>0 弹出「取消 / 仍然尝试创建」；取消不关新建外键弹窗并把可读警告留在弹窗里；仍然尝试才执行 ALTER；失败统一翻译为可行动文案（FkCreationFailureException）。
+- 测试钩子：@visibleForTesting orphanReportOverride（跳过真实查询）与公开 RelationDesignerState.openNewForeignKeyForTest。
+- 测试：er_model_test 113（引号/SQL/解析/用户场景中英警告/错误映射）、er_designer_test 41（live SQLite：孤儿→取消保留弹窗+警告、仍然尝试→友好 1452、预检跳过仍友好、真实 SQL 查出 2 行孤儿）；全量 Flutter 785 passed / 16 skipped。
+- 限制：预检每次多 3–5 次查询（大表可能慢，无超时；失败静默跳过）；只覆盖单列直接外键，中间表内联外键不预检；本地前置校验仍先拦「引用列非唯一」，警告只建议先建 UNIQUE、不自动建索引；1452/1215/1826 基于错误文本关键字，驱动消息变体会落到「未知错误+原文」。
+- 验证债清理：本轮补跑全量 cargo test --offline --no-run（EXIT=0），随后删除 target/debug/deps（8.1 GB，可重建）与 incremental 释放磁盘，release 构建/测试恢复正常。
+

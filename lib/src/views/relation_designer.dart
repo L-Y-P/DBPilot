@@ -226,6 +226,7 @@ class RelationDesigner extends StatefulWidget {
     this.onRequestEditFields,
     this.driverOverride,
     this.alterTableOverride,
+    this.orphanReportOverride,
   });
 
   final String database;
@@ -252,11 +253,23 @@ class RelationDesigner extends StatefulWidget {
   @visibleForTesting
   final Future<Json> Function(String table, Json body)? alterTableOverride;
 
+  /// 测试注入：跳过真实 [Api.query] 的外键孤儿预检，直接给出报告（null = 不做
+  /// 预检）。产品代码不传，走真实查询；查询失败时也会静默跳过预检。
+  @visibleForTesting
+  final FkOrphanReport? Function(
+    String localTable,
+    String localColumn,
+    String refTable,
+    String refColumn,
+  )? orphanReportOverride;
+
   @override
-  State<RelationDesigner> createState() => _RelationDesignerState();
+  State<RelationDesigner> createState() => RelationDesignerState();
 }
 
-class _RelationDesignerState extends State<RelationDesigner> {
+/// 公开 State 仅为测试注入「打开新建外键弹窗」的入口（第 61 轮）；产品代码
+/// 通过画布连接点进入同一个 [_beginCreateForeignKey] 流程。
+class RelationDesignerState extends State<RelationDesigner> {
   // ---------------------------------------------------------------- 数据状态
   bool _loading = true;
   String? _loadError;
@@ -1257,16 +1270,222 @@ class _RelationDesignerState extends State<RelationDesigner> {
     String localTable,
     Map<String, dynamic> payload,
   ) async {
+    final columns = (payload['columns'] as List?) ?? const <dynamic>[];
+    final refColumns = (payload['ref_columns'] as List?) ?? const <dynamic>[];
+    final refTable = (payload['ref_table'] ?? '').toString();
+    final localColumn = columns.length == 1 ? columns.first.toString() : '';
+    final refColumn =
+        refColumns.length == 1 ? refColumns.first.toString() : '';
+    // 第 61 轮：先查孤儿行，让用户在 ALTER 失败前看懂「为什么不匹配」。
+    FkOrphanReport? report;
+    if (localColumn.isNotEmpty && refColumn.isNotEmpty) {
+      report = await _checkFkOrphans(
+        localTable,
+        localColumn,
+        refTable,
+        refColumn,
+      );
+    }
+    if (!mounted) return;
+    if (report != null && report.hasOrphans) {
+      final sameName = _lookupTable(refTable)?.columnNamed(localColumn)?.name;
+      final warning = fkOrphanWarningMessage(
+        report,
+        localTable: localTable,
+        localColumn: localColumn,
+        refTable: refTable,
+        refColumn: refColumn,
+        sameNameColumnInRefTable:
+            (sameName != null && sameName != refColumn) ? sameName : null,
+      );
+      final proceed = await _confirmCreateDespiteOrphans(warning);
+      if (!mounted) return;
+      if (!proceed) {
+        // 不关新建外键弹窗：把可读警告写回弹窗的 _error（不加「失败」前缀）。
+        throw FkPrecheckWarningException(warning);
+      }
+    }
     // P0-1：Rust 把 ALTER 失败写在返回体里，必须走 checked 版本才会抛错，
-    // 否则「创建外键」在数据库拒绝时也会静默关窗。
-    await _alterTable(
-      localTable,
-      <String, dynamic>{
-        'add_foreign_keys': <Map<String, dynamic>>[payload],
-      },
-    );
+    // 否则「创建外键」在数据库拒绝时也会静默关窗。第 61 轮换成可行动文案。
+    try {
+      await _alterTable(
+        localTable,
+        <String, dynamic>{
+          'add_foreign_keys': <Map<String, dynamic>>[payload],
+        },
+      );
+    } catch (error) {
+      throw FkCreationFailureException(
+        fkConstraintFailureMessage(
+          error,
+          localTable: localTable,
+          refTable: refTable,
+          localColumn: localColumn,
+          refColumn: refColumn,
+          report: report,
+        ),
+        cause: error,
+      );
+    }
     await _reloadTable(localTable);
   }
+
+  /// 第 61 轮：新建外键前查孤儿行（仅单列直接外键）。
+  ///
+  /// 任何查询异常（测试环境没有 Api / 权限不足 / 驱动不支持）都静默跳过预检，
+  /// 绝不阻塞原本能成功的创建。
+  Future<FkOrphanReport?> _checkFkOrphans(
+    String localTable,
+    String localColumn,
+    String refTable,
+    String refColumn,
+  ) async {
+    final override = widget.orphanReportOverride;
+    if (override != null) {
+      return override(localTable, localColumn, refTable, refColumn);
+    }
+    try {
+      final driver = _driver;
+      final countJson = await Api.instance.query(
+        fkOrphanCountSql(
+          driver: driver,
+          childTable: localTable,
+          childColumn: localColumn,
+          refTable: refTable,
+          refColumn: refColumn,
+        ),
+        widget.database,
+      );
+      final childSampleJson = await Api.instance.query(
+        fkOrphanChildSampleSql(
+          driver: driver,
+          childTable: localTable,
+          childColumn: localColumn,
+        ),
+        widget.database,
+      );
+      final parentSampleJson = await Api.instance.query(
+        fkOrphanParentSampleSql(
+          driver: driver,
+          refTable: refTable,
+          refColumn: refColumn,
+        ),
+        widget.database,
+      );
+      final sameName = _lookupTable(refTable)?.columnNamed(localColumn)?.name;
+      final sameNameColumn =
+          (sameName != null && sameName != refColumn) ? sameName : null;
+      Map<String, dynamic>? sameNameCountJson;
+      Map<String, dynamic>? childNonEmptyCountJson;
+      if (sameNameColumn != null) {
+        sameNameCountJson = await Api.instance.query(
+          fkSameNameMatchCountSql(
+            driver: driver,
+            childTable: localTable,
+            childColumn: localColumn,
+            refTable: refTable,
+            sameNameColumn: sameNameColumn,
+          ),
+          widget.database,
+        );
+        childNonEmptyCountJson = await Api.instance.query(
+          fkChildNonEmptyCountSql(
+            driver: driver,
+            childTable: localTable,
+            childColumn: localColumn,
+          ),
+          widget.database,
+        );
+      }
+      return parseFkOrphanReport(
+        countJson,
+        childSampleJson,
+        parentSampleJson,
+        sameNameCountJson: sameNameCountJson,
+        childNonEmptyCountJson: childNonEmptyCountJson,
+        sameNameColumn: sameNameColumn,
+      );
+    } catch (_) {
+      // 预检只用于提示：失败时静默跳过，避免把本来能建的外键拦下来。
+      return null;
+    }
+  }
+
+  /// 查找画布或 schema 里的表（引用表可能还没画到画布上）。
+  ErTable? _lookupTable(String name) {
+    final onCanvas = _tableNamed(name);
+    if (onCanvas != null) return onCanvas;
+    final row = _schemaRows[name];
+    if (row != null) return ErTable.fromStructure(name, row);
+    return null;
+  }
+
+  /// 预检发现孤儿行时的警告：取消 / 仍然尝试创建。
+  Future<bool> _confirmCreateDespiteOrphans(String warning) async {
+    final result = await showAppModal<bool>(
+      context: context,
+      title: pickText('外键数据不匹配', 'Foreign-key data does not match'),
+      builder: (context) => ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 720),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            AlertBox(warning, tone: AlertTone.warn),
+            const SizedBox(height: 8),
+            Text(
+              pickText(
+                '现在创建外键会被数据库拒绝。可以先修正数据；也可以仍然尝试，'
+                    '确认数据库的最终报错。',
+                'Creating the foreign key now will be rejected by the database. '
+                    'Fix the data first, or try anyway to see the final database '
+                    'error.',
+              ),
+              style: kSmallMuted,
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        Builder(
+          builder: (context) => Btn(
+            pickText('取消', 'Cancel'),
+            key: const ValueKey<String>('fk-precheck-cancel'),
+            onPressed: () => Navigator.of(context).pop(false),
+          ),
+        ),
+        Builder(
+          builder: (context) => Btn(
+            pickText('仍然尝试创建', 'Try creating anyway'),
+            key: const ValueKey<String>('fk-precheck-proceed'),
+            danger: true,
+            onPressed: () => Navigator.of(context).pop(true),
+          ),
+        ),
+      ],
+    );
+    return result == true;
+  }
+
+  /// 测试入口：等价于从连接点拖出「新建外键关系」弹窗（第 61 轮）。
+  @visibleForTesting
+  Future<void> openNewForeignKeyForTest({
+    required String localTable,
+    required String localColumn,
+    required String refTable,
+    required String refColumn,
+  }) async {
+    final local = _tableNamed(localTable);
+    final ref = _tableNamed(refTable);
+    if (local == null || ref == null) return;
+    await _beginCreateForeignKey(
+      localTable: local,
+      localColumn: localColumn,
+      refTable: ref,
+      refColumn: refColumn,
+    );
+  }
+
 
   /// 删除外键：先二次确认（P2-9），确认后才真正 ALTER；返回是否真的删除。
   ///
@@ -3590,12 +3809,21 @@ class _NewForeignKeyDialogState extends State<_NewForeignKeyDialog> {
       if (!mounted) return;
       setState(() {
         _busy = false;
-        // P0-1：失败必须留在弹窗里（中文前缀 + 数据库原文），不能静默关窗。
-        _error = erDbActionError(
-          zh: '创建外键失败：',
-          en: 'Failed to create the foreign key: ',
-          error: error,
-        );
+        // P0-1：失败必须留在弹窗里，不能静默关窗。第 61 轮：
+        //   * 预检警告 → 直接显示可读警告（不加「创建外键失败：」前缀）；
+        //   * ALTER 失败 → 已翻译成可行动文案（1452 / 1826 / 1215 等）；
+        //   * 其它 → 保留「创建外键失败：」前缀 + 数据库原文。
+        if (error is FkPrecheckWarningException) {
+          _error = error.message;
+        } else if (error is FkCreationFailureException) {
+          _error = error.message;
+        } else {
+          _error = erDbActionError(
+            zh: '创建外键失败：',
+            en: 'Failed to create the foreign key: ',
+            error: error,
+          );
+        }
       });
     }
   }

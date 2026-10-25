@@ -7,6 +7,7 @@
 //  * 多对多中间表通过 createTable 一次建表成功（SQLite 内联外键）；
 //  * 中文动作文案不出现 SQL 关键字，英文界面才出现。
 
+import 'dart:async';
 import 'dart:io';
 import 'dart:ui' show PointerDeviceKind;
 
@@ -1701,5 +1702,215 @@ void main() {
       hasLength(1),
     );
     expect(alterTableErrors(<String, dynamic>{}), isEmpty);
+  });
+
+  // =====================================================================
+  // 第 61 轮：新建外键 1452 的可行动诊断
+  // =====================================================================
+
+  const userScenario1452 =
+      'Cannot add or update a child row: a foreign key constraint fails '
+      '(clerk_cn_test.#sql-1004_4e, CONSTRAINT fk_grade_student '
+      'FOREIGN KEY (学号) REFERENCES 学生名单 (id) ON DELETE CASCADE) '
+      '(错误码 23000)';
+
+  Future<void> createUserScenarioTables(WidgetTester tester) async {
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS 学生名单 '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, 学号 INTEGER)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS 年级成绩单 '
+        '(学号 INTEGER PRIMARY KEY AUTOINCREMENT, 姓名 TEXT)',
+      );
+    });
+  }
+
+  testWidgets('新建外键预检：孤儿→取消保留警告；仍然尝试→1452 友好文案（第 61 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    await createUserScenarioTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    var alterCalls = 0;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['年级成绩单', '学生名单'],
+          height: 560,
+          driverOverride: 'mysql',
+          orphanReportOverride:
+              (localTable, localColumn, refTable, refColumn) =>
+                  const FkOrphanReport(
+                    count: 30,
+                    childSamples: <String>['20260101', '20260102'],
+                    parentSamples: <String>['1', '2'],
+                    sameNameColumn: '学号',
+                    sameNameMatchCount: 30,
+                    childNonEmptyCount: 30,
+                  ),
+          alterTableOverride: (table, body) async {
+            alterCalls++;
+            throw StateError(userScenario1452);
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: '年级成绩单',
+        localColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    expect(find.text('新建外键关系'), findsOneWidget);
+
+    // 预检警告：数量 + 示例值 + 同名列/索引建议。
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 10);
+    expect(find.textContaining('引用数据不匹配'), findsWidgets);
+    expect(find.textContaining('20260101'), findsWidgets);
+    expect(find.textContaining('学生名单.学号'), findsWidgets);
+    expect(find.textContaining('UNIQUE 索引'), findsWidgets);
+
+    // 取消：不执行 ALTER；新建外键弹窗保持打开并把警告显示为错误说明。
+    await tester.tap(find.byKey(const ValueKey('fk-precheck-cancel')));
+    await settle(tester, rounds: 8);
+    expect(alterCalls, 0);
+    expect(find.text('新建外键关系'), findsOneWidget);
+    expect(find.textContaining('引用数据不匹配'), findsWidgets);
+
+    // 仍然尝试：执行一次 ALTER，1452 被翻译成可行动文案（不再出现原始错误）。
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 10);
+    await tester.tap(find.byKey(const ValueKey('fk-precheck-proceed')));
+    await settle(tester, rounds: 14);
+    expect(alterCalls, 1);
+    expect(find.text('新建外键关系'), findsOneWidget);
+    expect(find.textContaining('找不到对应记录'), findsWidgets);
+    expect(find.textContaining('UNIQUE 索引'), findsWidgets);
+    expect(
+      find.textContaining('Cannot add or update a child row'),
+      findsNothing,
+    );
+
+    // 清理：关闭弹窗。
+    await tester.tap(find.widgetWithText(Btn, '取消'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('新建外键：预检被跳过时 1452 仍给友好文案（不阻塞创建）（第 61 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    await createUserScenarioTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    var alterCalls = 0;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['年级成绩单', '学生名单'],
+          height: 560,
+          driverOverride: 'mysql',
+          // 模拟测试环境/权限不足：预检返回 null（跳过），创建流程不被阻塞。
+          orphanReportOverride:
+              (localTable, localColumn, refTable, refColumn) => null,
+          alterTableOverride: (table, body) async {
+            alterCalls++;
+            throw StateError(userScenario1452);
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: '年级成绩单',
+        localColumn: '学号',
+        refTable: '学生名单',
+        refColumn: 'id',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    expect(find.text('新建外键关系'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 14);
+    expect(alterCalls, 1);
+    // 没有预检警告弹窗，直接展示 1452 的友好解释。
+    expect(find.textContaining('找不到对应记录'), findsWidgets);
+    expect(find.textContaining('年级成绩单'), findsWidgets);
+    expect(
+      find.textContaining('Cannot add or update a child row'),
+      findsNothing,
+    );
+    await tester.tap(find.widgetWithText(Btn, '取消'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('新建外键预检：真实 SQL 在 SQLite 上查出孤儿（无 override）', (tester) async {
+    await setSurface(tester);
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS pre_parent '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS pre_child '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER)',
+      );
+      await Api.instance.query('DELETE FROM pre_child');
+      await Api.instance.query('DELETE FROM pre_parent');
+      await Api.instance.query('INSERT INTO pre_parent (id) VALUES (1), (2)');
+      await Api.instance.query('INSERT INTO pre_child (pid) VALUES (9), (8)');
+    });
+    final designerKey = GlobalKey<RelationDesignerState>();
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['pre_child', 'pre_parent'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: 'pre_child',
+        localColumn: 'pid',
+        refTable: 'pre_parent',
+        refColumn: 'id',
+      ),
+    );
+    await settle(tester, rounds: 12);
+    expect(find.text('新建外键关系'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 24);
+    // 真实 LEFT JOIN 查询命中 2 行孤儿，且带出两侧示例值。
+    expect(find.textContaining('2 行'), findsWidgets);
+    expect(find.textContaining('pre_child'), findsWidgets);
+    expect(find.textContaining('本表这些值的示例'), findsWidgets);
+    expect(find.textContaining('引用表的示例'), findsWidgets);
+
+    await tester.tap(find.byKey(const ValueKey('fk-precheck-cancel')));
+    await settle(tester, rounds: 8);
+    expect(find.textContaining('引用数据不匹配'), findsWidgets);
+    await tester.tap(find.widgetWithText(Btn, '取消'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
   });
 }

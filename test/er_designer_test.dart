@@ -768,6 +768,8 @@ void main() {
     );
     expect(notice.message, contains('已建立建议外键'));
     expect(notice.message, contains('s_child.s_parent_id'));
+    // 第 62 轮：建立成功后「当前数据库还没有外键」的提示必须消失。
+    expect(find.textContaining('当前数据库还没有外键'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -1911,6 +1913,419 @@ void main() {
     expect(find.textContaining('引用数据不匹配'), findsWidgets);
     await tester.tap(find.widgetWithText(Btn, '取消'));
     await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  // =====================================================================
+  // 第 62 轮：画布拖动视角 / 批量建议友好错误 / 一键 UNIQUE 索引
+  // =====================================================================
+
+  testWidgets('画布拖动视角：空白拖动平移，节点拖动不平移（第 62 轮）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        SizedBox(
+          width: 900,
+          height: 320,
+          child: RelationDesigner(
+            database: 'main',
+            initialTables: const <String>[
+              'authors',
+              'books',
+              'reviews',
+              'c1',
+              'c2',
+              'c3',
+              'c4',
+              'c5',
+              'c6',
+            ],
+            height: 320,
+          ),
+        ),
+      ),
+    );
+    await settle(tester);
+    final canvasStack = find.byKey(const ValueKey('er-canvas-stack'));
+    expect(canvasStack, findsOneWidget);
+    final scrollables = find.ancestor(
+      of: canvasStack,
+      matching: find.byType(Scrollable),
+    );
+    expect(scrollables, findsNWidgets(2));
+    ScrollableState scrollState(int index) =>
+        tester.state<ScrollableState>(scrollables.at(index));
+    double pixels(int index) => scrollState(index).position.pixels;
+    final maxExtents = <double>[
+      scrollState(0).position.maxScrollExtent,
+      scrollState(1).position.maxScrollExtent,
+    ];
+    expect(
+      maxExtents[0] > 0 || maxExtents[1] > 0,
+      isTrue,
+      reason: '测试前提：内容要超出视口，maxExtents=$maxExtents',
+    );
+
+    // 先拖节点标题栏：节点自身手势优先，视角保持不动。
+    final node = find.byKey(const ValueKey('er-node-authors'));
+    expect(node, findsOneWidget);
+    final nodeStart = tester.getTopLeft(node) + const Offset(30, 12);
+    final nodeDrag = await tester.startGesture(nodeStart);
+    for (var i = 0; i < 4; i++) {
+      await nodeDrag.moveBy(const Offset(10, 8));
+      await tester.pump();
+    }
+    await nodeDrag.up();
+    await tester.pump();
+    expect(pixels(0), 0);
+    expect(pixels(1), 0);
+
+    // 空白处（节点从 24px 开始）向左上拖动 → 视角向右下平移。
+    final start = tester.getTopLeft(canvasStack) + const Offset(4, 4);
+    final pan = await tester.startGesture(start);
+    for (var i = 0; i < 6; i++) {
+      await pan.moveBy(const Offset(-24, -18));
+      await tester.pump();
+    }
+    await pan.up();
+    await tester.pump();
+    final afterPan = <double>[pixels(0), pixels(1)];
+    expect(
+      afterPan[0] + afterPan[1],
+      greaterThan(0),
+      reason: '拖动空白处后至少一个轴应产生滚动偏移',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('批量建议外键失败：1452 显示可行动诊断（第 62 轮）', (tester) async {
+    await setSurface(tester);
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS sg_parent '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS sg_child '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, sg_parent_id INTEGER)',
+      );
+    });
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['sg_child', 'sg_parent'],
+          height: 520,
+          driverOverride: 'mysql',
+          orphanReportOverride:
+              (localTable, localColumn, refTable, refColumn) =>
+                  const FkOrphanReport(
+                    count: 30,
+                    childSamples: <String>['20260101'],
+                    parentSamples: <String>['1'],
+                    sameNameColumn: '学号',
+                    sameNameMatchCount: 30,
+                    childNonEmptyCount: 30,
+                  ),
+          alterTableOverride: (table, body) async {
+            throw StateError(userScenario1452);
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final panel = find.byKey(const ValueKey('er-relation-list-panel'));
+    expect(panel, findsOneWidget);
+    await tester.tap(
+      find.descendant(
+        of: panel,
+        matching: find.text('sg_child.sg_parent_id → sg_parent.id'),
+      ),
+    );
+    await settle(tester, rounds: 12);
+
+    // 批量失败汇总保留条数，并用可行动文案替代裸 1452。
+    expect(find.textContaining('已建立 0/1 条建议外键'), findsWidgets);
+    expect(find.textContaining('找不到对应记录'), findsWidgets);
+    expect(find.textContaining('UNIQUE 索引'), findsWidgets);
+    expect(
+      find.textContaining('Cannot add or update a child row'),
+      findsNothing,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  Future<void> createUniqueIndexScenarioTables(WidgetTester tester) async {
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS uq_parent '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, code INTEGER)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS uq_child '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, code INTEGER)',
+      );
+      await Api.instance.query('DELETE FROM uq_parent');
+      await Api.instance.query('INSERT INTO uq_parent (code) VALUES (1), (2), (3)');
+    });
+  }
+
+  testWidgets('引用列全唯一：一键建 UNIQUE 索引并断言 add_indexes（第 62 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    await createUniqueIndexScenarioTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    Json? capturedBody;
+    String? capturedTable;
+    var alterCalls = 0;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['uq_child', 'uq_parent'],
+          height: 520,
+          driverOverride: 'mysql',
+          uniquenessOverride: (table, column) async =>
+              const ErColumnUniqueness(total: 3, distinct: 3),
+          alterTableOverride: (table, body) async {
+            alterCalls++;
+            capturedTable = table;
+            capturedBody = body;
+            return <String, dynamic>{'failed': 0, 'results': <dynamic>[]};
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: 'uq_child',
+        localColumn: 'code',
+        refTable: 'uq_parent',
+        refColumn: 'code',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    expect(find.text('目标列不是唯一键'), findsOneWidget);
+    expect(find.textContaining('全部唯一'), findsWidgets);
+    expect(
+      find.byKey(const ValueKey('er-create-unique-index')),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byKey(const ValueKey('er-create-unique-index')));
+    await settle(tester, rounds: 16);
+    expect(alterCalls, 1);
+    expect(capturedTable, 'uq_parent');
+    final indexes = (capturedBody!['add_indexes'] as List).cast<Map>();
+    expect(indexes, hasLength(1));
+    expect(indexes.single['unique'], isTrue);
+    expect((indexes.single['columns'] as List).single, 'code');
+    expect(indexes.single['name'], startsWith('uk_code'));
+
+    // override 是假成功（真实库没建索引）：重新校验仍不唯一，回到阻止提示；
+    // 真实 MySQL 上此处会重新打开「新建外键关系」弹窗。
+    expect(find.text('无法创建外键'), findsWidgets);
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('引用列有重复：说明数量/示例，不提供建索引（第 62 轮）', (tester) async {
+    await setSurface(tester);
+    await createUniqueIndexScenarioTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    var alterCalls = 0;
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['uq_child', 'uq_parent'],
+          height: 520,
+          driverOverride: 'mysql',
+          uniquenessOverride: (table, column) async =>
+              const ErColumnUniqueness(
+                total: 30,
+                distinct: 1,
+                duplicates: <ErDuplicateValue>[
+                  ErDuplicateValue('20260101', 30),
+                ],
+              ),
+          alterTableOverride: (table, body) async {
+            alterCalls++;
+            return <String, dynamic>{'failed': 0, 'results': <dynamic>[]};
+          },
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: 'uq_child',
+        localColumn: 'code',
+        refTable: 'uq_parent',
+        refColumn: 'code',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    expect(find.text('目标列不是唯一键'), findsOneWidget);
+    expect(find.textContaining('30 行非空'), findsWidgets);
+    expect(find.textContaining('1 个不同值'), findsWidgets);
+    expect(find.textContaining('20260101'), findsWidgets);
+    expect(find.textContaining('出现 30 次'), findsWidgets);
+    expect(
+      find.byKey(const ValueKey('er-create-unique-index')),
+      findsNothing,
+    );
+    expect(alterCalls, 0, reason: '有重复时不自动建索引');
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('引用列已有 UNIQUE 索引时直接打开新建外键弹窗（live SQLite）', (tester) async {
+    await setSurface(tester);
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS uq3_parent '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, code INTEGER)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS uq3_child '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, code INTEGER)',
+      );
+      await Api.instance.query('DROP INDEX IF EXISTS uk_uq3_code');
+      await Api.instance.query(
+        'CREATE UNIQUE INDEX uk_uq3_code ON uq3_parent(code)',
+      );
+    });
+    final designerKey = GlobalKey<RelationDesignerState>();
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['uq3_child', 'uq3_parent'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: 'uq3_child',
+        localColumn: 'code',
+        refTable: 'uq3_parent',
+        refColumn: 'code',
+      ),
+    );
+    await settle(tester, rounds: 12);
+    // 唯一索引存在 → 本地校验通过，直接进入新建外键弹窗（不再提示建索引）。
+    expect(find.text('新建外键关系'), findsOneWidget);
+    expect(find.text('目标列不是唯一键'), findsNothing);
+    await tester.tap(find.widgetWithText(Btn, '取消'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  // =====================================================================
+  // 第 62 轮修正：唯一性查询失败降级 + 创建成功后清「还没有外键」提示
+  // =====================================================================
+
+  testWidgets('唯一性查询失败：降级回原「不是唯一键」提示，不显示假事实', (tester) async {
+    await setSurface(tester);
+    await createUniqueIndexScenarioTables(tester);
+    final designerKey = GlobalKey<RelationDesignerState>();
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['uq_child', 'uq_parent'],
+          height: 520,
+          driverOverride: 'mysql',
+          // 模拟真实查询失败（如保留字别名导致 1064 被静默吞掉）。
+          uniquenessOverride: (table, column) async => null,
+          alterTableOverride: (table, body) async =>
+              <String, dynamic>{'failed': 0, 'results': <dynamic>[]},
+        ),
+      ),
+    );
+    await settle(tester);
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: 'uq_child',
+        localColumn: 'code',
+        refTable: 'uq_parent',
+        refColumn: 'code',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    // 必须退回原来的阻止提示，不能出现「没有非空值」这种假事实。
+    expect(find.text('无法创建外键'), findsWidgets);
+    expect(find.textContaining('不是主键或单列唯一列'), findsWidgets);
+    expect(find.text('目标列不是唯一键'), findsNothing);
+    expect(find.textContaining('没有非空值'), findsNothing);
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 8);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('成功创建外键后「还没有外键」提示消失', (tester) async {
+    await setSurface(tester);
+    await tester.runAsync(() async {
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS nh_parent '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, code INTEGER)',
+      );
+      await Api.instance.query(
+        'CREATE TABLE IF NOT EXISTS nh_child '
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, code INTEGER)',
+      );
+      await Api.instance.query('DELETE FROM nh_parent');
+      await Api.instance.query('DELETE FROM nh_child');
+    });
+    final designerKey = GlobalKey<RelationDesignerState>();
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          key: designerKey,
+          database: 'main',
+          initialTables: const <String>['nh_child', 'nh_parent'],
+          height: 520,
+          driverOverride: 'mysql',
+          alterTableOverride: (table, body) async =>
+              <String, dynamic>{'failed': 0, 'results': <dynamic>[]},
+        ),
+      ),
+    );
+    await settle(tester);
+    // 测试库还有其它表的外键，这里直接注入「还没有外键」提示来验证创建后清除。
+    designerKey.currentState!.showNoForeignKeyNoticeForTest();
+    await settle(tester, rounds: 4);
+    expect(find.textContaining('当前数据库还没有外键'), findsOneWidget);
+
+    unawaited(
+      designerKey.currentState!.openNewForeignKeyForTest(
+        localTable: 'nh_child',
+        localColumn: 'code',
+        refTable: 'nh_parent',
+        refColumn: 'id',
+      ),
+    );
+    await settle(tester, rounds: 10);
+    expect(find.text('新建外键关系'), findsOneWidget);
+
+    // 预检真实查询（空表 → 0 孤儿）后 ALTER（override 成功），弹窗关闭。
+    await tester.tap(find.widgetWithText(Btn, '创建'));
+    await settle(tester, rounds: 20);
+    expect(find.text('新建外键关系'), findsNothing);
+    expect(find.textContaining('当前数据库还没有外键'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 }

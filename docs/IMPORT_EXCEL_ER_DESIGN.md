@@ -508,3 +508,13 @@ Future<void> showRelationDesigner(
 - 限制：预检每次多 3–5 次查询（大表可能慢，无超时；失败静默跳过）；只覆盖单列直接外键，中间表内联外键不预检；本地前置校验仍先拦「引用列非唯一」，警告只建议先建 UNIQUE、不自动建索引；1452/1215/1826 基于错误文本关键字，驱动消息变体会落到「未知错误+原文」。
 - 验证债清理：本轮补跑全量 cargo test --offline --no-run（EXIT=0），随后删除 target/debug/deps（8.1 GB，可重建）与 incremental 释放磁盘，release 构建/测试恢复正常。
 
+
+## 18. 第 62 轮修订（画布拖动视角 / 一键唯一索引 / MySQL 8.4 引用列规则）
+
+- **画布拖动视角**：E-R 画布横向/纵向 SingleChildScrollView 改用 ScrollController，空白处 onPanStart/Update/End 平移（jumpTo clamp），节点/连线/连接点手势优先（_dragLocked 时不平移）；grab/grabbing 光标；SelectionContainer.disabled；自动布局、滚动条、空白点击行为不变。
+- **批量建议外键失败诊断**：_applySuggestions 失败时对该关系跑孤儿预检并用 fkConstraintFailureMessage 生成可行动文案（1452/同名列/UNIQUE 提示），保留「已建立 X/Y」汇总。
+- **非唯一引用列一键建 UNIQUE**：validate 返回 refColumnNotUnique 时先查引用列唯一性（erColumnUniquenessSql：COUNT(col) vs COUNT(DISTINCT col)，别名 total_count/distinct_count）；数据全唯一 → 「取消 / 创建唯一索引并重试」，确认后 add_indexes unique（erIndexNamesOf + uniqueIndexNameFor 生成不冲突 uk_<列>），成功后刷新结构并重开新建外键弹窗；有重复 → 展示行数/不同值/重复示例，不提供按钮、不发 DDL；查询失败（含 results[].error / failed>0 / 空 results 的 erQueryPayloadFailed）降级回原「不是主键或单列唯一列」提示，绝不显示假事实。
+- **创建成功后清除「当前数据库还没有外键」提示**：_clearNoForeignKeyNotice 只清 info 色调提示（warn 上限提示保留），创建外键/中间表/建议成功后调用。
+- **MySQL 8.4 规则验证**：新增 MySQL live 测试 test/fk_reference_live_test.dart（3 例）：无索引引用列报 6125 Missing unique key；加 UNIQUE 后成功且孤儿插入被拒（1452）；普通非唯一 KEY 仍报 6125。结论：产品本地校验与 MySQL 8.4 一致；phpMyAdmin web 能建通常是因为该列已有 UNIQUE，或服务器是 MariaDB/旧版 MySQL（规则不同），不是本地应用更严格。
+- **修复的回归问题**：唯一性 SQL 原用裸别名 AS distinct（MySQL 保留字）→ 1064 被静默吞掉，导致错误显示「没有非空值」；已改别名 + 可空解析 + 失败降级。GUI 实测通过。
+

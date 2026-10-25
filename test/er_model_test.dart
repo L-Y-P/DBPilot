@@ -2483,6 +2483,240 @@ void main() {
       expect(exception.message, '有 30 行孤儿');
     });
   });
+
+  // =====================================================================
+  // 第 62 轮：引用列唯一性 / 一键建 UNIQUE 索引
+  // =====================================================================
+
+  group('引用列唯一性 SQL 与解析（第 62 轮）', () {
+    test('COUNT(col) / COUNT(DISTINCT col) 按驱动引号', () {
+      final mysql = erColumnUniquenessSql(
+        driver: ErDriver.mysql,
+        table: '学生名单',
+        column: '学号',
+      );
+      expect(mysql, contains('COUNT(`学号`)'));
+      expect(mysql, contains('COUNT(DISTINCT `学号`)'));
+      expect(mysql, contains('FROM `学生名单`'));
+      // 第 62 轮 GUI 抽测回归：MySQL 里 DISTINCT 是保留字，不能做裸别名。
+      expect(mysql, contains('AS total_count'));
+      expect(mysql, contains('AS distinct_count'));
+      // 不能用 `AS distinct` / `AS total` 这种保留字裸别名（词边界匹配，
+      // 避免把 total_count 误判成 total）。
+      expect(mysql, isNot(matches(RegExp(r'AS distinct\b'))));
+      expect(mysql, isNot(matches(RegExp(r'AS total\b'))));
+      final pg = erDuplicateValuesSql(
+        driver: ErDriver.postgres,
+        table: '学生名单',
+        column: '学号',
+        limit: 2,
+      );
+      expect(pg, contains('"学生名单"'));
+      expect(pg, contains('HAVING COUNT(*) > 1'));
+      expect(pg, contains('LIMIT 2'));
+    });
+
+    test('解析 results/rows 与 Map 行；空结果降级', () {
+      final uniqueness = parseErColumnUniqueness(<String, dynamic>{
+        'results': <dynamic>[
+          <String, dynamic>{
+            'rows': <dynamic>[
+              <dynamic>[30, 30],
+            ],
+          },
+        ],
+      });
+      expect(uniqueness.total, 30);
+      expect(uniqueness.distinct, 30);
+      expect(uniqueness.isUnique, isTrue);
+      expect(uniqueness.hasDuplicates, isFalse);
+
+      final duplicates = parseErDuplicateValues(<String, dynamic>{
+        'results': <dynamic>[
+          <String, dynamic>{
+            'rows': <dynamic>[
+              <dynamic>['20260101', 30],
+              <dynamic>['20260102', 2],
+            ],
+          },
+        ],
+      });
+      expect(duplicates, hasLength(2));
+      expect(duplicates.first.value, '20260101');
+      expect(duplicates.first.count, 30);
+
+      final empty = parseErColumnUniqueness(<String, dynamic>{});
+      expect(empty.total, 0);
+      expect(empty.distinct, 0);
+      expect(empty.isUnique, isTrue, reason: '空列也能建唯一索引');
+    });
+
+    test('查询失败/空结果：必须返回 null，不能当成 0 行 0 个值', () {
+      // MySQL 语法错误会作为 results[].error 返回而不抛异常（第 62 轮真实 bug）。
+      expect(
+        erQueryPayloadFailed(<String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{'error': 'ERROR 1064 (42000): syntax error'},
+          ],
+        }),
+        isTrue,
+      );
+      expect(
+        parseErColumnUniquenessResult(<String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{'error': 'ERROR 1064 (42000): syntax error'},
+          ],
+        }),
+        isNull,
+      );
+      // failed>0 / results 为空 / 缺 rows 同样视为不可用。
+      expect(erQueryPayloadFailed(<String, dynamic>{'failed': 1}), isTrue);
+      expect(
+        erQueryPayloadFailed(<String, dynamic>{'results': <dynamic>[]}),
+        isTrue,
+      );
+      expect(
+        parseErColumnUniquenessResult(<String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{'rows': <dynamic>[]},
+          ],
+        }),
+        isNull,
+      );
+      // 正常结果：返回对象。
+      final ok = parseErColumnUniquenessResult(<String, dynamic>{
+        'results': <dynamic>[
+          <String, dynamic>{
+            'rows': <dynamic>[
+              <dynamic>[30, 30],
+            ],
+          },
+        ],
+      });
+      expect(ok, isNotNull);
+      expect(ok!.total, 30);
+      expect(ok.isUnique, isTrue);
+      // 正常但 0 行的空表：合法（0/0 全唯一），不能与查询失败混淆。
+      expect(
+        erQueryPayloadFailed(<String, dynamic>{
+          'results': <dynamic>[
+            <String, dynamic>{
+              'rows': <dynamic>[
+                <dynamic>[0, 0],
+              ],
+            },
+          ],
+        }),
+        isFalse,
+      );
+    });
+
+    test('唯一性判定与重复行数', () {
+      const unique = ErColumnUniqueness(total: 30, distinct: 30);
+      expect(unique.isUnique, isTrue);
+      expect(unique.duplicateRowCount, 0);
+      const dup = ErColumnUniqueness(total: 30, distinct: 1);
+      expect(dup.isUnique, isFalse);
+      expect(dup.hasDuplicates, isTrue);
+      expect(dup.duplicateRowCount, 29);
+    });
+  });
+
+  group('唯一索引名生成（第 62 轮）', () {
+    test('uk_<列>；冲突追加 _2/_3；大小写不敏感去重', () {
+      expect(uniqueIndexNameFor('code', const <String>{}), 'uk_code');
+      expect(uniqueIndexNameFor('code', <String>{'uk_code'}), 'uk_code_2');
+      expect(
+        uniqueIndexNameFor('code', <String>{'UK_CODE', 'uk_code_2'}),
+        'uk_code_3',
+      );
+      expect(uniqueIndexNameFor('  学号 ', const <String>{}), 'uk_学号');
+    });
+
+    test('非法字符替换成下划线；名字不超过 60 字符', () {
+      expect(uniqueIndexNameFor('a b-c', const <String>{}), 'uk_a_b_c');
+      final long = uniqueIndexNameFor('x' * 80, const <String>{});
+      expect(long.length, lessThanOrEqualTo(60));
+      expect(long, startsWith('uk_'));
+      final longConflict = uniqueIndexNameFor('x' * 80, <String>{long});
+      expect(longConflict.length, lessThanOrEqualTo(60));
+      expect(longConflict, endsWith('_2'));
+    });
+
+    test('已有索引名从 structure 行里取（INDEX_NAME / name）', () {
+      expect(
+        erIndexNamesOf(<dynamic>[
+          <String, dynamic>{'INDEX_NAME': 'PRIMARY'},
+          <String, dynamic>{'name': 'idx_code'},
+          <String, dynamic>{},
+        ]),
+        <String>['PRIMARY', 'idx_code'],
+      );
+      expect(erIndexNamesOf(null), isEmpty);
+    });
+  });
+
+  group('唯一列提示文案（第 62 轮）', () {
+    test('中文：全唯一 → 提供建 UNIQUE 索引建议，并解释 web 差异', () {
+      I18n.setLang(AppLang.zh);
+      final message = erUniqueIndexSuggestionMessage(
+        const ErColumnUniqueness(total: 30, distinct: 30),
+        refTable: '学生名单',
+        refColumn: '学号',
+      );
+      expect(message, contains('学生名单.学号'));
+      expect(message, contains('30 个非空值'));
+      expect(message, contains('全部唯一'));
+      expect(message, contains('UNIQUE'));
+      expect(message, contains('MySQL 8.4'));
+      expect(message, contains('MariaDB'));
+    });
+
+    test('中文：有重复 → 数量 / 示例 / 不自动建索引', () {
+      I18n.setLang(AppLang.zh);
+      final message = erRefColumnDuplicateMessage(
+        const ErColumnUniqueness(
+          total: 30,
+          distinct: 1,
+          duplicates: <ErDuplicateValue>[ErDuplicateValue('20260101', 30)],
+        ),
+        refTable: '学生名单',
+        refColumn: '学号',
+      );
+      expect(message, contains('30 行非空'));
+      expect(message, contains('1 个不同值'));
+      expect(message, contains('重复 29 行'));
+      expect(message, contains('20260101'));
+      expect(message, contains('出现 30 次'));
+      expect(message, contains('不会自动创建索引'));
+    });
+
+    test('英文：唯一 / 重复两套文案', () {
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final unique = erUniqueIndexSuggestionMessage(
+        const ErColumnUniqueness(total: 30, distinct: 30),
+        refTable: '学生名单',
+        refColumn: '学号',
+      );
+      expect(unique, contains('30 non-null values'));
+      expect(unique, contains('UNIQUE'));
+      expect(unique, contains('MySQL 8.4'));
+      final dup = erRefColumnDuplicateMessage(
+        const ErColumnUniqueness(
+          total: 30,
+          distinct: 1,
+          duplicates: <ErDuplicateValue>[ErDuplicateValue('X', 30)],
+        ),
+        refTable: 'p',
+        refColumn: 'c',
+      );
+      expect(dup, contains('30 non-null rows'));
+      expect(dup, contains('1 distinct values'));
+      expect(dup, contains('appears 30 times'));
+      expect(dup, contains('no index is created automatically'));
+    });
+  });
 }
 
 /// 测试辅助：关系的人读标签（模型没有 label 方法，用两端拼）。

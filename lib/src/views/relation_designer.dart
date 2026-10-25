@@ -227,6 +227,7 @@ class RelationDesigner extends StatefulWidget {
     this.driverOverride,
     this.alterTableOverride,
     this.orphanReportOverride,
+    this.uniquenessOverride,
   });
 
   final String database;
@@ -262,6 +263,13 @@ class RelationDesigner extends StatefulWidget {
     String refTable,
     String refColumn,
   )? orphanReportOverride;
+
+  /// 测试注入：跳过真实 [Api.query] 的引用列唯一性查询，直接给出结果。
+  ///
+  /// null = 查询失败，降级为原来的「目标列不是唯一键」提示。产品代码不传。
+  @visibleForTesting
+  final Future<ErColumnUniqueness?> Function(String table, String column)?
+      uniquenessOverride;
 
   @override
   State<RelationDesigner> createState() => RelationDesignerState();
@@ -306,6 +314,12 @@ class RelationDesignerState extends State<RelationDesigner> {
 
   /// 是否显示右侧「关系列表」侧栏（第 54 轮 P2-5）。
   bool _relationListOpen = false;
+
+  // ---- 第 62 轮：画布拖动视角 ----
+  /// 画布内容超出视口时，拖动空白处平移视角（保留滚动条 / 自动布局）。
+  final ScrollController _canvasHorizontal = ScrollController();
+  final ScrollController _canvasVertical = ScrollController();
+  bool _panningCanvas = false;
 
   /// 关系列表搜索框：过滤表名 / 列名 / 展示文本。
   final TextEditingController _relationListFilter = TextEditingController();
@@ -466,6 +480,8 @@ class RelationDesignerState extends State<RelationDesigner> {
   @override
   void dispose() {
     _relationListFilter.dispose();
+    _canvasHorizontal.dispose();
+    _canvasVertical.dispose();
     super.dispose();
   }
 
@@ -848,6 +864,20 @@ class RelationDesignerState extends State<RelationDesigner> {
     });
   }
 
+  /// 成功创建外键/中间表后清除「当前数据库还没有外键…」的自动带入提示。
+  ///
+  /// 第 62 轮 GUI 抽测：创建成功后这条提示还挂着，用户以为数据库仍没有外键。
+  /// 只清「无外键」类（info 色调）提示；「已达画布上限」的 warn 提示与本次操作
+  /// 无关，保留。
+  void _clearNoForeignKeyNotice() {
+    if (!mounted) return;
+    if (_autoIncludeNotice == null || _autoIncludeNoticeWarn) return;
+    setState(() {
+      _autoIncludeNotice = null;
+      _autoIncludeNoticeWarn = false;
+    });
+  }
+
   /// 撤销最近一次自动加入：移除这些表，并记住不再自动带回。
   void _undoAutoAdded() {
     final remove = <String>{..._autoAdded};
@@ -968,8 +998,26 @@ class RelationDesignerState extends State<RelationDesigner> {
           applied.add(suggestion);
           appliedTables.add(suggestion.localTable);
         } catch (error) {
+          // 第 62 轮：批量建议失败也给可行动文案（1452 孤儿 / 同名列 / UNIQUE
+          // 提示），不再只贴数据库原文。预检查询失败时静默降级。
+          final report = await _checkFkOrphans(
+            suggestion.localTable,
+            suggestion.localColumn,
+            suggestion.refTable,
+            suggestion.refColumn,
+          );
           failures.add(
-            _SuggestionFailure(suggestion, describeDbError(error)),
+            _SuggestionFailure(
+              suggestion,
+              fkConstraintFailureMessage(
+                error,
+                localTable: suggestion.localTable,
+                refTable: suggestion.refTable,
+                localColumn: suggestion.localColumn,
+                refColumn: suggestion.refColumn,
+                report: report,
+              ),
+            ),
           );
         }
       }
@@ -991,7 +1039,11 @@ class RelationDesignerState extends State<RelationDesigner> {
               : null;
         });
       }
-      if (applied.isNotEmpty) await widget.onChanged?.call();
+      if (applied.isNotEmpty) {
+        // 第 62 轮：至少成功建立一条外键后，「还没有外键」提示不再成立。
+        _clearNoForeignKeyNotice();
+        await widget.onChanged?.call();
+      }
     }
   }
 
@@ -1059,6 +1111,161 @@ class RelationDesignerState extends State<RelationDesigner> {
     onRequestEditFields: widget.onRequestEditFields,
   );
 
+  /// 第 62 轮：引用列不是唯一键时的就地修复。
+  ///
+  /// 先查 COUNT(col) vs COUNT(DISTINCT col)：
+  ///   * 数据全唯一 → 弹「创建唯一索引并重试」，确认后 add_indexes(unique)；
+  ///   * 有重复值 → 说明重复数量 / 示例，建议清理或改选主键列（不做自动 DDL）；
+  ///   * 查询/建索引失败 → 静默降级为原来的「目标列不是唯一键」提示。
+  ///
+  /// 返回 true 表示索引创建成功且结构已刷新，调用方可以重新打开新建外键弹窗。
+  Future<bool> _offerUniqueIndexFix({
+    required ErTable localTable,
+    required String localColumn,
+    required ErTable refTable,
+    required String refColumn,
+  }) async {
+    final uniqueness = await _checkColumnUniqueness(refTable.name, refColumn);
+    if (!mounted) return false;
+    if (uniqueness == null) {
+      // 环境不支持/查询失败：退回原来的阻止提示，保留引用列上下文。
+      await _showBlocked(
+        ErFkIssue(
+          kind: ErFkIssueKind.refColumnNotUnique,
+          localTable: localTable.name,
+          localColumn: localColumn,
+          refTable: refTable.name,
+          refColumn: refColumn,
+        ),
+      );
+      return false;
+    }
+    final unique = uniqueness.isUnique;
+    final message = unique
+        ? erUniqueIndexSuggestionMessage(
+            uniqueness,
+            refTable: refTable.name,
+            refColumn: refColumn,
+          )
+        : erRefColumnDuplicateMessage(
+            uniqueness,
+            refTable: refTable.name,
+            refColumn: refColumn,
+          );
+    final accepted = await showAppModal<bool>(
+      context: context,
+      title: pickText('目标列不是唯一键', 'The referenced column is not unique'),
+      builder: (context) => ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 720),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            AlertBox(message, tone: AlertTone.warn),
+            const SizedBox(height: 8),
+            Text(
+              unique
+                  ? pickText(
+                      '创建 UNIQUE 索引后会重新打开「新建外键关系」，再点「创建」即可。',
+                      'After the UNIQUE index is created the "New foreign key" '
+                          'dialog reopens; press "Create" again.',
+                    )
+                  : pickText(
+                      '这里的重复值不会自动修改；请先清理数据，或改选其它引用列。',
+                      'Duplicates are not modified automatically; clean the data '
+                          'or pick another referenced column.',
+                    ),
+              style: kSmallMuted,
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        Builder(
+          builder: (context) => Btn(
+            unique ? pickText('取消', 'Cancel') : pickText('关闭', 'Close'),
+            onPressed: () => Navigator.of(context).pop(false),
+          ),
+        ),
+        if (unique)
+          Builder(
+            builder: (context) => Btn(
+              pickText('创建唯一索引并重试', 'Create a UNIQUE index and retry'),
+              key: const ValueKey<String>('er-create-unique-index'),
+              primary: true,
+              onPressed: () => Navigator.of(context).pop(true),
+            ),
+          ),
+      ],
+    );
+    if (!mounted || accepted != true) return false;
+    final existing = erIndexNamesOf(_schemaRows[refTable.name]?['indexes']);
+    final indexName = uniqueIndexNameFor(refColumn, existing.toSet());
+    try {
+      await _alterTable(
+        refTable.name,
+        <String, dynamic>{
+          'add_indexes': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'name': indexName,
+              'unique': true,
+              'columns': <String>[refColumn],
+            },
+          ],
+        },
+      );
+    } catch (error) {
+      if (!mounted) return false;
+      await showForeignKeyBlockedDialog(
+        context,
+        message: fkConstraintFailureMessage(
+          error,
+          refTable: refTable.name,
+          refColumn: refColumn,
+        ),
+        onRequestEditFields: widget.onRequestEditFields,
+      );
+      return false;
+    }
+    await _reloadTable(refTable.name);
+    return true;
+  }
+
+  /// 查引用列唯一性（总行数 / 不同值数 / 重复示例）；失败返回 null。
+  Future<ErColumnUniqueness?> _checkColumnUniqueness(
+    String table,
+    String column,
+  ) async {
+    final override = widget.uniquenessOverride;
+    if (override != null) return override(table, column);
+    try {
+      final driver = _driver;
+      final countJson = await Api.instance.query(
+        erColumnUniquenessSql(driver: driver, table: table, column: column),
+        widget.database,
+      );
+      // 第 62 轮 GUI 抽测：MySQL 保留字别名会让查询失败但不抛异常；必须
+      // 显式判失败，否则会把「查不到」误当成「0 行/0 个值」显示假事实。
+      final uniqueness = parseErColumnUniquenessResult(countJson);
+      if (uniqueness == null) return null;
+      if (uniqueness.isUnique) return uniqueness;
+      final duplicatesJson = await Api.instance.query(
+        erDuplicateValuesSql(driver: driver, table: table, column: column),
+        widget.database,
+      );
+      return ErColumnUniqueness(
+        total: uniqueness.total,
+        distinct: uniqueness.distinct,
+        duplicates: erQueryPayloadFailed(duplicatesJson)
+            ? const <ErDuplicateValue>[]
+            : parseErDuplicateValues(duplicatesJson),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+
   /// SQLite 下点建议外键时的明确说明（可点但无法 ALTER，不是静默失败）。
   Future<void> _showSqliteAlterFkNotice() async {
     await showAppModal<void>(
@@ -1123,6 +1330,7 @@ class RelationDesignerState extends State<RelationDesigner> {
     required String localColumn,
     required ErTable refTable,
     required String refColumn,
+    bool allowUniqueIndexFix = true,
   }) async {
     if (refTable.columns.isEmpty) return;
     // 0) 前置条件校验：不满足就在本地报错，不发 SQL。
@@ -1134,6 +1342,30 @@ class RelationDesignerState extends State<RelationDesigner> {
       refUniqueColumns: _uniqueColumns[refTable.name] ?? const <String>{},
     );
     if (issue != null) {
+      // 第 62 轮：引用列不是唯一键时，先查数据是否全唯一，能就地补 UNIQUE 索引。
+      if (issue.kind == ErFkIssueKind.refColumnNotUnique) {
+        if (!allowUniqueIndexFix) {
+          await _showBlocked(issue);
+          return;
+        }
+        final fixed = await _offerUniqueIndexFix(
+          localTable: localTable,
+          localColumn: localColumn,
+          refTable: refTable,
+          refColumn: refColumn,
+        );
+        if (!mounted || !fixed) return;
+        // 索引已建好且结构已刷新：重新走一遍流程（引用列保持不变）。
+        final refreshed = _tableNamed(refTable.name) ?? refTable;
+        await _beginCreateForeignKey(
+          localTable: localTable,
+          localColumn: localColumn,
+          refTable: refreshed,
+          refColumn: refColumn,
+          allowUniqueIndexFix: false,
+        );
+        return;
+      }
       await _showBlocked(issue);
       return;
     }
@@ -1328,6 +1560,8 @@ class RelationDesignerState extends State<RelationDesigner> {
       );
     }
     await _reloadTable(localTable);
+    // 第 62 轮：创建成功后「当前数据库还没有外键」的提示不再成立。
+    _clearNoForeignKeyNotice();
   }
 
   /// 第 61 轮：新建外键前查孤儿行（仅单列直接外键）。
@@ -1467,6 +1701,20 @@ class RelationDesignerState extends State<RelationDesigner> {
     return result == true;
   }
 
+  /// 测试入口：模拟「当前数据库还没有外键」的自动带入提示（真实环境由
+  /// _loadInitial/_expandRelated 设置；本测试库有其它表的外键，无法自然出现）。
+  @visibleForTesting
+  void showNoForeignKeyNoticeForTest() {
+    _applyAutoIncludeNotice(
+      autoIncludeNotice(
+        addedCount: 0,
+        hasAnyForeignKey: false,
+        reachedLimit: false,
+        maxTables: widget.maxTables,
+      ),
+    );
+  }
+
   /// 测试入口：等价于从连接点拖出「新建外键关系」弹窗（第 61 轮）。
   @visibleForTesting
   Future<void> openNewForeignKeyForTest({
@@ -1600,6 +1848,8 @@ class RelationDesignerState extends State<RelationDesigner> {
       _selectedRelationKey = null;
       _bumpGraph();
     });
+    // 第 62 轮：中间表自带两条外键，创建成功后清「还没有外键」提示。
+    _clearNoForeignKeyNotice();
   }
 
   Future<void> _openRelationDialog(ErRelation relation) async {
@@ -2510,14 +2760,26 @@ class RelationDesignerState extends State<RelationDesigner> {
                 });
               }
             },
+            // 第 62 轮：空白处可拖动视角（抓取/拖拽光标；节点自身光标优先）。
+            cursor: _panningCanvas
+                ? SystemMouseCursors.grabbing
+                : SystemMouseCursors.grab,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
+              // 第 62 轮：空白处按住拖动 = 平移视角（节点/连线手势优先）。
+              onPanStart: _canvasPanStart,
+              onPanUpdate: _canvasPanUpdate,
+              onPanEnd: (_) => _canvasPanEnd(),
+              onPanCancel: _canvasPanEnd,
               onTapUp: (details) => _handleCanvasTap(
                 details.localPosition,
                 curves,
                 suggestionCurves,
               ),
-              child: Stack(
+              // 拖动时禁用文本选择（当前画布没有可选文本，防御以后加
+              // SelectableText 时拖动会误选）。
+              child: SelectionContainer.disabled(
+                child: Stack(
                 key: const ValueKey('er-canvas-stack'),
                 clipBehavior: Clip.none,
                 children: <Widget>[
@@ -2551,20 +2813,61 @@ class RelationDesignerState extends State<RelationDesigner> {
                   for (final curve in suggestionCurves) _suggestionLabel(curve),
                 ],
               ),
+              ),
             ),
           ),
         );
         const locked = NeverScrollableScrollPhysics();
+        // 第 62 轮：两个轴的控制器由背景拖动直接 jumpTo（clamp 到 maxExtent）。
         return SingleChildScrollView(
+          controller: _canvasHorizontal,
           scrollDirection: Axis.horizontal,
           physics: _dragLocked ? locked : null,
           child: SingleChildScrollView(
+            controller: _canvasVertical,
             physics: _dragLocked ? locked : null,
             child: canvas,
           ),
         );
       },
     );
+  }
+
+  /// 背景拖动开始：节点/连线拖动优先，空白处才平移视角。
+  ///
+  /// 节点拖动用的是 Listener（不走手势竞技场），这里用 [_draggingNode]/_drag/
+  /// _dotPressed 判断「正在拖节点/连线」，避免视角和节点一起动。
+  void _canvasPanStart(DragStartDetails details) {
+    if (_dragLocked) return;
+    setState(() => _panningCanvas = true);
+  }
+
+  void _canvasPanUpdate(DragUpdateDetails details) {
+    if (!_panningCanvas) return;
+    _scrollCanvasBy(Offset(-details.delta.dx, -details.delta.dy));
+  }
+
+  void _canvasPanEnd() {
+    if (_panningCanvas && mounted) {
+      setState(() => _panningCanvas = false);
+    }
+  }
+
+  void _scrollCanvasBy(Offset delta) {
+    void apply(ScrollController controller, double amount) {
+      if (!controller.hasClients) return;
+      final position = controller.position;
+      final next = (position.pixels + amount).clamp(
+        0.0,
+        position.maxScrollExtent,
+      );
+      if ((next - position.pixels).abs() > 0.01) {
+        controller.jumpTo(next);
+      }
+    }
+
+    apply(_canvasHorizontal, delta.dx);
+    apply(_canvasVertical, delta.dy);
   }
 
   Widget _node(ErTable table) {

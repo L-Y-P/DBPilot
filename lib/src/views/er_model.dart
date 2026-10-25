@@ -2710,3 +2710,229 @@ class FkCreationFailureException implements Exception {
   @override
   String toString() => message;
 }
+
+// ------------------------------------------- 引用列唯一性 / 一键建唯一索引
+// 第 62 轮：MySQL 8.4 要求被引用列必须有 UNIQUE 键（Missing unique key 6125），
+// MariaDB/旧版只要求普通索引。用户真实场景：学生名单.学号 30 个值全唯一但没有
+// 唯一索引，本地校验据此阻止。这里放「查唯一性 → 解释 → 生成索引名」的纯逻辑。
+
+/// 一个重复值及其出现次数。
+class ErDuplicateValue {
+  const ErDuplicateValue(this.value, this.count);
+
+  final String value;
+  final int count;
+}
+
+/// 引用列的唯一性：非空行数 / 不同值数 /（可选）重复值示例。
+class ErColumnUniqueness {
+  const ErColumnUniqueness({
+    required this.total,
+    required this.distinct,
+    this.duplicates = const <ErDuplicateValue>[],
+  });
+
+  /// COUNT(column)：非空行数。
+  final int total;
+
+  /// COUNT(DISTINCT column)：不同值数。
+  final int distinct;
+
+  /// 出现次数 > 1 的值（前几个），只在有重复时查询。
+  final List<ErDuplicateValue> duplicates;
+
+  /// 不同值覆盖全部非空值（空列 0/0 也算，可以直接建 UNIQUE 索引）。
+  bool get isUnique => distinct >= total;
+
+  /// 重复导致的多余行数（total - distinct）。
+  int get duplicateRowCount => total - distinct;
+
+  /// 是否确实有重复值（total > distinct）。
+  bool get hasDuplicates => total > distinct;
+}
+
+/// 引用列唯一性查询：一次拿到非空行数与不同值数。
+String erColumnUniquenessSql({
+  required ErDriver driver,
+  required String table,
+  required String column,
+}) {
+  final target = quoteIdentForDriver(driver, table);
+  final col = quoteIdentForDriver(driver, column);
+  // 别名不能用 MySQL 保留字（第 62 轮 GUI 抽测：AS distinct 在 MySQL 8.4 报
+  // 1064，查询失败被静默吞掉后误显示「该列没有非空值」）。
+  return 'SELECT COUNT($col) AS total_count, '
+      'COUNT(DISTINCT $col) AS distinct_count FROM $target';
+}
+
+/// 重复值示例查询（前 [limit] 个，按出现次数降序）。
+String erDuplicateValuesSql({
+  required ErDriver driver,
+  required String table,
+  required String column,
+  int limit = 3,
+}) {
+  final target = quoteIdentForDriver(driver, table);
+  final col = quoteIdentForDriver(driver, column);
+  return 'SELECT $col, COUNT(*) AS cnt FROM $target '
+      'WHERE $col IS NOT NULL GROUP BY $col HAVING COUNT(*) > 1 '
+      'ORDER BY cnt DESC LIMIT $limit';
+}
+
+/// Api.query 的返回里是否带语句错误 / 整体失败（不抛异常的失败路径）。
+///
+/// 真实 DB 的语法错误（如第 62 轮的 `AS distinct` 1064）会作为 results[].error
+/// 返回而不抛异常；调用方必须先判失败，否则会把「查不到」误当成「0 行/0 个值」。
+bool erQueryPayloadFailed(Map<String, dynamic> payload) {
+  final failed = payload['failed'];
+  if (failed is num && failed > 0) return true;
+  final results = payload['results'];
+  if (results is List) {
+    if (results.isEmpty) return true;
+    for (final result in results) {
+      if (result is Map && result['error'] != null) return true;
+    }
+  }
+  return false;
+}
+
+/// 解析唯一性查询；null = 查询失败或没有可用结果。
+///
+/// 调用方必须降级为原来的「目标列不是唯一键」提示，不能传 0/0 给文案（那会
+/// 错误显示「该列没有非空值」这种假事实）。
+ErColumnUniqueness? parseErColumnUniquenessResult(
+  Map<String, dynamic> payload,
+) {
+  if (erQueryPayloadFailed(payload)) return null;
+  final rows = _fkQueryRows(payload);
+  if (rows.isEmpty || rows.first.length < 2) return null;
+  return parseErColumnUniqueness(payload);
+}
+
+/// 解析唯一性查询的第一行（total_count, distinct_count，按 SELECT 顺序）。
+/// 容忍 results/rows 与 Map 行；查询失败请先用 [parseErColumnUniquenessResult]。
+ErColumnUniqueness parseErColumnUniqueness(Map<String, dynamic> payload) {
+  final rows = _fkQueryRows(payload);
+  if (rows.isEmpty) return const ErColumnUniqueness(total: 0, distinct: 0);
+  final row = rows.first;
+  int read(int index) {
+    Object? value;
+    if (index < row.length) value = row[index];
+    if (value is num) return value.toInt();
+    return int.tryParse(erStringOf(value).trim()) ?? 0;
+  }
+
+  return ErColumnUniqueness(total: read(0), distinct: read(1));
+}
+
+/// 解析重复值查询（value, count）。
+List<ErDuplicateValue> parseErDuplicateValues(Map<String, dynamic> payload) {
+  final out = <ErDuplicateValue>[];
+  for (final row in _fkQueryRows(payload)) {
+    if (row.isEmpty || row.first == null) continue;
+    final value = erStringOf(row.first).trim();
+    if (value.isEmpty) continue;
+    final count = row.length > 1 ? row[1] : null;
+    final parsed = count is num
+        ? count.toInt()
+        : int.tryParse(erStringOf(count).trim()) ?? 0;
+    out.add(ErDuplicateValue(value, parsed));
+  }
+  return out;
+}
+
+/// 已有索引名（structure/builderSchema 的 indexes 行）。
+List<String> erIndexNamesOf(Object? indexes) => <String>[
+      for (final row in erRowsOf(indexes))
+        if (erStringOf(row['INDEX_NAME'] ?? row['name']).isNotEmpty)
+          erStringOf(row['INDEX_NAME'] ?? row['name']),
+    ];
+
+/// 生成不冲突的 UNIQUE 索引名：uk_<列名>，冲突时追加 _2、_3……
+///
+/// 保留字母/数字/下划线与中日韩文字（MySQL 等都允许），其余字符替换成下划线；
+/// 长度限制 60（给后缀留余量）。
+String uniqueIndexNameFor(String column, Set<String> existingNames) {
+  var base = column.trim();
+  if (base.isEmpty) base = 'col';
+  base = base.replaceAll(RegExp(r'[^0-9A-Za-z_\u3400-\u9fff]'), '_');
+  final taken = <String>{
+    for (final name in existingNames) name.trim().toLowerCase(),
+  };
+  var candidate = 'uk_$base';
+  if (candidate.length > 60) candidate = candidate.substring(0, 60);
+  if (!taken.contains(candidate.toLowerCase())) return candidate;
+  for (var suffix = 2; suffix < 1000; suffix++) {
+    final tail = '_$suffix';
+    var head = 'uk_$base';
+    final maxHead = 60 - tail.length;
+    if (head.length > maxHead) head = head.substring(0, maxHead);
+    candidate = '$head$tail';
+    if (!taken.contains(candidate.toLowerCase())) return candidate;
+  }
+  return candidate;
+}
+
+/// 「全唯一 → 可以建 UNIQUE 索引再引用」的说明（中英双语）。
+String erUniqueIndexSuggestionMessage(
+  ErColumnUniqueness uniqueness, {
+  required String refTable,
+  required String refColumn,
+}) {
+  final qualified = '$refTable.$refColumn';
+  final detail = uniqueness.total == 0
+      ? pickText(
+          '该列目前没有非空值，可以直接创建 UNIQUE 索引后再引用。',
+          'The column has no non-null values yet; you can add a UNIQUE index '
+              'and reference it.',
+        )
+      : pickText(
+          '该列共 ${uniqueness.total} 个非空值，其中 ${uniqueness.distinct} 个'
+              '不同值——数据全部唯一，可以创建 UNIQUE 索引后再引用。',
+          'The column has ${uniqueness.total} non-null values and '
+              '${uniqueness.distinct} distinct values — all unique, so a UNIQUE '
+              'index can be added and the column referenced.',
+        );
+  return pickText(
+    '目标列「$qualified」不是唯一键。$detail\n'
+        'MySQL 8.4 要求被引用列必须有唯一键；phpMyAdmin web 上能建通常是因为'
+        '服务器是 MariaDB/旧版 MySQL，或该列已经有索引。',
+    'The target column "$qualified" is not unique. $detail\n'
+        'MySQL 8.4 requires a UNIQUE key on the referenced column; it may work '
+        'in phpMyAdmin web because the server is MariaDB/older MySQL, or that '
+        'column already has an index.',
+  );
+}
+
+/// 「有重复值 → 先清理或改选主键列」的说明（中英双语）；不提供自动 DDL。
+String erRefColumnDuplicateMessage(
+  ErColumnUniqueness uniqueness, {
+  required String refTable,
+  required String refColumn,
+}) {
+  final qualified = '$refTable.$refColumn';
+  final examples = <String>[
+    for (final value in uniqueness.duplicates)
+      pickText(
+        '「${value.value}」出现 ${value.count} 次',
+        '"${value.value}" appears ${value.count} times',
+      ),
+  ];
+  final exampleText = examples.isEmpty
+      ? ''
+      : pickText(
+          '；例如 ${examples.join('、')}',
+          '; e.g. ${examples.join(', ')}',
+        );
+  return pickText(
+    '目标列「$qualified」不是唯一键：共 ${uniqueness.total} 行非空，只有 '
+        '${uniqueness.distinct} 个不同值（重复 ${uniqueness.duplicateRowCount} 行）'
+        '$exampleText。\n'
+        '请先清理重复值，或改选主键列后再建外键；这里不会自动创建索引。',
+    'The target column "$qualified" is not unique: ${uniqueness.total} non-null '
+        'rows but only ${uniqueness.distinct} distinct values '
+        '(${uniqueness.duplicateRowCount} duplicate row(s))$exampleText.\n'
+        'Clean up the duplicates first, or reference a primary-key column; no '
+        'index is created automatically.',
+  );
+}

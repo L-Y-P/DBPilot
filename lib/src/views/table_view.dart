@@ -314,11 +314,51 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   int _page = 1;
   int _perPage = 25;
 
-  /// 当前页批量编辑里尚未保存的单元格改动（由 DataGrid.onDirtyChanges 上报）。
+  /// 跨页暂存的批量编辑：行键（[rowChangeKeyFor]）→ 列名 → 单元格编辑。
   ///
-  /// 翻页 / 改每页条数 / 刷新 / 切页签 / 切表前都先用 [_confirmLeaveDirty]
-  /// 询问「取消 / 放弃 / 保存后继续」，避免未保存的编辑被静默丢弃（第 57 轮）。
-  List<DirtyCell> _stagedEdits = <DirtyCell>[];
+  /// 第 59 轮：翻页 / 排序 / 筛选 / 改每页条数不再丢弃这些编辑 —— DataGrid 按
+  /// 行键把当前页的编辑恢复出来，保存时把所有页合并成一条 applyRowChanges
+  /// 事务。切页签 / 切表仍然要确认（跨表暂存不安全），刷新也保留确认。
+  final Map<String, Map<String, DirtyCell>> _stagedEditsByKey =
+      <String, Map<String, DirtyCell>>{};
+
+  /// 所有页加起来的暂存编辑数（表格工具栏 /「未保存 N 处」用）。
+  int get _stagedEditCount => _stagedEditsByKey.values.fold<int>(
+        0,
+        (sum, row) => sum + row.length,
+      );
+
+  /// 当前完整的跨页暂存 map，交给 DataGrid 按行键恢复当前页的着色与计数。
+  Map<String, List<DirtyCell>> get _initialDirtyByKey => <String, List<DirtyCell>>{
+        for (final entry in _stagedEditsByKey.entries)
+          if (entry.value.isNotEmpty) entry.key: entry.value.values.toList(),
+      };
+
+  /// 把一批带 keys 的编辑并入跨页 map（没有 keys 的旧编辑按当前行推断）。
+  void _mergeStagedEdits(Iterable<DirtyCell> edits) {
+    for (final edit in edits) {
+      var keys = edit.keys;
+      if (keys == null) {
+        final rows = _rows;
+        if (edit.rowIndex < 0 || edit.rowIndex >= rows.length) continue;
+        keys = rowChangeKeys(
+          columns: _columns,
+          row: rows[edit.rowIndex],
+          primaryKey: _primaryKey,
+        );
+      }
+      if (keys.isEmpty) continue;
+      final key = rowChangeKeyFor(keys);
+      (_stagedEditsByKey[key] ??= <String, DirtyCell>{})[edit.column] =
+          DirtyCell(
+        rowIndex: edit.rowIndex,
+        column: edit.column,
+        value: edit.value,
+        isNull: edit.isNull,
+        keys: keys,
+      );
+    }
+  }
 
   /// Keyset cursors, one per loaded page.
   ///
@@ -434,13 +474,15 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       // build 期间，不能直接弹框/setState，所以 postFrame 里先问「放弃 / 保存到
       // 原表」再 reload 新表。限制：如果父组件给 TableView 加了 key（导致 State
       // 被销毁）就没有机会提示，只能寄望于翻页/页签守卫。
-      if (_stagedEdits.isNotEmpty) {
-        final edits = List<DirtyCell>.of(_stagedEdits);
+      if (_stagedEditCount > 0) {
+        final edits = <DirtyCell>[
+          for (final row in _stagedEditsByKey.values) ...row.values,
+        ];
         final oldDb = oldWidget.db;
         final oldTable = oldWidget.table;
-        // 此刻 _data 还是原表的数据，把原表的行列快照一起带进 postFrame。
+        // 此刻 _data 还是原表的数据，把原表的列/主键快照带进 postFrame；
+        // 行键已在编辑暂存时捕获，跨页保存不再需要旧 rows。
         final oldColumns = _columns;
-        final oldRows = _rows;
         final oldPrimaryKey = _primaryKey;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
@@ -448,7 +490,6 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
             oldDb,
             oldTable,
             oldColumns,
-            oldRows,
             oldPrimaryKey,
             edits,
           );
@@ -464,7 +505,6 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     String oldDb,
     String oldTable,
     List<Json> oldColumns,
-    List<List<dynamic>> oldRows,
     List<String> oldPrimaryKey,
     List<DirtyCell> edits,
   ) async {
@@ -480,7 +520,6 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
         oldDb,
         oldTable,
         oldColumns,
-        oldRows,
         oldPrimaryKey,
         edits,
       );
@@ -498,7 +537,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
         saveFailed = true;
       }
     }
-    _stagedEdits = <DirtyCell>[];
+    _stagedEditsByKey.clear();
     await _reloadAll();
     if (saveFailed && mounted) {
       widget.notice.show(
@@ -711,11 +750,24 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// number from whenever the table was last counted (round34 P2-01).
   Future<void> _reloadAfterWrite() => _loadData(refreshCount: true);
 
-  /// DataGrid 的暂存编辑变更回调（第 57 轮）。
+  /// DataGrid 的暂存编辑变更回调（第 57/59 轮）。
+  ///
+  /// DataGrid 上报的是**当前页**的全部暂存编辑（含行键）：先把这一页的行键从
+  /// 跨页 map 中移除，再并入上报的编辑。其它页的编辑原样保留。
   void _onDirtyChanges(List<DirtyCell> edits) {
     if (!mounted) return;
+    final pageKeys = <String>{
+      for (final row in _rows)
+        rowChangeKey(
+          columns: _columns,
+          row: row,
+          primaryKey: _primaryKey,
+        ),
+    }..remove('');
+    _stagedEditsByKey.removeWhere((key, _) => pageKeys.contains(key));
+    _mergeStagedEdits(edits);
     // DataGrid 只在事件处理或 postFrame 里回调，这里 setState 是安全的。
-    setState(() => _stagedEdits = List<DirtyCell>.of(edits));
+    setState(() {});
   }
 
   /// 离开当前页 / 当前批次前的未保存批量编辑确认。
@@ -724,9 +776,8 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// 用户取消或保存失败，调用方必须停留。保存走既有 [_applyDirtyEdits]（单事务、
   /// 自带 reload），失败时错误横幅已经显示。
   Future<bool> _confirmLeaveDirty() async {
-    if (_stagedEdits.isEmpty) return true;
-    final edits = List<DirtyCell>.of(_stagedEdits);
-    final count = edits.length;
+    final count = _stagedEditCount;
+    if (count == 0) return true;
     final choice = await showAppModal<int>(
       context: context,
       title: pickText('有未保存的修改', 'Unsaved changes'),
@@ -737,11 +788,11 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           children: [
             Text(
               pickText(
-                '当前页有 $count 处批量编辑还没保存。继续操作会离开当前页，这些'
-                    '修改会丢失；也可以先保存再继续。',
-                'This page has $count unsaved batch edit(s). Continuing leaves '
-                    'this page and discards them; you can also save first and then '
-                    'continue.',
+                '有 $count 处批量编辑还没保存（可能分布在多页）。继续操作会丢弃'
+                    '这些修改；也可以先保存再继续。',
+                'There are $count unsaved batch edit(s), possibly across several '
+                    'pages. Continuing discards them; you can also save first and '
+                    'then continue.',
               ),
               style: kSmall,
             ),
@@ -785,39 +836,41 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     if (!mounted) return false;
     switch (choice) {
       case 1:
-        // 放弃：清掉本地记录。DataGrid 的内部暂存会在随后的 reload / 切页签
-        // 卸载时被替换或丢弃。
-        _stagedEdits = <DirtyCell>[];
+        // 放弃：清掉所有页的暂存记录。DataGrid 的内部暂存会在随后的 reload /
+        // 切页签卸载时被替换或丢弃。
+        _stagedEditsByKey.clear();
         setState(() {});
         return true;
       case 2:
-        final saved = await _applyDirtyEdits(edits);
+        final saved = await _applyDirtyEdits(const <DirtyCell>[]);
         if (!mounted) return false;
         if (!saved) return false; // 保存失败：留在当前页，错误横幅已显示
-        _stagedEdits = <DirtyCell>[];
+        _stagedEditsByKey.clear();
         return true;
       default:
         return false;
     }
   }
 
-  // ---------- 第 57 轮：会 reload / 换页的入口统一先过 _confirmLeaveDirty ----------
+  // ---- 第 59 轮：翻页/排序/筛选只换数据、不丢暂存编辑（按行键跨页保留） ----
+  // 只有「切页签 / 切表」（跨表暂存不安全）和「刷新」（外部数据可能已变）
+  // 仍然过 _confirmLeaveDirty。
 
   Future<void> _goToPage(int target) async {
-    if (!await _confirmLeaveDirty()) return;
     if (!mounted) return;
     setState(() => _page = target);
     await _loadData();
   }
 
   Future<void> _refreshData() async {
+    // 刷新会重新拉当前页数据；暂存编辑按行键还在，但外部可能已经删/改了行，
+    // 所以仍保留第 57 轮的确认。
     if (!await _confirmLeaveDirty()) return;
     if (!mounted) return;
     await _loadData(refreshCount: true);
   }
 
   Future<void> _applyWhere() async {
-    if (!await _confirmLeaveDirty()) return;
     if (!mounted) return;
     setState(() => _page = 1);
     await _loadData();
@@ -825,7 +878,6 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
 
   Future<void> _clearWhere() async {
     if (_where.text.isEmpty) return;
-    if (!await _confirmLeaveDirty()) return;
     if (!mounted) return;
     _where.text = '';
     setState(() => _page = 1);
@@ -933,8 +985,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   }
 
   Future<void> _onSort(String column, bool additive) async {
-    // 排序会 reload 当前页，未保存的批量编辑会随 rows 替换被清掉。
-    if (!await _confirmLeaveDirty()) return;
+    // 第 59 轮：排序只换页面数据，暂存编辑按行键保留，不再要求丢弃。
     if (!mounted) return;
     setState(() {
       final existing = _sorts.indexWhere((s) => s.column == column);
@@ -958,7 +1009,7 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
   /// Build a WHERE clause from the DataGrid filter row, quoting identifiers
   /// for the active driver exactly like the web filtersToWhere().
   Future<void> _onFilters(List<GridFilter> filters) async {
-    if (!await _confirmLeaveDirty()) return;
+    // 第 59 轮：筛选同排序，编辑按行键保留。
     if (!mounted) return;
     final q = AppState.instance.quoteIdent;
     final conditions = <String>[];
@@ -1168,7 +1219,6 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                     onChanged: (v) async {
                       final next = v ?? 25;
                       if (next == _perPage) return;
-                      if (!await _confirmLeaveDirty()) return;
                       if (!mounted) return;
                       setState(() {
                         _perPage = next;
@@ -1189,11 +1239,11 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
                   // otherwise the pill keeps the pre-refresh number and only
                   // walking back to page 1 updates it.
                   Btn(t('refresh'), onPressed: _refreshData),
-                  if (_stagedEdits.isNotEmpty)
+                  if (_stagedEditCount > 0)
                     Pill(
                       pickText(
-                        '未保存 ${_stagedEdits.length} 处',
-                        '${_stagedEdits.length} unsaved edit(s)',
+                        '未保存 $_stagedEditCount 处',
+                        '$_stagedEditCount unsaved edit(s)',
                       ),
                       tone: PillTone.warn,
                     ),
@@ -1225,6 +1275,8 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           onSaveCell: _saveCell,
           onApplyEdits: _applyDirtyEdits,
           onDirtyChanges: _onDirtyChanges,
+          initialDirtyByKey: _initialDirtyByKey,
+          totalDirtyCount: _stagedEditCount,
         ),
         const SizedBox(height: 8),
         _pager(),
@@ -1282,25 +1334,20 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     return keys;
   }
 
-  /// Save every staged cell edit of the current page in **one transaction**.
+  /// 把一批带行键的单元格编辑写到显式的 db/table（切表保存到原表也复用它）。
   ///
-  /// Unlike [_saveCell] (one immediate UPDATE per cell), the grid stages edits
-  /// and hands them over together; the Rust side validates all of them before
-  /// opening the transaction and rolls the whole batch back on the first error.
-  /// 把一批单元格编辑写到显式的 db/table（切表保存到原表也复用它）。
-  ///
-  /// 返回实际影响的行数；失败返回 null，并在页面错误横幅里显示原因。
+  /// 第 59 轮改用 [buildRowChangesFromKeys]：编辑可能来自多个页，行键在暂存时
+  /// 已捕获，不再依赖当前页的 rows。返回实际影响的行数；失败返回 null，并在
+  /// 页面错误横幅里显示原因。
   Future<int?> _saveBatchEdits(
     String db,
     String table,
     List<Json> columns,
-    List<List<dynamic>> rows,
     List<String> primaryKey,
     List<DirtyCell> edits,
   ) async {
-    final changes = buildRowChanges(
+    final changes = buildRowChangesFromKeys(
       columns: columns,
-      rows: rows,
       primaryKey: primaryKey,
       edits: edits,
     );
@@ -1313,17 +1360,30 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
     }
   }
 
+  /// Save every staged edit of every page in **one transaction**.
+  ///
+  /// Unlike [_saveCell] (one immediate UPDATE per cell), the grid stages edits
+  /// and the Rust side validates all of them before opening the transaction and
+  /// rolls the whole batch back on the first error. [edits] is the current
+  /// page's list from DataGrid (used to refresh the cross-page map); the
+  /// authoritative batch is [_stagedEditsByKey], so edits staged on other pages
+  /// are included too.
   Future<bool> _applyDirtyEdits(List<DirtyCell> edits) async {
+    _mergeStagedEdits(edits);
+    final all = <DirtyCell>[
+      for (final row in _stagedEditsByKey.values) ...row.values,
+    ];
+    if (all.isEmpty) return true;
     final applied = await _saveBatchEdits(
       widget.db,
       widget.table,
       _columns,
-      _rows,
       _primaryKey,
-      edits,
+      all,
     );
     if (applied == null) return false;
     widget.notice.show('已保存 $applied 行');
+    _stagedEditsByKey.clear();
     await _reloadAfterWrite();
     return true;
   }

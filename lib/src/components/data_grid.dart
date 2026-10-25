@@ -78,6 +78,8 @@ class DataGrid extends StatefulWidget {
     this.onSaveCell,
     this.onApplyEdits,
     this.onDirtyChanges,
+    this.initialDirtyByKey,
+    this.totalDirtyCount,
     this.exportActions,
   });
 
@@ -112,6 +114,22 @@ class DataGrid extends StatefulWidget {
   /// after "撤销改动" (empty), and after a rows replacement cleared stale edits
   /// (empty, one frame later because it happens during didUpdateWidget).
   final void Function(List<DirtyCell> edits)? onDirtyChanges;
+
+  /// Host-owned staged edits for the **whole table**, keyed by
+  /// [rowChangeKeyFor]（第 59 轮：跨页保持）.
+  ///
+  /// When non-null the grid is in "controlled" mode: after a page/sort/filter
+  /// change it rebuilds its page-level dirty state from this map (matching rows
+  /// by their row key) instead of clearing the staged edits. The host keeps the
+  /// map authoritative and refreshes it from [onDirtyChanges].
+  final Map<String, List<DirtyCell>>? initialDirtyByKey;
+
+  /// Total number of staged edits across every page (host-managed).
+  ///
+  /// When it is larger than this page's edits the toolbar still offers
+  /// 「保存全部改动」, labelled with this count, so a batch staged on another
+  /// page can be saved from here.
+  final int? totalDirtyCount;
 
   /// Optional replacement for the built-in "导出 CSV / 导出 JSON" buttons.
   ///
@@ -172,6 +190,7 @@ class _DataGridState extends State<DataGrid> {
   void initState() {
     super.initState();
     _filters = List.generate(widget.columns.length, (_) => GridFilter());
+    _restoreDirtyFromInitial();
     _horizontal.addListener(_onHorizontalScroll);
     _syncPerfSettings();
     AppState.instance.addListener(_onAppStateChanged);
@@ -222,15 +241,55 @@ class _DataGridState extends State<DataGrid> {
     if (oldWidget.columns.length != widget.columns.length) {
       _filters = List.generate(widget.columns.length, (_) => GridFilter());
     }
-    if (_rowsReplaced(oldWidget.rows, widget.rows)) {
-      _selected.clear();
-      // A reload / page flip replaces the rendered rows: staged edits index into
-      // the old list, so keeping them would write to the wrong row.
+    final rowsReplaced = _rowsReplaced(oldWidget.rows, widget.rows);
+    if (rowsReplaced) _selected.clear();
+    if (widget.initialDirtyByKey != null) {
+      // Controlled mode (第 59 轮): the host owns the cross-page batch, so a page
+      // flip restores this page's edits by row key instead of dropping them.
+      _restoreDirtyFromInitial();
+    } else if (rowsReplaced) {
+      // Legacy mode: staged edits index into the old list, so keeping them
+      // would write to the wrong row.
       final hadDirtyEdits = _dirtyCells.isNotEmpty;
       _dirtyCells.clear();
       // didUpdateWidget runs during build: the host's callback normally calls
       // setState, which must wait for the next frame.
       if (hadDirtyEdits) _notifyDirtyChanges(postFrame: true);
+    }
+  }
+
+  /// Rebuild this page's dirty state from [DataGrid.initialDirtyByKey].
+  ///
+  /// Rows are matched by their captured row key, so edits staged on another
+  /// page are harmless (they simply do not match here) and the same row after a
+  /// sort/filter still shows its staged cells. The [DirtyCell.rowIndex] is
+  /// rewritten to the current row position.
+  void _restoreDirtyFromInitial() {
+    final initial = widget.initialDirtyByKey;
+    if (initial == null) return;
+    _dirtyCells.clear();
+    if (initial.isEmpty) return;
+    final columnNames = _columnNames.toSet();
+    for (var index = 0; index < widget.rows.length; index++) {
+      final key = rowChangeKey(
+        columns: widget.columns,
+        row: widget.rows[index],
+        primaryKey: widget.primaryKey,
+      );
+      final edits = initial[key];
+      if (edits == null || edits.isEmpty) continue;
+      final row = <String, DirtyCell>{};
+      for (final edit in edits) {
+        if (!columnNames.contains(edit.column)) continue;
+        row[edit.column] = DirtyCell(
+          rowIndex: index,
+          column: edit.column,
+          value: edit.value,
+          isNull: edit.isNull,
+          keys: edit.keys,
+        );
+      }
+      if (row.isNotEmpty) _dirtyCells[index] = row;
     }
   }
 
@@ -290,8 +349,12 @@ class _DataGridState extends State<DataGrid> {
   /// reloads the rows on success), so this only manages the local staged state.
   Future<void> _applyDirtyEdits() async {
     final apply = widget.onApplyEdits;
+    if (apply == null) return;
     final edits = _dirtyEdits;
-    if (apply == null || edits.isEmpty) return;
+    // Controlled mode: the host may hold edits from other pages while this page
+    // has none; still hand over the (possibly empty) page edits so it can save
+    // the whole cross-page batch.
+    if (edits.isEmpty && (widget.totalDirtyCount ?? 0) == 0) return;
     final keepGoing = await apply(edits);
     if (!mounted) return;
     if (keepGoing) {
@@ -367,19 +430,23 @@ class _DataGridState extends State<DataGrid> {
                     : () => widget.onDeleteSelected?.call(_selected.toList())),
             Text('已选 ${_selected.length}', style: kSmallMuted),
           ],
-          if (widget.onApplyEdits != null && _dirtyCells.isNotEmpty) ...[
-            Btn('保存全部改动 (${_dirtyEdits.length})',
+          if (widget.onApplyEdits != null &&
+              (_dirtyCells.isNotEmpty || (widget.totalDirtyCount ?? 0) > 0)) ...[
+            Btn(
+                '保存全部改动 (${widget.totalDirtyCount ?? _dirtyEdits.length})',
                 key: const ValueKey('grid-apply-dirty'),
                 small: true,
                 primary: true,
                 onPressed: _applyDirtyEdits),
-            Btn('撤销改动',
-                key: const ValueKey('grid-discard-dirty'),
-                small: true,
-                onPressed: () {
-                  setState(_dirtyCells.clear);
-                  _notifyDirtyChanges();
-                }),
+            // 撤销只清当前页（跨页 map 由宿主按本页上报的 edits 删除本页键）。
+            if (_dirtyCells.isNotEmpty)
+              Btn('撤销改动',
+                  key: const ValueKey('grid-discard-dirty'),
+                  small: true,
+                  onPressed: () {
+                    setState(_dirtyCells.clear);
+                    _notifyDirtyChanges();
+                  }),
           ],
           const SizedBox(width: 12),
           Text('本页 ${widget.rows.length} 行', style: kSmallMuted),
@@ -1170,11 +1237,21 @@ class _DataGridState extends State<DataGrid> {
       if (widget.onApplyEdits != null) {
         // Batch mode: keep the edit in the grid until "保存全部改动".
         setState(() {
-          (_dirtyCells[rowIndex] ??= <String, DirtyCell>{})[column] = DirtyCell(
+          final row = _dirtyCells[rowIndex] ??= <String, DirtyCell>{};
+          final existing = row[column];
+          row[column] = DirtyCell(
             rowIndex: rowIndex,
             column: column,
             value: controller.text,
             isNull: isNull,
+            // 第 59 轮：捕获编辑前的原始行键。跨页恢复/保存都靠它定位行；
+            // 编辑主键列本身时也仍指向旧行的键。
+            keys: existing?.keys ??
+                rowChangeKeys(
+                  columns: widget.columns,
+                  row: widget.rows[rowIndex],
+                  primaryKey: widget.primaryKey,
+                ),
           );
         });
         _notifyDirtyChanges();

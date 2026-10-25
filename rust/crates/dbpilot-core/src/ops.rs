@@ -303,6 +303,190 @@ const RESTORE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// dump from materialising an unbounded result set.
 const RESTORE_MAX_ROWS: usize = 1_000_000;
 
+/// Largest dump that still runs as one transaction.
+///
+/// PostgreSQL must keep WAL/undo for the whole dump and holds locks until
+/// COMMIT, so restoring a multi-GB dump in one transaction is the classic
+/// "restore fills the disk / blocks everyone" failure. Above this size the
+/// backup path automatically falls back to the grouped (commit per run) restore
+/// — see [restore_atomic_eligible].
+pub const RESTORE_ATOMIC_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Strip leading whitespace and SQL comments so the keyword scan sees the real
+/// statement start.
+///
+/// Only the prefix is removed: words inside the statement body (string literals
+/// included) are never considered, so INSERT ... VALUES ('VACUUM') cannot look
+/// like a VACUUM statement.
+fn strip_leading_sql_noise(mut statement: &str) -> &str {
+    loop {
+        let trimmed = statement.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(index) => statement = &rest[index + 1..],
+                None => return "",
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(index) => statement = &rest[index + 2..],
+                None => return "",
+            }
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+/// Uppercase head words of one statement (comments stripped).
+///
+/// Only the first few words are examined, which is enough for the multi-word
+/// forms below and keeps a word inside a long string literal from matching.
+fn statement_head_words(statement: &str, max_words: usize) -> Vec<String> {
+    strip_leading_sql_noise(statement)
+        .split_whitespace()
+        .take(max_words)
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .to_ascii_uppercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// One statement form that cannot run inside a transaction, or None.
+///
+/// The list is deliberately prefix-based: VACUUM / CREATE DATABASE / ... are
+/// matched from the first word(s), and the CONCURRENTLY forms additionally
+/// require the statement kind (so COMMENT ON INDEX ... IS 'concurrently' is not
+/// mistaken for CREATE INDEX CONCURRENTLY).
+fn statement_atomic_blocker(statement: &str, driver_id: &str) -> Option<&'static str> {
+    let words = statement_head_words(statement, 12);
+    let first = words.first().map(String::as_str).unwrap_or("");
+    let second = words.get(1).map(String::as_str).unwrap_or("");
+    let has = |word: &str| words.iter().any(|candidate| candidate == word);
+    match driver_id {
+        "postgres" => {
+            if first == "VACUUM" {
+                return Some("VACUUM");
+            }
+            if first == "CREATE" && second == "DATABASE" {
+                return Some("CREATE DATABASE");
+            }
+            if first == "DROP" && second == "DATABASE" {
+                return Some("DROP DATABASE");
+            }
+            if first == "ALTER" && second == "SYSTEM" {
+                return Some("ALTER SYSTEM");
+            }
+            if first == "CREATE" && second == "TABLESPACE" {
+                return Some("CREATE TABLESPACE");
+            }
+            if first == "DROP" && second == "TABLESPACE" {
+                return Some("DROP TABLESPACE");
+            }
+            if first == "CREATE" && has("INDEX") && has("CONCURRENTLY") {
+                return Some("CREATE INDEX CONCURRENTLY");
+            }
+            if first == "DROP" && second == "INDEX" && has("CONCURRENTLY") {
+                return Some("DROP INDEX CONCURRENTLY");
+            }
+            if first == "REINDEX" && has("CONCURRENTLY") {
+                return Some("REINDEX CONCURRENTLY");
+            }
+            if first == "REFRESH" && second == "MATERIALIZED" && has("CONCURRENTLY") {
+                return Some("REFRESH MATERIALIZED VIEW CONCURRENTLY");
+            }
+            None
+        }
+        "sqlite" => {
+            if first == "VACUUM" {
+                return Some("VACUUM");
+            }
+            if first == "ATTACH" {
+                return Some("ATTACH");
+            }
+            if first == "DETACH" {
+                return Some("DETACH");
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Unique blocker labels for already-split dump statements, in first-seen order.
+pub fn restore_atomic_blockers(statements: &[String], driver_id: &str) -> Vec<String> {
+    let mut blockers: Vec<String> = Vec::new();
+    for statement in statements {
+        if let Some(label) = statement_atomic_blocker(statement, driver_id) {
+            if !blockers.iter().any(|existing| existing == label) {
+                blockers.push(label.to_string());
+            }
+        }
+    }
+    blockers
+}
+
+/// Human-readable MiB value: "256 MiB" for whole numbers, "320.5 MiB" otherwise.
+fn format_mib(bytes: usize) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let mib = bytes as f64 / MIB;
+    if (mib - mib.round()).abs() < 0.05 {
+        format!("{:.0} MiB", mib)
+    } else {
+        format!("{:.1} MiB", mib)
+    }
+}
+
+/// Why this dump cannot be restored atomically; None when it can.
+fn atomic_ineligible_reason(
+    driver_id: &str,
+    statements: &[String],
+    bytes: usize,
+) -> Option<String> {
+    if driver_id == "mysql" {
+        return Some(
+            "MySQL 的 DDL 会隐式提交，无法整段原子还原（改为分组提交，失败时可能留下部分数据）"
+                .to_string(),
+        );
+    }
+    let blockers = restore_atomic_blockers(statements, driver_id);
+    if !blockers.is_empty() {
+        let label = if driver_id == "postgres" {
+            "PostgreSQL"
+        } else {
+            "SQLite"
+        };
+        return Some(format!(
+            "还原脚本包含 {label} 不能在事务中执行的语句：{}（改为分组提交，失败时无法整体回滚）",
+            blockers.join("、")
+        ));
+    }
+    if bytes > RESTORE_ATOMIC_MAX_BYTES {
+        return Some(format!(
+            "备份约 {}，超过 {} 自动改用分组提交，失败时可能留下部分数据",
+            format_mib(bytes),
+            format_mib(RESTORE_ATOMIC_MAX_BYTES)
+        ));
+    }
+    None
+}
+
+/// Whether a whole dump can be restored in one transaction.
+///
+/// Returns the Chinese reason when it cannot: the dump contains a statement a
+/// transaction rejects (PostgreSQL VACUUM / CREATE INDEX CONCURRENTLY / ...,
+/// SQLite VACUUM / ATTACH / DETACH), it is larger than
+/// [RESTORE_ATOMIC_MAX_BYTES], or the driver is MySQL (DDL implicitly commits).
+/// The backup API shows the reason and falls back to [restore_sql] (grouped
+/// commits, partial data possible on failure).
+pub fn restore_atomic_eligible(driver_id: &str, sql: &str, bytes: usize) -> Result<(), String> {
+    match atomic_ineligible_reason(driver_id, &split_statements(sql), bytes) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
+}
+
 /// Outcome of [restore_sql] / [restore_sql_atomic].
 pub struct RestoreReport {
     /// One entry per executed dump statement, in dump order (same shape as
@@ -621,7 +805,11 @@ pub async fn restore_sql(
 ///   counts it, rolls back best-effort and stops.
 /// * if BEGIN itself is rejected (unusual proxy / driver), the old grouped path
 ///   runs instead and the report says atomic = false, so a dump that used to
-///   restore does not start failing outright.
+///   restore does not start failing outright;
+/// * if the dump contains a statement a transaction rejects (VACUUM,
+///   CREATE INDEX CONCURRENTLY, ...) or is larger than
+///   [RESTORE_ATOMIC_MAX_BYTES], the same grouped fallback is used (call
+///   [restore_atomic_eligible] first to get the user-facing reason).
 ///
 /// MySQL must keep using [restore_sql]: its DDL implicitly commits, so a
 /// whole-dump transaction is impossible there. A MySQL session handed to this
@@ -635,6 +823,12 @@ pub async fn restore_sql_atomic(
     }
     let statements = split_statements(sql);
     let total = statements.len();
+    // Transaction-illegal statements or an oversized dump: fall back to the
+    // grouped path so the restore still completes (the API reports why through
+    // restore_atomic_eligible).
+    if atomic_ineligible_reason(session.driver_id(), &statements, sql.len()).is_some() {
+        return restore_sql(session, sql).await;
+    }
     let tx = restore_tx_for(session.driver_id());
     let mut report = RestoreReport {
         results: Vec::with_capacity(total),
@@ -932,8 +1126,9 @@ pub(crate) async fn change_row<D: DatabaseDriver + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_transactional_restore_statement, restore_groups, restore_sql, restore_sql_atomic,
-        restore_tx_for, RestoreGroup, RESTORE_BATCH_BYTES, RESTORE_BATCH_STATEMENTS,
+        is_transactional_restore_statement, restore_atomic_blockers, restore_atomic_eligible,
+        restore_groups, restore_sql, restore_sql_atomic, restore_tx_for, split_statements,
+        RestoreGroup, RESTORE_ATOMIC_MAX_BYTES, RESTORE_BATCH_BYTES, RESTORE_BATCH_STATEMENTS,
     };
     use crate::db::ResultSet;
     use crate::session::SessionHandle;
@@ -1285,6 +1480,157 @@ mod tests {
         assert_eq!(report.transaction_batches, 1);
         assert_eq!(report.statements_in_transactions, 2);
         assert!(session.executed().contains(&"COMMIT"));
+    }
+
+    // ------------------------------------------------ atomic fallback (round 59)
+
+    fn blockers_for(driver: &str, sql: &str) -> Vec<String> {
+        restore_atomic_blockers(&split_statements(sql), driver)
+    }
+
+    #[test]
+    fn postgres_transaction_illegal_statements_are_detected() {
+        for (sql, expected) in [
+            ("VACUUM t", "VACUUM"),
+            ("vacuum (full, analyze) t", "VACUUM"),
+            ("CREATE DATABASE app", "CREATE DATABASE"),
+            ("drop database if exists app", "DROP DATABASE"),
+            ("CREATE TABLESPACE ts LOCATION '/data'", "CREATE TABLESPACE"),
+            ("DROP TABLESPACE ts", "DROP TABLESPACE"),
+            ("ALTER SYSTEM SET work_mem = '1GB'", "ALTER SYSTEM"),
+            ("CREATE INDEX CONCURRENTLY idx ON t (c)", "CREATE INDEX CONCURRENTLY"),
+            ("CREATE UNIQUE INDEX CONCURRENTLY idx ON t (c)", "CREATE INDEX CONCURRENTLY"),
+            ("DROP INDEX CONCURRENTLY idx", "DROP INDEX CONCURRENTLY"),
+            ("REINDEX TABLE CONCURRENTLY t", "REINDEX CONCURRENTLY"),
+            (
+                "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+                "REFRESH MATERIALIZED VIEW CONCURRENTLY",
+            ),
+        ] {
+            assert_eq!(
+                blockers_for("postgres", sql),
+                vec![expected.to_string()],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_transaction_illegal_statements_are_detected() {
+        for (sql, expected) in [
+            ("VACUUM", "VACUUM"),
+            ("VACUUM INTO 'backup.db'", "VACUUM"),
+            ("ATTACH DATABASE 'x.db' AS x", "ATTACH"),
+            ("attach 'x.db' as x", "ATTACH"),
+            ("DETACH DATABASE x", "DETACH"),
+        ] {
+            assert_eq!(
+                blockers_for("sqlite", sql),
+                vec![expected.to_string()],
+                "{sql}"
+            );
+        }
+        // PostgreSQL-only forms are not blockers for SQLite.
+        assert!(blockers_for("sqlite", "CREATE DATABASE app").is_empty());
+    }
+
+    #[test]
+    fn blocker_scan_handles_comments_case_multi_statements_and_dedup() {
+        let sql = "-- header
+/* block */ vacuum t;
+CREATE TABLE t (id int);
+  -- trailing
+  CREATE INDEX CONCURRENTLY idx ON t (id);";
+        assert_eq!(
+            blockers_for("postgres", sql),
+            vec!["VACUUM".to_string(), "CREATE INDEX CONCURRENTLY".to_string()]
+        );
+        // Repeated forms are reported once.
+        assert_eq!(
+            blockers_for("postgres", "VACUUM a; VACUUM b"),
+            vec!["VACUUM".to_string()]
+        );
+        // A leading comment must not hide the keyword.
+        assert_eq!(
+            blockers_for("sqlite", "-- note
+/* other */ ATTACH 'x' AS x"),
+            vec!["ATTACH".to_string()]
+        );
+    }
+
+    #[test]
+    fn blocker_scan_does_not_match_words_inside_strings_or_comments() {
+        for sql in [
+            "INSERT INTO t VALUES ('VACUUM')",
+            "UPDATE t SET note = 'CREATE DATABASE app'",
+            "SELECT 'CONCURRENTLY' AS word",
+            "COMMENT ON INDEX idx IS 'concurrently'",
+            "CREATE TABLE t (vacuum text, concurrently int)",
+            "CREATE TABLE t (id int); -- VACUUM inside a trailing comment\n SELECT 1",
+        ] {
+            assert!(blockers_for("postgres", sql).is_empty(), "{sql}");
+        }
+        for sql in [
+            "INSERT INTO t VALUES ('ATTACH')",
+            "SELECT 'VACUUM'",
+            "CREATE TABLE vacuum (id int)",
+        ] {
+            assert!(blockers_for("sqlite", sql).is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn atomic_eligibility_reports_reasons_and_size_threshold() {
+        let normal = "CREATE TABLE t (id int); INSERT INTO t VALUES (1)";
+        assert!(restore_atomic_eligible("postgres", normal, 1024).is_ok());
+        assert!(restore_atomic_eligible("sqlite", normal, 1024).is_ok());
+
+        // MySQL is never atomic (its DDL implicitly commits).
+        let mysql = restore_atomic_eligible("mysql", normal, 1024).unwrap_err();
+        assert!(mysql.contains("MySQL"), "{mysql}");
+        assert!(mysql.contains("分组提交"), "{mysql}");
+
+        // Transaction-illegal statement: the reason names driver + form.
+        let pg = restore_atomic_eligible("postgres", "VACUUM t; SELECT 1", 1024).unwrap_err();
+        assert!(pg.contains("PostgreSQL"), "{pg}");
+        assert!(pg.contains("VACUUM"), "{pg}");
+        assert!(pg.contains("不能在事务中执行的语句"), "{pg}");
+        let sqlite =
+            restore_atomic_eligible("sqlite", "ATTACH DATABASE 'x' AS x", 1024).unwrap_err();
+        assert!(sqlite.contains("SQLite"), "{sqlite}");
+        assert!(sqlite.contains("ATTACH"), "{sqlite}");
+
+        // Exactly the limit is still atomic; one byte over is not.
+        assert!(
+            restore_atomic_eligible("postgres", normal, RESTORE_ATOMIC_MAX_BYTES).is_ok(),
+            "the threshold itself is still atomic"
+        );
+        let over =
+            restore_atomic_eligible("postgres", normal, RESTORE_ATOMIC_MAX_BYTES + 1).unwrap_err();
+        assert!(over.contains("256 MiB"), "{over}");
+        assert!(over.contains("分组提交"), "{over}");
+        let big = restore_atomic_eligible(
+            "postgres",
+            normal,
+            RESTORE_ATOMIC_MAX_BYTES + 64 * 1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(big.contains("320 MiB"), "{big}");
+        assert!(big.contains("256 MiB"), "{big}");
+        assert!(big.contains("失败时可能留下部分数据"), "{big}");
+    }
+
+    #[tokio::test]
+    async fn atomic_restore_falls_back_when_the_dump_uses_a_transaction_illegal_statement() {
+        let mut session = FakeSession::new("postgres");
+        let report = restore_sql_atomic(&mut session, "VACUUM t; CREATE TABLE t (id INT)").await;
+        assert!(!report.atomic, "VACUUM must force the grouped path");
+        assert!(!report.rolled_back);
+        assert_eq!(report.total_statements, 2);
+        assert_eq!(report.statements(), 2);
+        // The grouped path does not open a transaction for these barrier statements.
+        assert!(!session.executed().iter().any(|s| *s == "BEGIN"));
+        assert!(session.executed().contains(&"VACUUM t"));
     }
 }
 

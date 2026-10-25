@@ -48,6 +48,10 @@ class RestoreOutcomeCopy {
 ///
 /// 兼容旧后端与 `executed` / `skipped` 这组备用字段名，缺失时按 `statements`
 /// 与总数推断，保证降级时提示仍然合理。
+///
+/// 第 59 轮：`atomic_fallback_reason`（中文，后端在「脚本含事务内非法语句」或
+/// 「备份超过 256 MiB」时退回分组提交并给出原因）会在成功/失败提示后追加一句，
+/// 让用户知道这次还原不是整段事务、失败时可能留下部分数据。
 RestoreOutcomeCopy describeRestoreOutcome(Json result, {bool mysql = false}) {
   final total =
       (result['total_statements'] as num?)?.toInt() ??
@@ -65,6 +69,14 @@ RestoreOutcomeCopy describeRestoreOutcome(Json result, {bool mysql = false}) {
   final rolledBack = result['rolled_back'] == true;
   final atomic = result['atomic'] == true;
   final ok = result['ok'] != false;
+  // 第 59 轮：后端在事务内非法语句 / 超大备份时自动回退分组提交，并给出原因。
+  final fallbackReason =
+      (result['atomic_fallback_reason'] ?? '').toString().trim();
+  final fallbackZh =
+      fallbackReason.isEmpty ? '' : '；已自动改用分组提交：$fallbackReason';
+  final fallbackEn = fallbackReason.isEmpty
+      ? ''
+      : '; fell back to grouped commits: $fallbackReason';
   const mysqlHintZh = '；MySQL 的 DDL 会隐式提交，无法整段回滚';
   const mysqlHintEn =
       '; MySQL DDL commits implicitly, so the restore cannot roll back as a whole';
@@ -90,18 +102,18 @@ RestoreOutcomeCopy describeRestoreOutcome(Json result, {bool mysql = false}) {
     if (failed > 0) {
       return RestoreOutcomeCopy(
         zh: '备份还原完成，但 $failed / $total 条语句失败'
-            '${mysql ? mysqlHintZh : ''}',
+            '${mysql ? mysqlHintZh : ''}$fallbackZh',
         en: 'Restore finished with $failed / $total statement(s) failed'
-            '${mysql ? mysqlHintEn : ''}',
+            '${mysql ? mysqlHintEn : ''}$fallbackEn',
         isError: true,
       );
     }
     // 兜底：后端标记 ok=false 但没有逐条错误（理论上不会发生）。
     return RestoreOutcomeCopy(
       zh: '还原失败（共 $total 条语句，跳过 $skipped）'
-          '${mysql ? mysqlHintZh : ''}',
+          '${mysql ? mysqlHintZh : ''}$fallbackZh',
       en: 'Restore failed ($total statement(s) total, $skipped skipped)'
-          '${mysql ? mysqlHintEn : ''}',
+          '${mysql ? mysqlHintEn : ''}$fallbackEn',
       isError: true,
     );
   }
@@ -113,8 +125,8 @@ RestoreOutcomeCopy describeRestoreOutcome(Json result, {bool mysql = false}) {
     );
   }
   return RestoreOutcomeCopy(
-    zh: '备份已还原（$total 条语句）${mysql ? mysqlHintZh : ''}',
-    en: 'Backup restored ($total statement(s))${mysql ? mysqlHintEn : ''}',
+    zh: '备份已还原（$total 条语句）${mysql ? mysqlHintZh : ''}$fallbackZh',
+    en: 'Backup restored ($total statement(s))${mysql ? mysqlHintEn : ''}$fallbackEn',
     isError: false,
   );
 }

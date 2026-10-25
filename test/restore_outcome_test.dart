@@ -50,6 +50,22 @@ void main() {
       expect(copy.isError, isFalse);
       expect(copy.zh, '备份已还原（0 条语句）');
     });
+
+    test('atomic_fallback_reason：成功但回退分组提交时追加原因（第 59 轮）', () {
+      final copy = describeRestoreOutcome(<String, dynamic>{
+        'ok': true,
+        'statements': 9,
+        'failed': 0,
+        'atomic': false,
+        'atomic_fallback_reason':
+            '还原脚本包含 PostgreSQL 不能在事务中执行的语句：VACUUM（改为分组提交，失败时无法整体回滚）',
+      });
+      expect(copy.isError, isFalse);
+      expect(copy.zh, contains('备份已还原（9 条语句）'));
+      expect(copy.zh, contains('已自动改用分组提交'));
+      expect(copy.zh, contains('VACUUM'));
+      expect(copy.en, contains('fell back to grouped commits'));
+    });
   });
 
   group('describeRestoreOutcome：失败', () {
@@ -127,6 +143,41 @@ void main() {
       expect(copy.isError, isTrue);
       expect(copy.zh, contains('整段事务未提交'));
       expect(copy.zh, contains('共 6 条语句，跳过 5'));
+    });
+
+    test('atomic_fallback_reason：分组提交下的部分失败也说明原因（第 59 轮）', () {
+      final copy = describeRestoreOutcome(<String, dynamic>{
+        'ok': false,
+        'statements': 7,
+        'failed': 2,
+        'atomic': false,
+        'atomic_fallback_reason':
+            '备份约 320 MiB，超过 256 MiB 自动改用分组提交，失败时可能留下部分数据',
+      });
+      expect(copy.isError, isTrue);
+      expect(copy.zh, contains('备份还原完成，但 2 / 7 条语句失败'));
+      expect(copy.zh, contains('已自动改用分组提交'));
+      expect(copy.zh, contains('320 MiB'));
+      expect(copy.en, contains('fell back to grouped commits'));
+    });
+
+    test('无 atomic_fallback_reason 时文案保持不变（第 59 轮）', () {
+      final okCopy = describeRestoreOutcome(<String, dynamic>{
+        'ok': true,
+        'statements': 3,
+        'failed': 0,
+        'atomic': false,
+      });
+      expect(okCopy.zh, '备份已还原（3 条语句）');
+      expect(okCopy.zh, isNot(contains('分组提交')));
+      final failCopy = describeRestoreOutcome(<String, dynamic>{
+        'ok': false,
+        'statements': 3,
+        'failed': 1,
+        'atomic': false,
+      });
+      expect(failCopy.zh, '备份还原完成，但 1 / 3 条语句失败');
+      expect(failCopy.zh, isNot(contains('分组提交')));
     });
   });
 }

@@ -1,8 +1,11 @@
-// 第 57 轮：批量编辑的「未保存离开确认」。
+// 第 57/59 轮：批量编辑的跨页保持与「未保存离开确认」。
 //
-// TableView 的 DataGrid 把单元格编辑暂存在本地，翻页 / 改每页条数 / 刷新 /
-// 切页签 / 切表都会替换 rows 并清掉这些编辑。这个 live SQLite 测试覆盖守卫：
-//   * 翻页：取消不翻页、放弃翻页、保存后翻页（并验证真的写进数据库）；
+// 第 59 轮起，暂存编辑按行键跨页保留：翻页 / 排序 / 改每页条数不再丢编辑，
+// 「保存全部改动」把多页合并成一次事务；切页签 / 切表 / 刷新仍然确认。
+// 这个 live SQLite 测试覆盖：
+//   * 跨页：第 1 页改 A、翻到第 2 页改 B、翻回第 1 页两页编辑都在，排序不丢，
+//     「保存全部改动」后两页数据都写库；
+//   * 刷新：仍弹未保存确认，取消后编辑保留；
 //   * 切页签：取消留在数据页、放弃后切走；
 //   * 切表：保存到原表 / 放弃；
 //   * 保存失败：停留当前页并保留暂存编辑。
@@ -192,48 +195,67 @@ void main() {
     }
   });
 
-  testWidgets('翻页前确认：取消不翻页、放弃翻页、保存后翻页', (tester) async {
+  testWidgets('跨页保持：翻页/排序不丢编辑，保存全部一次写多页', (tester) async {
     size(tester);
     final notice = Notice();
     addTearDown(notice.dispose);
     await pumpTableView(tester, 'guard_rows', notice);
     expect(find.text('row_1'), findsWidgets);
 
-    await editCell(tester, 'row_1', 'row_1_saved');
+    // 第 1 页改 row_1。
+    await editCell(tester, 'row_1', 'row_1_page1');
     expect(stagedPill(1), findsOneWidget);
 
-    // 取消：仍在第 1 页（row_1 可见、row_26 不可见），暂存编辑保留。
+    // 翻到第 2 页：不再弹丢弃确认，编辑被带到别的页继续保留。
     await tester.tap(find.byKey(const ValueKey('pager-next')));
+    await settle(tester, rounds: 18);
+    expect(find.text('有未保存的修改'), findsNothing);
+    expect(find.text('row_26'), findsWidgets);
+    expect(stagedPill(1), findsOneWidget);
+
+    // 第 2 页再改 row_26：跨页计数变 2。
+    await editCell(tester, 'row_26', 'row_26_page2');
+    expect(stagedPill(2), findsOneWidget);
+    expect(find.text('保存全部改动 (2)'), findsOneWidget);
+
+    // 回第 1 页：两页的编辑都还在（计数 2）。
+    await tester.tap(find.byKey(const ValueKey('pager-prev')));
+    await settle(tester, rounds: 18);
+    expect(find.text('row_1'), findsWidgets);
+    expect(stagedPill(2), findsOneWidget);
+
+    // 排序会换页数据，也不丢编辑、不弹确认（表头文字是「列名(类型)」）。
+    await tester.tap(find.textContaining('name(').first);
+    await settle(tester, rounds: 18);
+    expect(find.text('有未保存的修改'), findsNothing);
+    expect(stagedPill(2), findsOneWidget);
+
+    // 从当前页点「保存全部改动」：两页编辑合并成一次 applyRowChanges。
+    await tester.tap(find.byKey(const ValueKey('grid-apply-dirty')));
+    await settle(tester, rounds: 26);
+    expect(find.textContaining('未保存'), findsNothing);
+    expect(await storedValue(tester, 'guard_rows', 1, 'name'), 'row_1_page1');
+    expect(await storedValue(tester, 'guard_rows', 26, 'name'), 'row_26_page2');
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('刷新仍确认：取消后编辑保留', (tester) async {
+    size(tester);
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    await pumpTableView(tester, 'guard_rows', notice);
+
+    await editCell(tester, 'row_1', 'row_1_refresh');
+    expect(stagedPill(1), findsOneWidget);
+
+    await tester.tap(find.text('刷新'));
     await settle(tester, rounds: 6);
     expect(find.text('有未保存的修改'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('batch-leave-cancel')));
     await settle(tester, rounds: 6);
     expect(find.text('有未保存的修改'), findsNothing);
-    expect(find.text('row_1'), findsWidgets);
-    expect(find.text('row_26'), findsNothing);
     expect(stagedPill(1), findsOneWidget);
-
-    // 放弃：翻到第 2 页，暂存编辑丢弃。
-    await tester.tap(find.byKey(const ValueKey('pager-next')));
-    await settle(tester, rounds: 6);
-    await tester.tap(find.byKey(const ValueKey('batch-leave-discard')));
-    await settle(tester, rounds: 18);
-    expect(find.text('row_26'), findsWidgets);
-    expect(find.textContaining('未保存'), findsNothing);
-
-    // 回第 1 页改一次，再点「保存后继续」：真正写库后才翻页。
-    await tester.tap(find.byKey(const ValueKey('pager-prev')));
-    await settle(tester, rounds: 18);
     expect(find.text('row_1'), findsWidgets);
-    await editCell(tester, 'row_1', 'row_1_saved');
-    expect(stagedPill(1), findsOneWidget);
-    await tester.tap(find.byKey(const ValueKey('pager-next')));
-    await settle(tester, rounds: 6);
-    await tester.tap(find.byKey(const ValueKey('batch-leave-save')));
-    await settle(tester, rounds: 26);
-    expect(find.text('row_26'), findsWidgets);
-    expect(find.textContaining('未保存'), findsNothing);
-    expect(await storedValue(tester, 'guard_rows', 1, 'name'), 'row_1_saved');
     await tester.pump(const Duration(seconds: 4));
   });
 
@@ -303,7 +325,7 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
   });
 
-  testWidgets('保存失败时停留当前页并保留暂存编辑', (tester) async {
+  testWidgets('保存失败时停留并保留暂存编辑', (tester) async {
     size(tester);
     final notice = Notice();
     addTearDown(notice.dispose);
@@ -315,14 +337,12 @@ void main() {
     // 外部删表：保存必然失败。
     await tester.runAsync(() => Api.instance.query('DROP TABLE guard_fail;'));
 
-    await tester.tap(find.byKey(const ValueKey('pager-next')));
-    await settle(tester, rounds: 6);
-    await tester.tap(find.byKey(const ValueKey('batch-leave-save')));
+    await tester.tap(find.byKey(const ValueKey('grid-apply-dirty')));
     await settle(tester, rounds: 22);
-    // 保存失败：不翻页、暂存编辑保留（用户可以随后放弃或重试）。
+    // 保存失败：仍在本页、暂存编辑保留（可以重试或撤销）。
     expect(find.text('row_1'), findsWidgets);
-    expect(find.text('row_26'), findsNothing);
     expect(stagedPill(1), findsOneWidget);
+    expect(find.text('保存全部改动 (1)'), findsOneWidget);
     await tester.pump(const Duration(seconds: 4));
   });
 

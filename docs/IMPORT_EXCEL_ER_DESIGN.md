@@ -468,3 +468,23 @@ Future<void> showRelationDesigner(
 - 风险/权衡：原子事务意味着事务内非法语句（PG CREATE INDEX CONCURRENTLY / VACUUM / CREATE DATABASE，SQLite VACUUM/部分 PRAGMA）
   会让整次还原回滚（本应用自产 dump 仅 CREATE TABLE + INSERT，不受影响）；超大 dump 在 PG 上成为长事务（WAL/锁增加），是换取原子性的代价。
 
+
+## 15. 第 59 轮修订（批量编辑跨页保持 / restore 原子策略回退）
+
+### 15.1 批量编辑跨页保持
+
+- DirtyCell 增加 keys（暂存时捕获的原始行键）；row_changes 新增 rowChangeKeys / rowChangeKeyFor（顺序无关、类型敏感的规范键）与 buildRowChangesFromKeys（按 keys 跨页分组、合并同行、limit_one=无主键），原 buildRowChanges 保留给结果表。
+- DataGrid 新增受控模式：initialDirtyByKey（宿主持有的跨页暂存，按行键恢复当前页编辑并着色/计数）与 totalDirtyCount；翻页替换 rows 时不再清空；暂存时捕获 keys（编辑主键列仍指旧行）；工具栏保存入口支持跨页计数。
+- table_view 暂存改为 Map<rowKey, Map<column, DirtyCell>>：翻页/排序/筛选/每页条数不再丢编辑、不弹丢弃确认；刷新、切页签、切表、删除/行编辑器仍保留确认。「保存全部改动」把多页编辑合并成一次 applyRowChanges（单事务），成功清空全部并 reload，失败全部保留。
+- 取舍：行键在暂存时捕获，外部在保存前改键列/整行（无主键表）可能匹配 0 行；被筛掉/不在当前页的编辑仍会随保存全部写库（避免静默丢失）；跨页暂存暂无数量上限。
+
+### 15.2 restore 原子策略回退
+
+- core 新增纯函数 restore_atomic_blockers / restore_atomic_eligible：剥离前导注释后按语句头 12 词匹配，检测 PG/SQLite 不能在事务中执行的语句——
+  PG：VACUUM、CREATE/DROP DATABASE、ALTER SYSTEM、CREATE/DROP TABLESPACE、CREATE/DROP INDEX CONCURRENTLY、REINDEX CONCURRENTLY、REFRESH MATERIALIZED VIEW CONCURRENTLY；
+  SQLite：VACUUM、ATTACH、DETACH。另设 RESTORE_ATOMIC_MAX_BYTES=256 MiB 阈值（避免超大 dump 成为 PG 长事务）。
+- backup.rs：原子候选先判定；不可原子 → 退回分组 restore，JSON 新增 atomic_fallback_reason（命中语句 / 超 256 MiB / BEGIN 被拒 三种中文原因；MySQL null）；
+  restore_sql_atomic 内部同样自保回退（绕过 API 直接调用也不会硬上事务）。
+- Dart describeRestoreOutcome 在成功/部分失败/兜底失败文案后追加「已自动改用分组提交：<原因>」；无原因时文案不变。
+- 测试：core +6（各关键短语、注释/大小写/多语句去重、字符串内词不误伤、256 MiB 边界、原子路径回退）；Dart +3；PG live 正常 dump 不被误降级。
+

@@ -131,14 +131,17 @@ pub async fn read_backup(id: String) -> anyhow::Result<Value> {
 /// The dump runs through **one pinned connection**. PostgreSQL and SQLite get
 /// a really atomic restore ([dbpilot_core::ops::restore_sql_atomic]): one
 /// transaction around the whole dump, so a failure at any statement rolls the
-/// schema and data back too. MySQL keeps the grouped path
-/// ([dbpilot_core::ops::restore_sql]) because its DDL implicitly commits and a
-/// whole-dump transaction is impossible there — a MySQL restore can leave the
-/// successfully applied prefix behind.
+/// schema and data back too. That only works when the dump is transactional:
+/// statements a transaction rejects (PostgreSQL VACUUM / CREATE INDEX
+/// CONCURRENTLY / CREATE DATABASE / ..., SQLite VACUUM / ATTACH / DETACH) or a
+/// dump larger than [dbpilot_core::ops::RESTORE_ATOMIC_MAX_BYTES] fall back to
+/// the grouped path and report the reason in atomic_fallback_reason. MySQL
+/// always uses the grouped path because its DDL implicitly commits — a MySQL
+/// restore can leave the successfully applied prefix behind.
 ///
 /// Failure reporting: one entry per executed dump statement, the first 20
-/// errors are returned, and for MySQL a failed DML batch is rolled back and
-/// replayed so every other statement is still attempted.
+/// errors are returned, and on the grouped path a failed DML batch is rolled
+/// back and replayed so every other statement is still attempted.
 pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
     let state = state()?;
     let (meta, content) = state.backups.read(&id).await?;
@@ -160,17 +163,38 @@ pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
     // USE / SET FOREIGN_KEY_CHECKS actually apply to the next statement).
     let mut session = state.open_session(target_database.as_deref()).await?;
     // PostgreSQL / SQLite have transactional DDL, so the whole dump can be one
-    // transaction. MySQL cannot: every DDL statement implicitly commits there,
-    // which is why it keeps the grouped (per-run) restore path.
-    let report = match driver.kind() {
-        crate::drivers::DriverKind::Postgres | crate::drivers::DriverKind::Sqlite => {
-            dbpilot_core::ops::restore_sql_atomic(session.as_mut(), &content).await
-        }
-        crate::drivers::DriverKind::Mysql => {
-            dbpilot_core::ops::restore_sql(session.as_mut(), &content).await
-        }
+    // transaction — but only when every statement is legal inside a transaction
+    // and the dump is not huge (one transaction holds WAL/undo and locks for its
+    // whole duration). Otherwise fall back to the grouped path and tell the user
+    // why; MySQL always takes the grouped path (DDL implicitly commits).
+    let atomic_candidate = matches!(
+        driver.kind(),
+        crate::drivers::DriverKind::Postgres | crate::drivers::DriverKind::Sqlite
+    );
+    let fallback_reason = if atomic_candidate {
+        dbpilot_core::ops::restore_atomic_eligible(driver.id(), &content, content.len()).err()
+    } else {
+        None
+    };
+    let report = if atomic_candidate && fallback_reason.is_none() {
+        dbpilot_core::ops::restore_sql_atomic(session.as_mut(), &content).await
+    } else {
+        dbpilot_core::ops::restore_sql(session.as_mut(), &content).await
     };
     drop(session);
+    // The eligibility check cannot see a server that rejects BEGIN itself; if the
+    // atomic path still bailed out, report that reason instead of silently
+    // returning atomic=false with no explanation.
+    let fallback_reason = fallback_reason.or_else(|| {
+        if atomic_candidate && !report.atomic {
+            Some(
+                "服务端拒绝了事务控制语句（BEGIN），已回退分组提交，失败时可能留下部分数据"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    });
     // Number of statements in the dump (the whole file), not just the executed
     // prefix: the Dart restore banner prints "共 N 条语句，已执行 X，跳过 Y", and
     // an atomic failure stops early. On the grouped (MySQL) path every statement
@@ -198,6 +222,10 @@ pub async fn restore_backup(id: String) -> anyhow::Result<Value> {
         // its statements_in_transactions covers only consecutive DML runs and a
         // dump is never atomic as a whole there (atomic = false).
         "atomic": report.atomic,
+        // Non-null only when PostgreSQL / SQLite wanted to be atomic but had to
+        // fall back: transaction-illegal statements, oversized dump, or a server
+        // that rejected BEGIN. MySQL stays null (it is never atomic).
+        "atomic_fallback_reason": fallback_reason,
         "rolled_back": report.rolled_back,
         "total_statements": report.total_statements,
         // Executed dump statements (the failing one included) and the ones an

@@ -242,4 +242,100 @@ void main() {
     await tester.pump(const Duration(seconds: 2));
     await tester.pumpAndSettle();
   });
+
+  // =====================================================================
+  // 第 59 轮：跨页保持（initialDirtyByKey 受控模式）
+  // =====================================================================
+
+  testWidgets('initialDirtyByKey restores staged cells and edits keep keys',
+      (tester) async {
+    final reports = <List<DirtyCell>>[];
+    final initial = <String, List<DirtyCell>>{
+      rowChangeKeyFor(<String, Object?>{'id': 1}): <DirtyCell>[
+        DirtyCell(
+          rowIndex: 0,
+          column: 'name',
+          value: 'ONE',
+          keys: <String, Object?>{'id': 1},
+        ),
+      ],
+    };
+    await tester.pumpWidget(host(DataGrid(
+      columns: _columns,
+      rows: _rows,
+      primaryKey: const <String>['id'],
+      rowOps: true,
+      editable: true,
+      onApplyEdits: (edits) async => true,
+      onDirtyChanges: (edits) => reports.add(List<DirtyCell>.of(edits)),
+      initialDirtyByKey: initial,
+      totalDirtyCount: 1,
+    )));
+    await tester.pumpAndSettle();
+    // 恢复的编辑已经让工具栏显示保存入口，且不需要重新通知宿主。
+    expect(find.text('保存全部改动 (1)'), findsOneWidget);
+    expect(reports, isEmpty);
+
+    // 编辑另一行后，上报的列表包含恢复的编辑 + 新编辑，都带 keys。
+    await editCell(tester, 'two', 'TWO');
+    expect(reports, isNotEmpty);
+    expect(reports.last, hasLength(2));
+    expect(
+      reports.last.every((edit) => edit.keys != null && edit.keys!.isNotEmpty),
+      isTrue,
+    );
+    final keys = reports.last.map((edit) => edit.keys!['id']).toSet();
+    expect(keys, <Object?>{1, 2});
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('controlled mode survives a page flip and saves from any page',
+      (tester) async {
+    List<DirtyCell>? applied;
+    final initial = <String, List<DirtyCell>>{
+      rowChangeKeyFor(<String, Object?>{'id': 1}): <DirtyCell>[
+        DirtyCell(
+          rowIndex: 0,
+          column: 'name',
+          value: 'ONE',
+          keys: <String, Object?>{'id': 1},
+        ),
+      ],
+    };
+    Widget grid(List<List<dynamic>> rows) => host(DataGrid(
+          columns: _columns,
+          rows: rows,
+          primaryKey: const <String>['id'],
+          rowOps: true,
+          editable: true,
+          initialDirtyByKey: initial,
+          totalDirtyCount: 1,
+          onApplyEdits: (edits) async {
+            applied = List<DirtyCell>.of(edits);
+            return true;
+          },
+        ));
+
+    await tester.pumpWidget(grid(_rows));
+    await tester.pumpAndSettle();
+    expect(find.text('保存全部改动 (1)'), findsOneWidget);
+
+    // 翻到另一页：本页没有编辑，但宿主还有别的页的编辑 → 保存入口仍在。
+    await tester.pumpWidget(grid(<List<dynamic>>[
+      <dynamic>[3, 'three'],
+      <dynamic>[4, 'four'],
+    ]));
+    await tester.pumpAndSettle();
+    expect(find.text('保存全部改动 (1)'), findsOneWidget);
+    expect(find.byKey(const ValueKey('grid-discard-dirty')), findsNothing);
+
+    // 从没有编辑的页也能触发保存：本页 edits 为空，宿主合并跨页批次。
+    await tester.tap(find.byKey(const ValueKey('grid-apply-dirty')));
+    await tester.pumpAndSettle();
+    expect(applied, isNotNull);
+    expect(applied, isEmpty);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+  });
 }

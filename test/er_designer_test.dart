@@ -454,6 +454,158 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('关系列表侧栏：打开 / 搜索 / 无匹配 / 关闭（P2-5）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books', 'reviews'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-relation-list-panel')), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final panel = find.byKey(const ValueKey('er-relation-list-panel'));
+    expect(panel, findsOneWidget);
+    expect(find.text('关系列表（2 条）'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: panel,
+        matching: find.text('books.author_id → authors.id'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: panel,
+        matching: find.text('reviews.book_id → books.id'),
+      ),
+      findsOneWidget,
+    );
+
+    // 搜索大小写不敏感：AUTHORS 只命中「books.author_id → authors.id」。
+    await tester.enterText(
+      find.byKey(const ValueKey('er-relation-list-filter')),
+      'AUTHORS',
+    );
+    await settle(tester, rounds: 3);
+    expect(
+      find.descendant(
+        of: panel,
+        matching: find.text('books.author_id → authors.id'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: panel,
+        matching: find.text('reviews.book_id → books.id'),
+      ),
+      findsNothing,
+    );
+
+    // 无匹配 → 空状态文案（不是空白面板）。
+    await tester.enterText(
+      find.byKey(const ValueKey('er-relation-list-filter')),
+      'zzz',
+    );
+    await settle(tester, rounds: 3);
+    expect(find.byKey(const ValueKey('er-relation-list-empty')), findsOneWidget);
+    expect(find.text('没有匹配的关系'), findsOneWidget);
+
+    // 清空过滤恢复两条。
+    await tester.enterText(
+      find.byKey(const ValueKey('er-relation-list-filter')),
+      '',
+    );
+    await settle(tester, rounds: 3);
+    expect(
+      find.descendant(
+        of: panel,
+        matching: find.text('books.author_id → authors.id'),
+      ),
+      findsOneWidget,
+    );
+
+    // 点击外键行 → 复用画布的外键详情对话框（可删 / 看约束名）。
+    await tester.tap(
+      find.descendant(
+        of: panel,
+        matching: find.text('books.author_id → authors.id'),
+      ),
+    );
+    await settle(tester, rounds: 6);
+    expect(find.text('外键关系'), findsWidgets);
+    await tester.tap(find.widgetWithText(Btn, '关闭'));
+    await settle(tester, rounds: 10);
+    expect(panel, findsOneWidget);
+
+    // 关闭侧栏 → 恢复画布，节点与画布手势区域仍在。
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-close')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-relation-list-panel')), findsNothing);
+    expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('关系列表空状态：还没有关系时给引导（P2-5）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['people'],
+          height: 520,
+        ),
+      ),
+    );
+    await settle(tester);
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-relation-list-panel')), findsOneWidget);
+    expect(find.text('关系列表（0 条）'), findsOneWidget);
+    expect(
+      find.text('还没有关系；添加表并连接字段后会出现在这里'),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('compact 模式：关系列表侧栏不溢出（P2-5）', (tester) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        SingleChildScrollView(
+          child: RelationDesigner(
+            database: 'main',
+            initialTables: const <String>['authors', 'books'],
+            compact: true,
+            height: 440,
+          ),
+        ),
+      ),
+    );
+    await settle(tester);
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final panel = find.byKey(const ValueKey('er-relation-list-panel'));
+    expect(panel, findsOneWidget);
+    // authors/books + 自动带入 reviews：两行关系，220px 面板里单行省略不溢出。
+    expect(
+      find.descendant(
+        of: panel,
+        matching: find.text('books.author_id → authors.id'),
+      ),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('中间表徽标、多对多连线与折叠 / 展开', (tester) async {
     await setSurface(tester);
     await tester.pumpWidget(
@@ -1167,6 +1319,38 @@ void main() {
     await settle(tester);
     expect(find.text('Junction table (many-to-many)'), findsWidgets);
     expect(find.text('many-to-many · order_items'), findsOneWidget);
+
+    // P2-5：关系列表侧栏里的多对多条目也必须是英文（画布上还有一份隐藏
+    // 标签，所以限定在面板内查找）。
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await settle(tester);
+    final panel = find.byKey(const ValueKey('er-relation-list-panel'));
+    expect(panel, findsOneWidget);
+    // 共享 SQLite 库里前面测试建过中间表，画布自动带入的表数不固定，所以只
+    // 断言标题的英文前缀，不断言具体条数。
+    final listTitle = tester.widget<app_text.Text>(
+      find.byKey(const ValueKey('er-relation-list-title')),
+    );
+    expect(listTitle.data, startsWith('Relation list ('));
+    expect(
+      find.descendant(
+        of: panel,
+        matching: find.text('many-to-many · order_items'),
+      ),
+      findsOneWidget,
+    );
+    expect(find.descendant(of: panel, matching: find.text('FK')), findsWidgets);
+    // 点击多对多行 → 折叠中间表（与画布上的橙色标签同一个动作）。
+    await tester.tap(
+      find.descendant(
+        of: panel,
+        matching: find.text('many-to-many · order_items'),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('er-node-order_items')), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-close')));
+    await settle(tester);
 
     // 建议关系：虚线标签与批量按钮也都是英文。
     await tester.pumpWidget(

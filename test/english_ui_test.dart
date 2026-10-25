@@ -282,6 +282,31 @@ void main() {
       findsOneWidget,
     );
 
+    // P2-5：关系列表侧栏（这个库只有 people、没有关系 → 空状态）。标题、
+    // 搜索 hint、空状态文案都必须是英文。
+    final relationListTooltip = tester.widget<Tooltip>(
+      find
+          .descendant(
+            of: find.byKey(const ValueKey('er-relation-list-toggle')),
+            matching: find.byType(Tooltip),
+          )
+          .first,
+    );
+    expect(relationListTooltip.message, 'Relation list');
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-toggle')));
+    await _settle(tester, rounds: 3);
+    expect(find.byKey(const ValueKey('er-relation-list-panel')), findsOneWidget);
+    expect(find.text('Relation list (0)'), findsOneWidget);
+    expect(
+      find.text(
+        'No relations yet; add tables and connect columns to see them here',
+      ),
+      findsOneWidget,
+    );
+    _expectNoChinese(tester, 'E-R relation list');
+    await tester.tap(find.byKey(const ValueKey('er-relation-list-close')));
+    await _settle(tester, rounds: 2);
+
     // P3：工具栏的术语说明入口。全树扫描覆盖 tooltip，这里再断言译名，并打开
     // 对话框扫描正文（词条是 pickText 双语，不能漏一条中文）。
     final glossaryTooltip = tester.widget<Tooltip>(

@@ -483,6 +483,28 @@ QuickColumn addGeneratedPrimaryKey(QuickTablePlan plan, String driver) {
   return column;
 }
 
+/// 删除「添加自增 id 主键」生成的列（第 54 轮）。
+///
+/// 只删 `generated == true` 且没有源列（[QuickColumn.sourceIndex] < 0）的列：
+/// 源文件里同名的普通列不能被误删。删除后**不**自动把别的列设为主键 —— 表回到
+/// 「没有主键」状态，「未设置主键 / 添加自增 id 主键」提示会重新出现，由用户
+/// 决定下一步（再次添加 id、或取消别的列的主键等）。
+///
+/// [name] 比较忽略首尾空白与大小写。返回是否真的删除了列。
+bool removeGeneratedColumn(QuickTablePlan plan, String name) {
+  final target = name.trim().toLowerCase();
+  if (target.isEmpty) return false;
+  final index = plan.columns.indexWhere(
+    (column) =>
+        column.generated &&
+        column.sourceIndex < 0 &&
+        column.name.trim().toLowerCase() == target,
+  );
+  if (index < 0) return false;
+  plan.columns.removeAt(index);
+  return true;
+}
+
 /// 把「看起来是外键」的整数列对齐到驱动的主键整数类型。
 ///
 /// 背景（第 52 轮）：本向导生成的自增主键是 BIGINT（SQLite 为 INTEGER），而
@@ -2365,6 +2387,31 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
     setState(() {});
   }
 
+  /// 删除一张表里「添加自增 id 主键」生成的列（第 54 轮）。
+  ///
+  /// 删除是可逆的：没有主键的提示与「添加自增 id 主键」按钮会重新出现，用户
+  /// 可以再次添加。删完后按当前驱动重新对齐/规范化剩余列的类型（主键没了，
+  /// alignForeignKeyColumns 自然不会再升级 *_id 列）。
+  void _deleteGeneratedColumn(int formIndex, QuickColumn column) {
+    if (_busy || _executing) return;
+    if (formIndex < 0 || formIndex >= _forms.length) return;
+    _syncForms();
+    final form = _forms[formIndex];
+    // 用生成列对象本身定位：用户可能刚改过列名（_syncForms 已同步回 column.name）。
+    if (!removeGeneratedColumn(form.plan, column.name)) return;
+    form.rebuildColumnControllers();
+    alignForeignKeyColumns(form.plan.columns, _driver);
+    normalizePrimaryColumnTypes(form.plan.columns, _driver);
+    widget.notice.show(
+      pickText(
+        '已删除自动生成的 id 列；需要主键时可重新点「添加自增 id 主键」',
+        'Removed the generated id column; use "Add auto-increment id as primary '
+            'key" if you need a primary key again',
+      ),
+    );
+    setState(() {});
+  }
+
   /// 第 1 步顶部的「没有主键」提示文案（全部没有 / 部分没有两种说法）。
   String? get _primaryWarningText {
     final missing = _tableNamesWithoutPrimary;
@@ -4063,6 +4110,7 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
               Text(pickText('自增', 'Auto')),
               const Text('允许空'),
               const Text('示例值'),
+              Text(pickText('操作', 'Actions')),
             ],
             emptyText: '文件里没有可导入的列',
             rows: [
@@ -4093,12 +4141,14 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
             pickText(
               '主键：每张表最多 1 个。学号/订单号这类业务编号默认不自增（值来自文件）；'
                   '只有「添加自增 id 主键」生成的列自增，也可以在主键列勾选「自增」。'
-                  '字段可空：主键列强制非空。',
+                  '字段可空：主键列强制非空。生成列右侧「操作」列的删除图标可以移除它，'
+                  '移除后可以重新添加。',
               'Primary key: at most one per table. Business numbers such as student/order '
                   'IDs are NOT auto-increment by default (their values come from the '
                   'file). Only the generated id column auto-increments, and you can '
                   'tick "Auto" on the key column. Nullable is forced off for the key '
-                  'column.',
+                  'column. Use the delete icon in the "Actions" column to remove a '
+                  'generated column; you can add it again afterwards.',
             ),
             style: kSmallMuted,
           ),
@@ -4257,6 +4307,28 @@ class QuickCreateTableWizardState extends State<QuickCreateTableWizard> {
               tooltip: column.sample,
               style: kSmallMuted,
             ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.all(4),
+          child: Center(
+            child: column.generated
+                ? IconBtn(
+                    Icons.delete_outline,
+                    key: ValueKey<String>(
+                      'quick-col-delete-$formIndex-$columnIndex',
+                    ),
+                    tooltip: pickText(
+                      '删除自动生成的主键列',
+                      'Delete the generated key column',
+                    ),
+                    onPressed: _busy || _executing
+                        ? null
+                        : () => _deleteGeneratedColumn(formIndex, column),
+                  )
+                // 普通源列不能删除（否则导入 mapping 与文件列对不上），占位
+                // 保持行高一致。
+                : const SizedBox(height: 26, width: 28),
           ),
         ),
       ],

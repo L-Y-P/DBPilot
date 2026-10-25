@@ -891,6 +891,244 @@ void main() {
     });
   });
 
+  group('关系列表条目（P2-5）', () {
+    const fkBooks = ErRelation(
+      localTable: 'books',
+      localColumn: 'author_id',
+      refTable: 'authors',
+      refColumn: 'id',
+      name: 'fk_books_author',
+    );
+    const fkReviews = ErRelation(
+      localTable: 'reviews',
+      localColumn: 'book_id',
+      refTable: 'books',
+      refColumn: 'id',
+    );
+    const suggestion = ErRelation(
+      localTable: 'orders',
+      localColumn: 'user_id',
+      refTable: 'users',
+      refColumn: 'id',
+      origin: ErRelationOrigin.suggested,
+    );
+    ErManyToManyLink junctionLink({String table = 'order_items'}) =>
+        ErManyToManyLink(
+          junctionTable: table,
+          relationA: ErRelation(
+            localTable: table,
+            localColumn: 'order_id',
+            refTable: 'orders',
+            refColumn: 'id',
+          ),
+          relationB: ErRelation(
+            localTable: table,
+            localColumn: 'product_id',
+            refTable: 'products',
+            refColumn: 'id',
+          ),
+        );
+
+    List<ErRelationListItem> query(String filter) => relationListItems(
+      relations: <ErRelation>[fkReviews, fkBooks],
+      suggestions: <ErRelation>[suggestion],
+      manyToMany: <ErManyToManyLink>[junctionLink()],
+      filter: filter,
+    );
+
+    test('三类关系合并：外键 → 建议 → 多对多，原始关系保留', () {
+      final items = query('');
+      expect(items, hasLength(4));
+      expect(items.map((item) => item.kind).toList(), <ErRelationListItemKind>[
+        ErRelationListItemKind.foreignKey,
+        ErRelationListItemKind.foreignKey,
+        ErRelationListItemKind.suggested,
+        ErRelationListItemKind.manyToMany,
+      ]);
+      // 同类型按本地表排序：books 在 reviews 前（输入是乱序的）。
+      expect(items[0].localTable, 'books');
+      expect(items[0].displayLabel, 'books.author_id → authors.id');
+      expect(items[0].relation.name, 'fk_books_author');
+      expect(items[1].displayLabel, 'reviews.book_id → books.id');
+      expect(items[2].displayLabel, 'orders.user_id → users.id');
+      expect(items[3].junctionTable, 'order_items');
+      expect(items[3].displayLabel, '多对多 · order_items');
+      expect(items[3].relation.localTable, 'orders');
+      expect(items[3].relation.refTable, 'products');
+      // key 稳定唯一，可直接做侧栏 widget key。
+      expect(items.map((item) => item.key).toSet().length, items.length);
+      expect(items[3].key, 'm2m:order_items');
+    });
+
+    test('filter 大小写不敏感，匹配表名 / 列名 / 展示文本 / 中间表名', () {
+      expect(query('').length, 4, reason: '空 filter 不过滤');
+      expect(query('   ').length, 4, reason: '只有空白也不过滤');
+      expect(query('AUTHORS').single.kind, ErRelationListItemKind.foreignKey);
+      expect(query('AUTHORS').single.localTable, 'books');
+      expect(query('BOOK_ID').single.localColumn, 'book_id');
+      expect(query('orders.user_id').single.kind, ErRelationListItemKind.suggested);
+      expect(query('多对多').single.kind, ErRelationListItemKind.manyToMany);
+      expect(query('order_items').single.junctionTable, 'order_items');
+      expect(query('nope'), isEmpty);
+    });
+
+    test('排序：类型优先，其次本地表 / 本地列（大小写不敏感）', () {
+      const fkZeta = ErRelation(
+        localTable: 'zeta',
+        localColumn: 'id',
+        refTable: 'a',
+        refColumn: 'id',
+      );
+      const fkAlpha = ErRelation(
+        localTable: 'Alpha',
+        localColumn: 'b_id',
+        refTable: 'a',
+        refColumn: 'id',
+      );
+      const fkAlphaA = ErRelation(
+        localTable: 'Alpha',
+        localColumn: 'a_id',
+        refTable: 'a',
+        refColumn: 'id',
+      );
+      final items = relationListItems(
+        relations: <ErRelation>[fkZeta, fkAlpha, fkAlphaA],
+        suggestions: <ErRelation>[],
+        manyToMany: <ErManyToManyLink>[],
+      );
+      expect(
+        items.map((item) => '${item.localTable}.${item.localColumn}').toList(),
+        <String>['Alpha.a_id', 'Alpha.b_id', 'zeta.id'],
+      );
+    });
+
+    test('英文模式：多对多展示文本与搜索键同步翻译', () {
+      I18n.setLang(AppLang.en);
+      addTearDown(() => I18n.setLang(AppLang.zh));
+      final items = relationListItems(
+        relations: <ErRelation>[],
+        suggestions: <ErRelation>[],
+        manyToMany: <ErManyToManyLink>[junctionLink()],
+      );
+      expect(items.single.displayLabel, 'many-to-many · order_items');
+      expect(items.single.searchKey, contains('many-to-many'));
+      expect(RegExp(r'[\u4e00-\u9fff]').hasMatch(items.single.displayLabel), isFalse);
+    });
+  });
+
+  group('多对多标签矩形与连线不相交（第 54 轮几何回归）', () {
+    const labelWidth = 210.0;
+    const labelHeight = 18.0;
+
+    Offset midpointOf(Offset a, Offset b) =>
+        Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
+
+    Offset unitVector(Offset vector) {
+      final length = vector.distance;
+      return length == 0 ? Offset.zero : vector / length;
+    }
+
+    /// 标签按连线方向摆放时的四个角：210 长 × 18 高，中心在 m2mLabelAnchorFor。
+    ///
+    /// 画布上的标签是轴对齐文本盒；这里用「长边沿连线方向」的矩形描述它相对
+    /// 连线的避让关系（210 是 Container 的 maxWidth，18 是标签行高）。
+    List<Offset> labelBandCorners(Offset start, Offset end) {
+      final anchor = m2mLabelAnchorFor(start: start, end: end);
+      final direction = unitVector(end - start);
+      final normal = Offset(-direction.dy, direction.dx);
+      return <Offset>[
+        anchor + direction * (labelWidth / 2) + normal * (labelHeight / 2),
+        anchor + direction * (labelWidth / 2) - normal * (labelHeight / 2),
+        anchor - direction * (labelWidth / 2) - normal * (labelHeight / 2),
+        anchor - direction * (labelWidth / 2) + normal * (labelHeight / 2),
+      ];
+    }
+
+    /// 点到**直线**（不是线段）的垂直距离。
+    double distanceToLine(Offset point, Offset start, Offset end) {
+      final direction = unitVector(end - start);
+      final normal = Offset(-direction.dy, direction.dx);
+      final offset = point - start;
+      return (offset.dx * normal.dx + offset.dy * normal.dy).abs();
+    }
+
+    /// 标签矩形带（沿连线方向的长方形）不能跨到连线另一侧：四个角的垂直距离
+    /// 都大于 0，说明标签整块在线的上方，连线中段不会被它盖住。
+    void expectBandClearsLine(Offset start, Offset end) {
+      for (final corner in labelBandCorners(start, end)) {
+        expect(
+          distanceToLine(corner, start, end),
+          greaterThan(0),
+          reason: '标签矩形跨过了连线（角点 $corner）',
+        );
+      }
+    }
+
+    /// 轴对齐矩形与线段是否相交（Liang–Barsky 参数裁剪）。
+    bool rectIntersectsSegment(Rect rect, Offset start, Offset end) {
+      var t0 = 0.0;
+      var t1 = 1.0;
+      final dx = end.dx - start.dx;
+      final dy = end.dy - start.dy;
+      bool clip(double p, double q) {
+        if (p == 0) return q >= 0;
+        final r = q / p;
+        if (p < 0) {
+          if (r > t1) return false;
+          if (r > t0) t0 = r;
+        } else {
+          if (r < t0) return false;
+          if (r < t1) t1 = r;
+        }
+        return true;
+      }
+
+      return clip(-dx, start.dx - rect.left) &&
+          clip(dx, rect.right - start.dx) &&
+          clip(-dy, start.dy - rect.top) &&
+          clip(dy, rect.bottom - start.dy);
+    }
+
+    test('水平连线：轴对齐标签矩形（210×18）与连线段不相交', () {
+      const a = Offset(100, 300);
+      const b = Offset(600, 300);
+      final rect = Rect.fromCenter(
+        center: m2mLabelAnchorFor(start: a, end: b),
+        width: labelWidth,
+        height: labelHeight,
+      );
+      expect(rect.contains(midpointOf(a, b)), isFalse);
+      expect(rectIntersectsSegment(rect, a, b), isFalse);
+      expectBandClearsLine(a, b);
+      // 18px 偏移 - 9px 半高 = 9px 净空。
+      expect(
+        distanceToLine(rect.center, a, b) - labelHeight / 2,
+        closeTo(9, 0.0001),
+      );
+    });
+
+    test('垂直连线：标签矩形带整块在连线一侧（净空 18 > 半高 9）', () {
+      const a = Offset(300, 100);
+      const b = Offset(300, 600);
+      final anchor = m2mLabelAnchorFor(start: a, end: b);
+      expect(distanceToLine(anchor, a, b), closeTo(18, 0.0001));
+      // 沿连线方向的矩形带四个角都在线的同一侧，不与连线相交。
+      expectBandClearsLine(a, b);
+      // 注：轴对齐的 210px 文本盒比 18px 偏移宽得多，垂直连线会擦过它的横向
+      // 长边；真正保证「线中段露出来」的是上面的矩形带净空。
+    });
+
+    test('斜线：标签矩形带与连线不相交，锚点在中点的法线上', () {
+      const a = Offset(100, 100);
+      const b = Offset(500, 420);
+      final anchor = m2mLabelAnchorFor(start: a, end: b);
+      final midpoint = midpointOf(a, b);
+      expect(distanceToLine(anchor, a, b), closeTo(18, 0.0001));
+      expect((anchor - midpoint).distance, closeTo(18, 0.0001));
+      expectBandClearsLine(a, b);
+    });
+  });
+
   group('自动带入关联表', () {
     test('BFS 沿父/子两个方向扩展，循环不重复', () {
       final expanded = expandRelatedTableNames(

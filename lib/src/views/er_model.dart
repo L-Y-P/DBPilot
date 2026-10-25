@@ -1517,6 +1517,138 @@ Offset m2mLabelAnchorFor({
   return midpoint + normal * offset;
 }
 
+// -------------------------------------------------- 关系列表（侧栏，第 54 轮 P2-5）
+
+/// 侧栏「关系列表」里的三类条目。
+enum ErRelationListItemKind {
+  /// 数据库里已有的外键：可打开详情（查看 / 删除）。
+  foreignKey,
+
+  /// 按列名推导、尚未写库的建议关系：点击即建立。
+  suggested,
+
+  /// 中间表折叠出来的多对多关系：点击折叠 / 展开中间表。
+  manyToMany,
+}
+
+/// 关系列表的一行。
+///
+/// 三种关系（真实外键 / 建议关系 / 多对多）在画布上的数据源不同，侧栏需要统一
+/// 的模型才能一起过滤、排序、展示。原始关系对象保留在 [relation] 里，侧栏点击
+/// 后直接复用画布现有的选中 / 建立 / 折叠逻辑。
+class ErRelationListItem {
+  const ErRelationListItem({
+    required this.kind,
+    required this.relation,
+    this.link,
+  });
+
+  final ErRelationListItemKind kind;
+
+  /// 原始关系：外键 / 建议关系直接使用；多对多用 [ErManyToManyLink] 的合成关系。
+  final ErRelation relation;
+
+  /// 多对多条目对应的中间表链路；其它类型为 null。
+  final ErManyToManyLink? link;
+
+  String get localTable => relation.localTable;
+  String get localColumn => relation.localColumn;
+  String get refTable => relation.refTable;
+  String get refColumn => relation.refColumn;
+
+  /// 多对多条目的中间表名；其它类型为 null。
+  String? get junctionTable => link?.junctionTable;
+
+  /// 列表展示文本：外键 / 建议用「a.b → c.d」，多对多用「多对多 · 中间表」
+  /// （与画布上的标签格式保持一致）。
+  String get displayLabel => kind == ErRelationListItemKind.manyToMany
+      ? pickText(
+          '多对多 · ${link!.junctionTable}',
+          'many-to-many · ${link!.junctionTable}',
+        )
+      : '${relation.localTable}.${relation.localColumn} → '
+            '${relation.refTable}.${relation.refColumn}';
+
+  /// 搜索键：表名 / 列名 / 展示文本，统一小写后做子串匹配。
+  String get searchKey => <String>[
+    localTable,
+    localColumn,
+    refTable,
+    refColumn,
+    ?junctionTable,
+    displayLabel,
+  ].join('\n').toLowerCase();
+
+  /// 唯一键（侧栏 widget key / 去重）：多对多用中间表，其它用关系 key。
+  String get key => kind == ErRelationListItemKind.manyToMany
+      ? 'm2m:${link!.junctionTable}'
+      : relation.key;
+
+  @override
+  String toString() => 'ErRelationListItem(${kind.name}, $displayLabel)';
+}
+
+/// 合并三类关系成一个可搜索、稳定排序的列表（第 54 轮 P2-5）。
+///
+/// 顺序固定为「真实外键 → 建议关系 → 多对多」，同类型内按本地表 / 本地列 /
+/// 引用表 / 引用列排序（大小写不敏感），保证每次重建侧栏的顺序一致。
+/// [filter] 去掉首尾空白后对 [ErRelationListItem.searchKey] 做大小写不敏感子串
+/// 匹配；空串表示不过滤。
+List<ErRelationListItem> relationListItems({
+  required List<ErRelation> relations,
+  required List<ErRelation> suggestions,
+  required List<ErManyToManyLink> manyToMany,
+  String filter = '',
+}) {
+  final items = <ErRelationListItem>[
+    for (final relation in relations)
+      ErRelationListItem(
+        kind: ErRelationListItemKind.foreignKey,
+        relation: relation,
+      ),
+    for (final relation in suggestions)
+      ErRelationListItem(
+        kind: ErRelationListItemKind.suggested,
+        relation: relation,
+      ),
+    for (final link in manyToMany)
+      ErRelationListItem(
+        kind: ErRelationListItemKind.manyToMany,
+        relation: link.syntheticRelation,
+        link: link,
+      ),
+  ];
+  final needle = filter.trim().toLowerCase();
+  final picked = needle.isEmpty
+      ? items
+      : <ErRelationListItem>[
+          for (final item in items)
+            if (item.searchKey.contains(needle)) item,
+        ];
+  int compareText(String a, String b) {
+    final lower = a.toLowerCase().compareTo(b.toLowerCase());
+    return lower != 0 ? lower : a.compareTo(b);
+  }
+
+  picked.sort((a, b) {
+    final byKind = a.kind.index.compareTo(b.kind.index);
+    if (byKind != 0) return byKind;
+    for (final pair in <List<String>>[
+      <String>[a.localTable, b.localTable],
+      <String>[a.localColumn, b.localColumn],
+      <String>[a.refTable, b.refTable],
+      <String>[a.refColumn, b.refColumn],
+      <String>[a.junctionTable ?? '', b.junctionTable ?? ''],
+      <String>[a.displayLabel, b.displayLabel],
+    ]) {
+      final result = compareText(pair[0], pair[1]);
+      if (result != 0) return result;
+    }
+    return 0;
+  });
+  return picked;
+}
+
 // -------------------------------------------------- 自动带入关联表
 
 /// 从已加入的表出发，沿已有外键（父表 + 子表两个方向）做 BFS，返回候选表名。

@@ -341,6 +341,45 @@ void main() {
     }
     expect(await _foreignKeyCount(), 4);
 
+    // Real ALTER success path in both directions (round 54): drop one foreign key
+    // through alterTableChecked, verify the database really removed it, then add
+    // it back and expect the suggestion to reappear and the count to return to 4.
+    await Api.instance.alterTableChecked(
+      _database,
+      'products',
+      <String, dynamic>{
+        'drop_foreign_keys': <String>['fk_products_category_id'],
+      },
+    );
+    expect(
+      await _foreignKeyCount(),
+      3,
+      reason: 'dropping a foreign key must really reach the database',
+    );
+    relations = await _relationsByTable(plans);
+    final afterDrop = suggestRelations(
+      tables: tables,
+      relationsByTable: relations,
+    );
+    final lost = afterDrop
+        .where(
+          (suggestion) =>
+              suggestion.localTable == 'products' &&
+              suggestion.localColumn == 'category_id',
+        )
+        .toList();
+    expect(
+      lost.length,
+      1,
+      reason: 'the dropped FK must be suggested again after the drop',
+    );
+    await apply(lost.single);
+    expect(
+      await _foreignKeyCount(),
+      4,
+      reason: 're-adding the dropped foreign key must succeed',
+    );
+
     // The junction table is recognised and orders↔products is many-to-many.
     final junctions = detectJunctionTables(
       relationsByTable: relations,

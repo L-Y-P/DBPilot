@@ -6397,4 +6397,181 @@ mod excel_tests {
         let error = file_info(&directory.to_string_lossy()).unwrap_err().to_string();
         assert!(error.contains("选择的路径不是文件"), "{error}");
     }
+
+    // ------------------------------ 第 54 轮：公开 API 端到端（import_inspect）
+
+    /// 端到端入口：走 FFI 层实际调用的 api::data_import::import_inspect
+    /// （内部就是 importer::inspect，第一步就会 file_info），不再直接调内部函数，
+    /// 保证「用户在应用里看到的错误/警告」就是这里断言的。
+    async fn inspect_via_api(path: &str) -> anyhow::Result<Value> {
+        crate::api::data_import::import_inspect(path.to_string()).await
+    }
+
+    /// chmod 000 的父目录：Drop 时恢复权限并删除，保证断言失败也不会留下坏权限目录。
+    #[cfg(unix)]
+    struct LockedDirGuard {
+        locked: std::path::PathBuf,
+        root: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl LockedDirGuard {
+        /// 建 root/locked/data.csv，再把 locked 的权限改成 000（不可搜索 ⇒ EACCES）。
+        fn new() -> (Self, String) {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!("rma-perm-{}", uuid::Uuid::new_v4()));
+            let locked = root.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            let file = locked.join("data.csv");
+            std::fs::write(&file, "id,name\n1,Ada\n").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let guard = LockedDirGuard { locked, root };
+            (guard, file.to_string_lossy().to_string())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LockedDirGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            // finally 语义：无论断言/panic 与否，先恢复 700 再删除。
+            let _ = std::fs::set_permissions(&self.locked, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inspect_api_reports_permission_denied_in_chinese() {
+        let (guard, path) = LockedDirGuard::new();
+
+        // 以 root 运行时 chmod 000 仍可访问：明确跳过（并说明原因），
+        // 而不是把「没测到」伪装成通过。
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                eprintln!(
+                    "跳过 PermissionDenied 用例：当前进程可能是 root（chmod 000 的目录仍可读取）"
+                );
+                return;
+            }
+            Err(error) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "chmod 000 的父目录必须产生 EACCES: {error}"
+            ),
+        }
+
+        let error = inspect_via_api(&path).await.unwrap_err().to_string();
+        assert!(error.contains("没有权限读取文件"), "{error}");
+        assert!(error.contains(&path), "路径要保留: {error}");
+        // 括号里保留 OS 原文（英文），便于排查；不同平台措辞不同，只认特征。
+        assert!(
+            error.contains("os error 13")
+                || error.contains("Permission denied")
+                || error.contains("Operation not permitted"),
+            "OS 原文要保留: {error}"
+        );
+
+        drop(guard);
+        // guard 必须恢复权限并删除目录（finally 语义）。
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "chmod 恢复后临时目录应被清理"
+        );
+    }
+
+    /// 1 张可见 + 1 张隐藏（table:display="false"）的最小 ODS。
+    const ODS_WITH_ONE_HIDDEN_SHEET: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<office:document-content ",
+        "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" ",
+        "xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" ",
+        "xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">",
+        "<office:body><office:spreadsheet>",
+        "<table:table table:name=\"可见页\">",
+        "<table:table-row>",
+        "<table:table-cell office:value-type=\"string\"><text:p>id</text:p></table:table-cell>",
+        "<table:table-cell office:value-type=\"string\"><text:p>姓名</text:p></table:table-cell>",
+        "</table:table-row>",
+        "<table:table-row>",
+        "<table:table-cell office:value-type=\"float\" office:value=\"1\"/>",
+        "<table:table-cell office:value-type=\"string\"><text:p>张伟</text:p></table:table-cell>",
+        "</table:table-row>",
+        "</table:table>",
+        "<table:table table:name=\"隐藏页\" table:display=\"false\">",
+        "<table:table-row><table:table-cell office:value-type=\"string\"><text:p>secret</text:p></table:table-cell></table:table-row>",
+        "</table:table>",
+        "</office:spreadsheet></office:body></office:document-content>",
+    );
+
+    #[tokio::test]
+    async fn inspect_api_excludes_one_hidden_ods_sheet_end_to_end() {
+        let path = temp_path("api_hidden.ods");
+        synthetic_ods(&path, ODS_WITH_ONE_HIDDEN_SHEET);
+        let info = inspect_via_api(&path).await.expect("ODS inspect 应成功");
+
+        assert_eq!(info["format"], json!("ods"), "{info}");
+        assert!(
+            info["warnings"]
+                .to_string()
+                .contains("已忽略 1 个隐藏工作表"),
+            "{info}"
+        );
+        let sheets = info["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 1, "隐藏表不能出现在 sheets: {info}");
+        assert_eq!(sheets[0]["name"], json!("可见页"), "{info}");
+        assert_eq!(info["sheet"], json!("可见页"), "{info}");
+        assert!(
+            !info.to_string().contains("隐藏页"),
+            "隐藏表名不能出现在 inspect 结果（sheets/sheet）: {info}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_api_excludes_one_hidden_spreadsheetml_sheet_end_to_end() {
+        let path = temp_file("api_hidden_sml.xls", SML_WITH_HIDDEN_SHEETS);
+        let info = inspect_via_api(&path)
+            .await
+            .expect("SpreadsheetML inspect 应成功");
+
+        assert_eq!(info["format"], json!("excel"), "{info}");
+        assert!(
+            info["warnings"]
+                .to_string()
+                .contains("已忽略 1 个隐藏工作表"),
+            "{info}"
+        );
+        let sheets = info["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 2, "隐藏表不能出现在 sheets: {info}");
+        let names: Vec<&str> = sheets
+            .iter()
+            .filter_map(|sheet| sheet["name"].as_str())
+            .collect();
+        assert_eq!(names, ["员工", "第二表"], "{info}");
+        assert!(!names.contains(&"隐藏页"), "{info}");
+    }
+
+    #[tokio::test]
+    async fn inspect_api_reports_html_disguised_as_xls_in_chinese() {
+        let path = temp_path("api_fake.xls");
+        std::fs::write(
+            &path,
+            b"<html><body><table><tr><td>1</td></tr></table></body></html>",
+        )
+        .unwrap();
+        let error = inspect_via_api(&path).await.unwrap_err().to_string();
+        assert!(error.contains("扩展名是 Excel"), "{error}");
+        assert!(error.contains("不是 Excel 二进制格式"), "{error}");
+        assert!(error.contains("HTML"), "文案要点明可能是 HTML: {error}");
+    }
+
+    #[tokio::test]
+    async fn inspect_api_reports_encrypted_cfb_in_chinese() {
+        let path = temp_path("api_encrypted.xlsx");
+        synthetic_cfb(&path, &["EncryptionInfo", "EncryptedPackage"]);
+        let error = inspect_via_api(&path).await.unwrap_err().to_string();
+        assert!(error.contains("已加密"), "{error}");
+        assert!(error.contains("密码"), "{error}");
+        assert!(error.contains("另存为未加密的 .xlsx/.xlsb"), "{error}");
+    }
 }

@@ -1159,6 +1159,73 @@ void main() {
     });
   });
 
+  group('删除自动生成的主键列（第 54 轮）', () {
+    test('只删除 generated 的列；删除主键列后表回到无主键', () {
+      final plan = planFor(
+        columns: <QuickColumn>[
+          quickColumn('name', 'TEXT'),
+          quickColumn('score', 'DECIMAL(18,2)', sourceIndex: 1),
+        ],
+      );
+      final generated = addGeneratedPrimaryKey(plan, 'mysql');
+      expect(plan.columns.first, same(generated));
+      expect(planHasPrimary(plan), isTrue);
+
+      // 名字大小写 / 首尾空白不敏感。
+      expect(removeGeneratedColumn(plan, ' ID '), isTrue);
+      expect(plan.columns.length, 2);
+      expect(plan.columns.any((column) => column.generated), isFalse);
+      expect(planHasPrimary(plan), isFalse, reason: '删除主键列后不自动把别的列设为主键');
+
+      // 源文件里的普通列不能被删除（即使名字碰巧一样也不行）。
+      expect(removeGeneratedColumn(plan, 'name'), isFalse);
+      expect(plan.columns.length, 2);
+      // 不存在 / 空名字。
+      expect(removeGeneratedColumn(plan, 'id'), isFalse);
+      expect(removeGeneratedColumn(plan, '  '), isFalse);
+      expect(plan.columns.length, 2);
+    });
+
+    test('删除后再次添加生成新列；源文件已有 id 时仍用 id_2', () {
+      final plan = planFor(
+        columns: <QuickColumn>[
+          quickColumn('id', 'INT', primary: true),
+          quickColumn('name', 'TEXT', sourceIndex: 1),
+        ],
+      );
+      final first = addGeneratedPrimaryKey(plan, 'mysql');
+      expect(first.name, 'id_2', reason: '源文件已有 id，生成列重名退到 id_2');
+      expect(removeGeneratedColumn(plan, first.name), isTrue);
+      expect(planHasPrimary(plan), isFalse);
+      expect(plan.columns.length, 2);
+
+      final second = addGeneratedPrimaryKey(plan, 'mysql');
+      expect(second, isNot(same(first)));
+      expect(second.name, 'id_2');
+      expect(second.generated, isTrue);
+      expect(second.primary, isTrue);
+      expect(second.autoIncrement, isTrue);
+      expect(plan.columns.where((column) => column.primary).length, 1);
+    });
+
+    test('删除生成列后建表载荷不再包含该列 / auto_increment', () {
+      final plan = planFor(columns: <QuickColumn>[quickColumn('name', 'TEXT')]);
+      final generated = addGeneratedPrimaryKey(plan, 'mysql');
+      final before = (createTableBodyFor(plan, 'mysql')['columns'] as List)
+          .cast<Map>();
+      expect(before.length, 2);
+      expect(before.any((column) => column['auto_increment'] == true), isTrue);
+
+      expect(removeGeneratedColumn(plan, generated.name), isTrue);
+      final after = (createTableBodyFor(plan, 'mysql')['columns'] as List)
+          .cast<Map>();
+      expect(after.length, 1);
+      expect(after.first['name'], 'name');
+      expect(after.any((column) => column['auto_increment'] == true), isFalse);
+      expect(after.any((column) => column['primary'] == true), isFalse);
+    });
+  });
+
   group('主键候选提示（P1-3）', () {
     test('columnsFromPreview 读取 reason；样本唯一列给出提示', () {
       final preview = <String, dynamic>{
@@ -3525,6 +3592,91 @@ void main() {
     await settle(tester, rounds: 40);
     expect(state.stepForTest, 2);
     expect(await tableNames(tester), contains('sameconflict_ok'));
+    await tester.pump(const Duration(seconds: 4));
+  });
+
+  testWidgets('删除自动生成的主键列：列消失、提示重现、可再次添加', (tester) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final csvPath = await tester.runAsync(
+      () => writeFile(
+        // 第一列故意重复：Rust 不会给 primary_candidate，源文件确实没有主键。
+        'genremove.csv',
+        'name,score\nAda,9.5\nAda,8\n',
+      ),
+    );
+    final notice = Notice();
+    addTearDown(notice.dispose);
+    final stateKey = await pumpWizardWithKey(tester, csvPath!, notice);
+    await settle(tester, rounds: 16);
+    await tester.tap(primaryButton());
+    await settle(tester, rounds: 24);
+
+    final state = stateKey.currentState!;
+    expect(find.textContaining('所有表都没有主键'), findsOneWidget);
+    // 字段表格新增第 8 列「操作」。
+    expect(find.text('操作'), findsOneWidget);
+
+    // 添加自增 id 主键 → 生成列出现删除按钮；普通列没有。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    var plan = state.plansForTest.single;
+    expect(plan.columns.first.generated, isTrue);
+    expect(plan.columns.first.name, 'id');
+    expect(plan.columns.first.primary, isTrue);
+    expect(find.textContaining('所有表都没有主键'), findsNothing);
+    expect(
+      find.byKey(const ValueKey<String>('quick-col-delete-0-0')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey<String>('quick-col-delete-0-1')),
+      findsNothing,
+      reason: '源文件的普通列不能删除',
+    );
+
+    // 删除生成列：列消失、主键提示与「添加自增 id 主键」按钮重现、notice 提示。
+    await tester.tap(
+      find.byKey(const ValueKey<String>('quick-col-delete-0-0')),
+    );
+    await settle(tester, rounds: 4);
+    plan = state.plansForTest.single;
+    expect(plan.columns.length, 2);
+    expect(plan.columns.any((column) => column.generated), isFalse);
+    expect(plan.columns.any((column) => column.primary), isFalse);
+    expect(
+      find.byKey(const ValueKey<String>('quick-col-delete-0-0')),
+      findsNothing,
+    );
+    expect(find.textContaining('所有表都没有主键'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey<String>('quick-add-pk-0')),
+      findsOneWidget,
+    );
+    expect(notice.message, contains('已删除自动生成的 id 列'));
+
+    // 再次添加成功：重新出现一个生成列（可再次删除）。
+    await tester.tap(find.byKey(const ValueKey<String>('quick-add-pk-0')));
+    await settle(tester, rounds: 2);
+    plan = state.plansForTest.single;
+    expect(plan.columns.first.generated, isTrue);
+    expect(plan.columns.first.name, 'id');
+    expect(plan.columns.first.primary, isTrue);
+    expect(
+      find.byKey(const ValueKey<String>('quick-col-delete-0-0')),
+      findsOneWidget,
+    );
+    // 载荷侧：重新添加后又有 auto_increment。
+    final body = createTableBodyFor(plan, AppState.instance.driver);
+    expect(
+      (body['columns'] as List).cast<Map>().any(
+        (column) => column['auto_increment'] == true,
+      ),
+      isTrue,
+    );
     await tester.pump(const Duration(seconds: 4));
   });
 }

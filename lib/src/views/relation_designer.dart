@@ -273,6 +273,12 @@ class _RelationDesignerState extends State<RelationDesigner> {
   String? _hoverSuggestionKey;
   String? _hoverDot;
 
+  /// 是否显示右侧「关系列表」侧栏（第 54 轮 P2-5）。
+  bool _relationListOpen = false;
+
+  /// 关系列表搜索框：过滤表名 / 列名 / 展示文本。
+  final TextEditingController _relationListFilter = TextEditingController();
+
   /// 用户手动拖过位置的表：自动布局 / 自动带入时保留这些坐标。
   final Set<String> _userMoved = <String>{};
 
@@ -364,6 +370,13 @@ class _RelationDesignerState extends State<RelationDesigner> {
 
   List<ErManyToManyLink> get _m2mLinks => manyToManyLinks(_junctionInfos);
 
+  /// 关系列表条目：真实外键 + 建议关系 + 多对多（第 54 轮 P2-5）。
+  List<ErRelationListItem> get _relationListItems => relationListItems(
+    relations: _relations,
+    suggestions: _suggestions,
+    manyToMany: _m2mLinks,
+  );
+
   /// 两端都可见的外键（去重后）。
   List<ErRelation> get _relations {
     final visible = _visibleNames;
@@ -405,6 +418,12 @@ class _RelationDesignerState extends State<RelationDesigner> {
   void initState() {
     super.initState();
     _loadInitial();
+  }
+
+  @override
+  void dispose() {
+    _relationListFilter.dispose();
+    super.dispose();
   }
 
   // ---------------------------------------------------------------- 数据加载
@@ -1590,11 +1609,256 @@ class _RelationDesignerState extends State<RelationDesigner> {
               _sqliteHint(),
             ],
             const SizedBox(height: 6),
-            Expanded(child: _body()),
+            Expanded(
+              child: _relationListOpen ? _bodyWithRelationList() : _body(),
+            ),
           ],
         ),
       ),
     );
+  }
+
+  /// 画布 + 右侧关系列表（第 54 轮 P2-5）。
+  ///
+  /// 只在侧栏打开时套一层 Row：画布拿剩余宽度，侧栏固定 260px（向导内嵌的
+  /// compact 模式 220px）。关闭时走原来的 [_body]，不改变既有画布手势。
+  Widget _bodyWithRelationList() {
+    final panelWidth = widget.compact ? 220.0 : 260.0;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Expanded(child: _body()),
+        const SizedBox(width: 8),
+        SizedBox(
+          key: const ValueKey('er-relation-list-panel-slot'),
+          width: panelWidth,
+          child: _relationListPanel(),
+        ),
+      ],
+    );
+  }
+
+  /// 工具栏按钮：打开 / 关闭关系列表侧栏。
+  void _toggleRelationList() {
+    setState(() {
+      _relationListOpen = !_relationListOpen;
+      if (!_relationListOpen) _relationListFilter.clear();
+    });
+  }
+
+  void _closeRelationList() {
+    setState(() {
+      _relationListOpen = false;
+      _relationListFilter.clear();
+    });
+  }
+
+  /// 右侧「关系列表」面板：标题（总数）+ 搜索 + 可点击的关系行（第 54 轮 P2-5）。
+  ///
+  /// 内容随 [_graphRevision] 刷新：[_suggestions] / [_m2mLinks] 都按版本缓存，
+  /// 新建 / 删除外键、折叠中间表后 [_bumpGraph] 会让列表重新计算，不需要额外
+  /// 通知侧栏。
+  Widget _relationListPanel() {
+    final all = _relationListItems;
+    final visible = relationListItems(
+      relations: _relations,
+      suggestions: _suggestions,
+      manyToMany: _m2mLinks,
+      filter: _relationListFilter.text,
+    );
+    return Container(
+      key: const ValueKey('er-relation-list-panel'),
+      padding: EdgeInsets.all(widget.compact ? 8 : 10),
+      decoration: BoxDecoration(
+        color: AppColors.panel,
+        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(AppMetrics.radiusCard),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  pickText(
+                    '关系列表（${all.length} 条）',
+                    'Relation list (${all.length})',
+                  ),
+                  key: const ValueKey('er-relation-list-title'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.cardHeading,
+                  ),
+                ),
+              ),
+              IconBtn(
+                Icons.close,
+                key: const ValueKey('er-relation-list-close'),
+                tooltip: pickText('关闭关系列表', 'Close relation list'),
+                dimension: 22,
+                glyphSize: 13,
+                onPressed: _closeRelationList,
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Field(
+            key: const ValueKey('er-relation-list-filter'),
+            label: '',
+            compact: true,
+            hint: pickText('搜索表名 / 列名', 'Search table / column'),
+            controller: _relationListFilter,
+            onChanged: (_) => setState(() {}),
+          ),
+          const SizedBox(height: 6),
+          Expanded(child: _relationListBody(all, visible)),
+        ],
+      ),
+    );
+  }
+
+  /// 侧栏列表区：加载中 / 空状态 / 可滚动的关系行。
+  Widget _relationListBody(
+    List<ErRelationListItem> all,
+    List<ErRelationListItem> visible,
+  ) {
+    if (_loading) {
+      return Center(
+        child: Text(pickText('加载中…', 'Loading…'), style: kSmallMuted),
+      );
+    }
+    if (visible.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(
+            all.isEmpty
+                ? pickText(
+                    '还没有关系；添加表并连接字段后会出现在这里',
+                    'No relations yet; add tables and connect columns to see them here',
+                  )
+                : pickText('没有匹配的关系', 'No matching relations'),
+            key: const ValueKey('er-relation-list-empty'),
+            style: kSmallMuted,
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+    return ListView.builder(
+      key: const ValueKey('er-relation-list-items'),
+      padding: EdgeInsets.zero,
+      itemCount: visible.length,
+      itemBuilder: (context, index) => _relationListRow(visible[index]),
+    );
+  }
+
+  /// 一行关系：类型小徽标 + 「a.b → c.d」+（真实外键）删除入口。
+  Widget _relationListRow(ErRelationListItem item) {
+    final (badge, badgeBg, badgeFg, badgeBorder) = switch (item.kind) {
+      ErRelationListItemKind.foreignKey => (
+        pickText('外键', 'FK'),
+        AppColors.chipBg,
+        AppColors.link,
+        AppColors.border,
+      ),
+      ErRelationListItemKind.suggested => (
+        pickText('建议', 'Suggested'),
+        AppColors.warnBg,
+        AppColors.warnText,
+        AppColors.warnBorder,
+      ),
+      ErRelationListItemKind.manyToMany => (
+        pickText('多对多', 'M2M'),
+        AppColors.infoBg,
+        AppColors.infoText,
+        AppColors.infoBorder,
+      ),
+    };
+    // 只有真实外键能删；SQLite 不支持 ALTER DROP，SQLite 下不显示删除入口。
+    final canDelete =
+        item.kind == ErRelationListItemKind.foreignKey &&
+        !_isSqlite &&
+        item.relation.name.isNotEmpty;
+    return Container(
+      key: ValueKey('er-relation-item-${item.key}'),
+      margin: const EdgeInsets.only(bottom: 4),
+      decoration: BoxDecoration(
+        color: AppColors.panel,
+        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(AppMetrics.radiusControl),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(AppMetrics.radiusControl),
+        onTap: () => _activateRelationListItem(item),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+          child: Row(
+            children: <Widget>[
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                decoration: BoxDecoration(
+                  color: badgeBg,
+                  border: Border.all(color: badgeBorder),
+                  borderRadius: BorderRadius.circular(3),
+                ),
+                child: Text(
+                  badge,
+                  maxLines: 1,
+                  style: TextStyle(fontSize: 8.5, color: badgeFg),
+                ),
+              ),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                  item.displayLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 10, color: AppColors.bodyText),
+                ),
+              ),
+              if (canDelete)
+                IconBtn(
+                  Icons.delete_outline,
+                  key: ValueKey('er-relation-delete-${item.relation.name}'),
+                  tooltip: pickText('删除外键', 'Delete foreign key'),
+                  dimension: 20,
+                  glyphSize: 12,
+                  danger: true,
+                  onPressed: () => _deleteRelationFromList(item.relation),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 点击关系行：外键打开详情（可删）、建议立即建立、多对多折叠 / 展开中间表。
+  void _activateRelationListItem(ErRelationListItem item) {
+    switch (item.kind) {
+      case ErRelationListItemKind.foreignKey:
+        _selectRelation(item.relation);
+        break;
+      case ErRelationListItemKind.suggested:
+        _applySuggestions(only: item.relation);
+        break;
+      case ErRelationListItemKind.manyToMany:
+        final junction = item.junctionTable;
+        if (junction != null) _toggleJunction(junction);
+        break;
+    }
+  }
+
+  /// 侧栏删除真实外键：复用 [_deleteForeignKey]（自带二次确认）。
+  Future<void> _deleteRelationFromList(ErRelation relation) async {
+    if (_isSqlite || relation.name.isEmpty) return;
+    final deleted = await _deleteForeignKey(relation.localTable, relation.name);
+    if (deleted && mounted) await widget.onChanged?.call();
   }
 
   /// 画布上方的图例：箭头方向（约束方 → 被约束方）+ 线型 / 颜色含义。
@@ -1734,6 +1998,19 @@ class _RelationDesignerState extends State<RelationDesigner> {
           onPressed: _tables.isEmpty ? null : _autoLayout,
         ),
         const SizedBox(width: 8),
+        // 第 54 轮 P2-5：画布之外再给一个「关系列表」，列出现有外键 / 建议
+        // 关系 / 多对多，方便找不到线或线被卡片挡住时直接定位。
+        IconBtn(
+          _relationListOpen ? Icons.view_sidebar : Icons.list_alt,
+          key: const ValueKey('er-relation-list-toggle'),
+          tooltip: pickText('关系列表', 'Relation list'),
+          dimension: 24,
+          glyphSize: 14,
+          onPressed: _loading || _loadError != null
+              ? null
+              : _toggleRelationList,
+        ),
+        const SizedBox(width: 6),
         IconBtn(
           Icons.help_outline,
           key: const ValueKey('er-suggestion-help'),

@@ -313,7 +313,9 @@ jobs:
         with:
           name: dbpilot-release-${{ matrix.artifact }}
           path: |
-            DBPilot-*-${{ matrix.artifact }}.zip
+            # 通配符末尾要留 *：Windows 产物是 ...-windows-x64-portable.zip，
+            # 旧写法 ...-windows-x64.zip 匹配不到，Release 会缺 portable 包。
+            DBPilot-*-${{ matrix.artifact }}*.zip
             DBPilot-*-windows-x64-setup.exe
           if-no-files-found: error
           retention-days: 7

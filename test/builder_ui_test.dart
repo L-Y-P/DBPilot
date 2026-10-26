@@ -187,7 +187,10 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('builder-table-orders')));
     await settle(tester, rounds: 3);
     expect(find.text('主表'), findsOneWidget);
-    expect(previewSql(tester), contains('FROM "orders"'));
+    // The SQLite widget harness has _database = main, so the builder now
+    // qualifies every reference (ROUND68 P1-01: pooled search_path may be
+    // empty; the namespace must not depend on it).
+    expect(previewSql(tester), contains('FROM "main"."orders"'));
 
     // Choosing a primary expands its field list automatically, so its columns
     // are immediately reachable; clicking one adds it to the output fields.
@@ -195,7 +198,7 @@ void main() {
     expect(field, findsOneWidget);
     await tester.tap(field);
     await settle(tester, rounds: 2);
-    expect(previewSql(tester), contains('SELECT "orders"."amount"'));
+    expect(previewSql(tester), contains('SELECT "main"."orders"."amount"'));
     expect(find.text('amount'), findsWidgets);
 
     // LIMIT lives in the sorting tab and edits the SQL immediately.
@@ -251,20 +254,20 @@ void main() {
     await settle(tester, rounds: 3);
     expect(find.text('主表'), findsOneWidget);
     expect(find.text('接入'), findsOneWidget);
-    expect(previewSql(tester), contains('LEFT JOIN "users"'));
+    expect(previewSql(tester), contains('LEFT JOIN "main"."users"'));
 
     // Clicking another table while a primary exists joins it.
     await tester.tap(find.byKey(const ValueKey('builder-table-users')));
     await settle(tester, rounds: 2);
     // It is already joined from the FK derivation, so the click removes it.
     expect(find.text('接入'), findsNothing);
-    expect(previewSql(tester), isNot(contains('LEFT JOIN "users"')));
+    expect(previewSql(tester), isNot(contains('LEFT JOIN "main"."users"')));
 
     // Clicking it once more joins it again.
     await tester.tap(find.byKey(const ValueKey('builder-table-users')));
     await settle(tester, rounds: 2);
     expect(find.text('接入'), findsOneWidget);
-    expect(previewSql(tester), contains('LEFT JOIN "users"'));
+    expect(previewSql(tester), contains('LEFT JOIN "main"."users"'));
 
     // Clicking the primary table again cancels the primary selection.
     await tester.tap(find.byKey(const ValueKey('builder-table-orders')));
@@ -320,7 +323,7 @@ void main() {
     await tester.pump();
     await tester.tap(find.byKey(const ValueKey('builder-add-order')));
     await tester.pump();
-    expect(previewSql(tester), contains('ORDER BY "orders"."id"'));
+    expect(previewSql(tester), contains('ORDER BY "main"."orders"."id"'));
 
     await tester.tap(find.byKey(const ValueKey('builder-tab-output')));
     await tester.pump();

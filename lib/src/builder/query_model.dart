@@ -700,21 +700,56 @@ class _Emitter {
     required this.quote,
     required this.dialect,
     required this.tables,
+    this.defaultNamespace = '',
   });
 
   final bool previewMode;
   final String Function(String) quote;
   final BuilderDialect dialect;
   final Map<String, BuilderTable> tables;
+
+  /// Namespace (PostgreSQL schema / MySQL database / SQLite file) every table
+  /// reference of the current data source is qualified with.
+  ///
+  /// The builder executes on pooled connections, and a pooled connection may
+  /// still carry session state from an earlier script (a pg_dump-style
+  /// `set_config('search_path', '', false)` leaves the search_path empty), so
+  /// an unqualified `"film_actor"` can raise 42P01 even though the table is in
+  /// the active database. Qualifying the reference makes the SQL independent of
+  /// session state. Cross-database (advanced) tables carry their own namespace
+  /// and are unaffected; an empty value keeps the historical bare rendering.
+  final String defaultNamespace;
+
   final List<SqlParam> params = <SqlParam>[];
   final List<String> warnings = <String>[];
 
   /// Render one table reference: `database.table` for cross-database tables,
-  /// the bare quoted name otherwise.
+  /// `defaultNamespace.table` for the single data source, the bare quoted
+  /// name otherwise.
   String tableRef(String tableKey) {
     final table = tables[tableKey];
-    if (table == null || table.database.isEmpty) return quote(tableKey);
-    return quote(table.database) + '.' + quote(table.name);
+    if (table != null && table.database.isNotEmpty) {
+      return quote(table.database) + '.' + quote(table.name);
+    }
+    if (defaultNamespace.isNotEmpty) {
+      return quote(defaultNamespace) + '.' + quote(table?.name ?? tableKey);
+    }
+    return quote(tableKey);
+  }
+
+  /// Render the `table.*` wildcard of one FROM item.
+  ///
+  /// A schema-qualified wildcard (`"public"."film".*`) is rejected by SQLite
+  /// (near "*": syntax error) and only accepted by some engines, while the
+  /// wildcard is defined against the FROM item's name in every dialect. The
+  /// FROM clause is already qualified, so the wildcard keeps the bare name and
+  /// the namespace never reaches this position.
+  String wildcardRef(String tableKey) {
+    final table = tables[tableKey];
+    if (table != null && table.database.isNotEmpty) {
+      return quote(table.database) + '.' + quote(table.name) + '.*';
+    }
+    return quote(table?.name ?? tableKey) + '.*';
   }
 
   String columnRef(String table, String column) =>
@@ -875,6 +910,38 @@ BuilderMissingValue? builderMissingConditionValue(BuilderQuery query) {
   return null;
 }
 
+/// Tables whose join multiplies the result rows (the "many" side of an FK).
+///
+/// Auto-derived joins run in both directions. `parent LEFT JOIN child` repeats
+/// the parent row once per child, so the result count no longer matches the
+/// primary table and used to be misread as data duplication (ROUND68 P3-02).
+/// The result header names those tables instead of leaving the count bare.
+///
+/// Detection uses the schema metadata only: [JoinSpec.rightColumn] is the
+/// child's FK column when it references the left table's key.
+List<String> builderJoinRowAmplifiers(
+    BuilderQuery query, List<BuilderTable> tables) {
+  final byKey = <String, BuilderTable>{
+    for (final table in tables) table.key: table,
+  };
+  final amplifiers = <String>[];
+  for (final join in query.joins) {
+    final right = byKey[join.rightTable];
+    if (right == null || join.rightColumn.isEmpty || join.leftColumn.isEmpty) {
+      continue;
+    }
+    final leftName = byKey[join.leftTable]?.name ?? join.leftTable;
+    final oneToMany = right.foreignKeys.any((fk) =>
+        fk.column == join.rightColumn &&
+        fk.refTable == leftName &&
+        fk.refColumn == join.leftColumn);
+    if (oneToMany && !amplifiers.contains(right.label)) {
+      amplifiers.add(right.label);
+    }
+  }
+  return amplifiers;
+}
+
 /// Build the SELECT for [query].
 ///
 /// [tables] is the schema payload; [quote] quotes one identifier the way the
@@ -887,6 +954,7 @@ BuilderSql buildBuilderSql(
   required String Function(String) quote,
   BuilderDialect? dialect,
   bool isMysql = false,
+  String defaultNamespace = '',
 }) {
   final resolvedDialect =
       dialect ?? (isMysql ? BuilderDialect.mysql : BuilderDialect.postgres);
@@ -911,12 +979,14 @@ BuilderSql buildBuilderSql(
     quote: quote,
     dialect: resolvedDialect,
     tables: tableMap,
+    defaultNamespace: defaultNamespace,
   );
   final executableEmitter = _Emitter(
     previewMode: false,
     quote: quote,
     dialect: resolvedDialect,
     tables: tableMap,
+    defaultNamespace: defaultNamespace,
   );
   final preview = _renderSelect(
     query,
@@ -1065,9 +1135,7 @@ String _renderSelect(
   final selectTables =
       visibleTables.isEmpty ? participating : visibleTables;
   final selectList = query.outputs.isEmpty
-      ? selectTables
-          .map((table) => emitter.tableRef(table) + '.*')
-          .join(', ')
+      ? selectTables.map(emitter.wildcardRef).join(', ')
       : query.outputs.map(columnExpr).join(', ');
   final head = 'SELECT ' + (query.distinct ? 'DISTINCT ' : '') + selectList;
 

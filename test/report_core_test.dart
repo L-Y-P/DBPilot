@@ -109,7 +109,9 @@ void main() {
     expect(preview(tester), contains('请先选择主表'));
     await tester.tap(find.text('sample').first);
     await tester.pump();
-    expect(preview(tester), contains('FROM "sample"'));
+    // The builder qualifies the data source namespace so the pooled session's
+    // search_path cannot break the statement (ROUND68 P1-01).
+    expect(preview(tester), contains('FROM "main"."sample"'));
     await tester.ensureVisible(find.text('执行查询'));
     await tester.tap(find.text('执行查询'));
     await settle(tester);

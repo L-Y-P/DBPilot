@@ -7,6 +7,7 @@ import '../app_state.dart';
 import '../connection_store_notice.dart';
 import '../db_options.dart';
 import '../i18n.dart';
+import '../i18n_literals.dart';
 import '../nav.dart';
 import '../notice.dart';
 import '../theme.dart';
@@ -29,6 +30,30 @@ const List<String> _pgSslModes = <String>[
   'verify-ca',
   'verify-full',
 ];
+
+/// Append an actionable hint to a TLS probe error such as
+/// `invalid peer certificate: UnknownIssuer`.
+///
+/// The server's own message is kept verbatim (it names the failing cause);
+/// only certificate-ish text gets the extra "use require or a CA file" advice.
+String appendSslCertificateHint(String message) {
+  final lower = message.toLowerCase();
+  final tlsError = lower.contains('certificate') ||
+      lower.contains('unknownissuer') ||
+      lower.contains('unknown issuer') ||
+      message.contains('证书');
+  if (!tlsError) return message;
+  return '$message '
+      '${pickText(
+    '提示：通常是证书链不受信任（例如 MySQL 自动生成的自签证书）。'
+        '若只需加密连接，请把「证书校验」改为 require；要校验证书请指定 CA 证书文件'
+        '（verify-ca / verify-full 需要 CA）。',
+    'Hint: the certificate chain is probably untrusted (e.g. the self-signed '
+        'certificate MySQL generates automatically). To just encrypt the '
+        'connection set the certificate check to require; to verify it, '
+        'provide the CA certificate file (verify-ca / verify-full need a CA).',
+  )}';
+}
 
 /// Connection manager: list, create, edit, delete, test and open connections.
 ///
@@ -78,7 +103,10 @@ class _ConnectionsViewState extends State<ConnectionsView> {
   String _driver = 'mysql';
   String _charset = '';
   String _sslMode = 'disable';
-  String _sslVerify = 'verify-full';
+  // New connections start at "encrypt only": `require` must behave like
+  // mysql --ssl-mode=REQUIRED, so a self-signed server (the MySQL default)
+  // connects instead of failing with UnknownIssuer.
+  String _sslVerify = 'require';
   /// PostgreSQL has one libpq-style `sslmode` instead of MySQL's
   /// mode + separate certificate-verification pair.
   String _pgSsl = 'disable';
@@ -105,7 +133,7 @@ class _ConnectionsViewState extends State<ConnectionsView> {
     final mode = (entry?['ssl_mode'] ?? 'disable').toString();
     final verify = (entry?['ssl_verify'] ?? '').toString();
     // A stored verify level only means TLS when the mode actually enables it:
-    // the MySQL form keeps `ssl_verify = verify-full` as its idle default while
+    // the MySQL form keeps `ssl_verify = require` as its idle default while
     // SSL is off, so trusting it unconditionally made a brand-new PostgreSQL
     // connection request certificate verification and fail.
     if (mode == 'disable' || mode == 'allow') return mode;
@@ -192,7 +220,7 @@ class _ConnectionsViewState extends State<ConnectionsView> {
     _hideDb.text = (entry?['hide_db'] ?? '').toString();
     _charset = (entry?['charset'] ?? '').toString();
     _sslMode = (entry?['ssl_mode'] ?? 'disable').toString();
-    _sslVerify = (entry?['ssl_verify'] ?? 'verify-full').toString();
+    _sslVerify = (entry?['ssl_verify'] ?? 'require').toString();
     _pgSsl = _pgSslFrom(entry);
     _sslCa.text = (entry?['ssl_ca'] ?? '').toString();
     _sslCert.text = (entry?['ssl_cert'] ?? '').toString();
@@ -378,7 +406,8 @@ class _ConnectionsViewState extends State<ConnectionsView> {
       setState(() {
         _testing = false;
         _testOk = false;
-        _testResult = '${t('conn_test_fail')}: $e';
+        _testResult =
+            '${t('conn_test_fail')}: ${appendSslCertificateHint('$e')}';
       });
     }
     dialog.rebuild();
@@ -1021,6 +1050,39 @@ class _ConnectionsViewState extends State<ConnectionsView> {
     );
   }
 
+  /// Explain what the (SSL 模式, 证书校验) pair actually does.
+  ///
+  /// The selectors overlap; spelling it out keeps `require` (encrypt only)
+  /// from looking like a broken verify-full and tells self-signed setups which
+  /// value connects.
+  String _sslVerifyHint() {
+    if (_sslVerify == 'require') {
+      return pickText(
+        'require 只加密、不校验证书链（等价 mysql --ssl-mode=REQUIRED）：'
+        '自签证书或未知 CA 也能连接。要防止中间人攻击请选 verify-ca / verify-full。',
+        'require only encrypts and does not verify the certificate chain '
+        '(equivalent to mysql --ssl-mode=REQUIRED), so self-signed or unknown '
+        'CA certificates still connect. Choose verify-ca / verify-full to '
+        'protect against MITM.',
+      );
+    }
+    if (_sslCa.text.trim().isEmpty) {
+      return pickText(
+        'verify-ca / verify-full 需要 CA：自签证书请改用 require，或在下方指定 CA 证书文件；'
+        '未填写 CA 时会改用系统根证书，自签证书通常报 UnknownIssuer。',
+        'verify-ca / verify-full need a CA: for a self-signed certificate use '
+        'require, or specify the CA certificate file below. Without a CA the '
+        'system trust store is used and a self-signed server usually fails '
+        'with UnknownIssuer.',
+      );
+    }
+    return pickText(
+      '将用上方 CA 校验证书链；require 只加密、不校验证书链。',
+      'The CA above is used to verify the chain; require only encrypts and '
+      'does not verify it.',
+    );
+  }
+
   /// "SSL" tab: MySQL's mode + verification pair, or libpq's single sslmode.
   Widget _sslTab({required bool isSqlite, required bool isPostgres}) {
     if (isSqlite) {
@@ -1058,14 +1120,16 @@ class _ConnectionsViewState extends State<ConnectionsView> {
           FormRow(
             label: 'SSL 模式',
             child: SelectBox<String>(
+              key: const ValueKey('ssl-mode'),
               value: _sslMode,
               onChanged: (v) {
-                _sslMode = v ?? 'disable';
-                if (_sslMode == 'disable') {
-                  _sslVerify = 'require';
-                } else if (_sslVerify == 'require') {
-                  _sslVerify = 'verify-full';
-                }
+                final next = v ?? 'disable';
+                // Enabling TLS must never silently raise verification: require
+                // means "encrypt, but do not validate the chain" (mysql
+                // --ssl-mode=REQUIRED). Only switching TLS off resets the
+                // hidden value, so re-enabling starts from encrypt-only again.
+                if (next == 'disable') _sslVerify = 'require';
+                _sslMode = next;
                 _rebuildForm();
               },
               items: [
@@ -1078,9 +1142,10 @@ class _ConnectionsViewState extends State<ConnectionsView> {
             FormRow(
               label: '证书校验',
               child: SelectBox<String>(
+                key: const ValueKey('ssl-verify'),
                 value: _sslVerify,
                 onChanged: (v) {
-                  _sslVerify = v ?? 'verify-full';
+                  _sslVerify = v ?? 'require';
                   _rebuildForm();
                 },
                 items: [
@@ -1090,14 +1155,13 @@ class _ConnectionsViewState extends State<ConnectionsView> {
               ),
             ),
             ..._sslFileRows(),
-            if (_sslVerify != 'require' && _sslCa.text.trim().isEmpty)
-              Padding(
-                padding: EdgeInsets.only(bottom: 10),
-                child: Text(
-                  '校验需要 CA 证书：不填会改用系统根证书，自签证书请指定 CA 文件。',
-                  style: kSmallMuted,
-                ),
-              ),
+            // The two selectors overlap semantically, so say what the pair does:
+            // require is encryption only; verify-* rejects self-signed servers
+            // unless a CA is configured.
+            Padding(
+              padding: EdgeInsets.only(bottom: 10),
+              child: Text(_sslVerifyHint(), style: kSmallMuted),
+            ),
           ],
         ],
         Padding(
@@ -1131,8 +1195,16 @@ class _ConnectionsViewState extends State<ConnectionsView> {
         Padding(
           padding: EdgeInsets.only(bottom: 10),
           child: Text(
-            '数据库地址从跳板机解析：可填写只监听远程 127.0.0.1 或内网地址的数据库。'
-            '本机 3306 等端口不会被暴露。',
+            pickText(
+              '数据库地址由跳板机解析：请按跳板机视角填写数据库「主机:端口」的远程侧地址'
+              '（例如 127.0.0.1:3306 表示数据库在跳板机本机），不要填写本机 SSH 转发端口'
+              '（例如 13306），否则连接会对到错误端点。本机 3306 等端口不会被暴露。',
+              'The database address is resolved from the jump host: enter the '
+              'remote-side host:port as seen from the jump host (e.g. '
+              '127.0.0.1:3306 means the database runs on the jump host). Do not '
+              'enter a local SSH-forwarded port (e.g. 13306) — that connects to '
+              'the wrong endpoint. Local ports such as 3306 are not exposed.',
+            ),
             style: kSmallMuted,
           ),
         ),

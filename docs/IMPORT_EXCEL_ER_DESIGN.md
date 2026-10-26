@@ -597,3 +597,43 @@ Future<void> showRelationDesigner(
 - sqlx 0.8.6 未处理 LocalInfileRequest（connection/executor.rs:161 注释 unhandled），本机 MySQL local_infile=0，离线 cargo 缓存无 mysql_async；因此未实现、未测吞吐。
 - 后续可选：patch sqlx-mysql 增加 handler，或仅在导入模块引入 mysql_async 建独立连接；需覆盖字符集、\N 与空串、日期/数字、错误行号、安全开关与回滚，不迁移全项目访问层。
 
+## 22. 第 68 轮修订（ROUND68 报告问题的修复契约）
+
+> 来源：test-report/ROUND68_FULL_TEST_REPORT.md §8/§9。本轮只改展示与 SQL 生成，未改 FRB 签名、未新增 Rust 代码、未重建 Release。
+> 详细修复记录见 test-report/FIX_REPORT_ROUND69.md。
+
+### 22.1 查询构建器：数据源命名空间显式限定（P1-01）
+
+- 背景：构建器把 SQL 交给 SQL 控制台的同一套池化会话执行；pg_dump 生成的脚本里有 `SELECT pg_catalog.set_config('search_path', '', false);`，控制台为整段脚本固定一条连接，脚本结束后这条连接带着**空 search_path** 回到池里。构建器原来发不带限定的表名，于是报 42P01（relation does not exist），而同一时刻 SQL 控制台里 `SELECT COUNT(*) FROM film` 正常。
+- 修复：`buildBuilderSql` 新增 `defaultNamespace` 参数，`_Emitter.tableRef` 在单数据源模式下渲染 `<命名空间>.<表>`（PG 是 schema、MySQL 是库、SQLite 是 main/ATTACH 别名）；跨库（advanced）表继续用自己带的命名空间，advanced 模式整体传空串以保持原有裸名渲染。`builder_view._buildSql` 传入当前 `_database`。
+- SELECT 无显式输出字段时，通配符仍是**裸** `表.*`（新增 `_Emitter.wildcardRef`）：SQLite 不接受 `main.t.*`（near "*": syntax error），而 FROM 已经限定，通配符在任何方言里都按 FROM 项名解析。PG / MySQL 实测 `SELECT "actor".* FROM "public"."actor"` 正常。
+- 测试：builder_model_test 新增 4 例（限定 FROM/JOIN/列/筛选/排序、空命名空间保持原样、跨库表保留自身命名空间、可执行 SQL 无裸表引用）；builder_ui_test 断言改为 `"main"."orders"` 形态；report_core_test P03 同步；新增 `test/builder_pg_searchpath_live_test.dart`（本机 PG + pagila：先 `set_config('search_path','',false)`，限定 SQL 成功、旧的不限定 SQL 仍报 42P01，live 不可达时 skip）。
+
+### 22.2 构建器结果行放大提示（P3-02）
+
+- 自动推导的一对多连接会把主表行按子表行数放大（MySQL customer 主表自动接入 4 张关系表后 100 条里出现大量重复客户）。新增纯函数 `builderJoinRowAmplifiers(query, tables)`：按 schema 元数据判断 rightColumn 是否是「引用左表主键」的子表外键，只列这些子表。
+- 结果头在「共 N 条」之后追加「一对多连接可能放大行数（表1、表2）」，不改查询本身、不自动去重。测试：builder_model_test 3 例（子表放大、父表不放大、缺列连接不误报）。
+
+### 22.3 数据库页行数展示诚实化（P3-01）
+
+- MySQL TABLE_ROWS / PG n_live_tup 都是统计估算；InnoDB 统计过期时可能对 252 万行的表报 0。新增 `tableRowCountLabel` / `tableRowCountTooltip` / `tableRowCountCell`：估算值统一加 `≈`；MySQL 且 row_count == 0 但 data_length > 0 时显示「0（统计可能过期）」并带 tooltip（说明可打开表页看精确行数或 ANALYZE TABLE）；SQLite 精确值不加标记。不伪造任何数字。
+- 测试：database_view_paging_test 新增 5 例（过期 0、估算、真空表不误报、PG、SQLite 精确、缺值）。
+
+### 22.4 E-R 画布上限（P3-04）
+
+- `RelationDesigner.maxTables` 默认 10 → **20**（第 68 轮 pagila 29 对象/23 关系一次看不全）。到达上限时：「添加表」按钮置灰并带 tooltip（说明可先移除部分表），自动带入提示明确「还有 N 张关联表未加入，可分批添加后继续」。
+- 未改布局算法与公开接口；`kRelationSeedLimit`（快速建表向导种子，10）保持原值，只有独立关系图入口用新默认。测试：er_designer_test 断言更新 + 新增「14 张关联表一次带入」用例；er_model_test 131 例不变。
+
+### 22.5 连接表单 SSL 语义与 SSH 地址提示（P2-02 / P3-05）
+
+- MySQL SSL：「证书校验」新建时默认 require（只加密、不校验证书链，等价 mysql --ssl-mode=REQUIRED）；SSL 模式切到 prefer/require 时**不再**静默把校验提升为 verify-full（旧行为让自签证书报 UnknownIssuer）；切到 disable 时复位隐藏值为 require。编辑已有连接保留用户保存值。
+- 证书类错误（certificate / UnknownIssuer / 证书）在「测试连接」失败文案后追加可操作提示（改用 require 或指定 CA 文件），原错误全文保留。
+- SSH：提示明确数据库主机/端口按**跳板机视角**填写远程侧地址（如 127.0.0.1:3306），不要填本机 SSH 转发端口（如 13306）。
+- 测试：connection_tabs_test 新增 4 例。Rust 侧 ssl_mode_for 无需改动（require → MySqlSslMode::Required 已正确）。
+
+### 22.6 本轮未做
+
+- 未重建 Release App、未做 GUI 抽测（磁盘约 1 GiB；本轮只改 Dart 展示与 SQL 生成，Rust 无改动）。
+- 未 live 实连自签证书服务器验证 P2-02 的 GUI 路径（Rust 语义已确认，widget 测试覆盖表单状态）。
+- P2-01（远程 Windows MySQL InnoDB 崩溃）是远端主机/IO 问题，本轮不修。
+

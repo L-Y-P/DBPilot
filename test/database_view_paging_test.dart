@@ -274,4 +274,58 @@ void main() {
     expect(find.text('Showing 50 / 120 rows'), findsOneWidget);
     expect(find.text('Showing 50 / 55 items'), findsOneWidget);
   });
+
+  // ------------------------------------------------------- ROUND68 P3-01
+  // The 行数 column comes from server statistics (MySQL TABLE_ROWS,
+  // PostgreSQL n_live_tup). InnoDB can report 0 for a table that already has
+  // storage allocated (stale statistics: round 68 saw TABLE_ROWS = 0 for a
+  // 2,524,000-row table), and showing that 0 as a precise count misleads the
+  // user. Estimates are marked with "≈"; the stale-zero case is called out.
+
+  Map<String, dynamic> rowCountTable(Object? count, {Object? dataLength}) =>
+      <String, dynamic>{
+        'row_count': count,
+        ?dataLength == null ? null : 'data_length': dataLength,
+      };
+
+  test('MySQL stale statistics: 0 rows with storage is called out', () {
+    final table = rowCountTable(0, dataLength: 167772160);
+    expect(tableRowCountLabel(table, driver: 'mysql'), contains('统计可能过期'));
+    final tooltip = tableRowCountTooltip(table, driver: 'mysql');
+    expect(tooltip, isNotNull);
+    expect(tooltip, contains('ANALYZE'));
+    expect(tooltip, contains('精确行数'));
+  });
+
+  test('MySQL estimates are marked with the estimate sign', () {
+    expect(
+        tableRowCountLabel(rowCountTable(2524000), driver: 'mysql'), '≈2524000');
+    // A genuinely empty InnoDB table (no storage allocated) is not flagged.
+    expect(tableRowCountLabel(rowCountTable(0, dataLength: 0), driver: 'mysql'),
+        '≈0');
+    expect(
+        tableRowCountTooltip(rowCountTable(0, dataLength: 0), driver: 'mysql'),
+        isNull);
+  });
+
+  test('PostgreSQL estimates are marked and have no stale hint', () {
+    expect(tableRowCountLabel(rowCountTable(500000), driver: 'postgres'),
+        '≈500000');
+    expect(
+        tableRowCountTooltip(rowCountTable(0, dataLength: 8192),
+            driver: 'postgres'),
+        isNull);
+  });
+
+  test('SQLite counts stay exact', () {
+    expect(tableRowCountLabel(rowCountTable(7), driver: 'sqlite'), '7');
+    expect(
+        tableRowCountTooltip(rowCountTable(0, dataLength: 4096),
+            driver: 'sqlite'),
+        isNull);
+  });
+
+  test('a missing row count renders an empty cell', () {
+    expect(tableRowCountLabel(<String, dynamic>{}, driver: 'mysql'), '');
+  });
 }

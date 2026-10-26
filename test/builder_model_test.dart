@@ -45,7 +45,8 @@ List<BuilderTable> schema() => <BuilderTable>[
 BuilderSql build(BuilderQuery query,
         {bool isMysql = false,
         BuilderDialect? dialect,
-        List<BuilderTable>? tables}) =>
+        List<BuilderTable>? tables,
+        String defaultNamespace = ''}) =>
     buildBuilderSql(
       query,
       tables ?? schema(),
@@ -55,6 +56,7 @@ BuilderSql build(BuilderQuery query,
           : pgQuote,
       dialect: dialect,
       isMysql: isMysql,
+      defaultNamespace: defaultNamespace,
     );
 
 /// Table names a UNION branch references through FROM / JOIN, in order.
@@ -932,5 +934,156 @@ void main() {
   test('field keys survive tables and columns with dots', () {
     final key = builderFieldKey('weird.table', 'a.col');
     expect(splitBuilderFieldKey(key), ('weird.table', 'a.col'));
+  });
+
+  // ------------------------------------------------- P1-01 (ROUND68) regression
+  // PostgreSQL: the builder runs on a pooled connection, and a previous console
+  // script can leave the session search_path empty (pg_dump emits
+  // SELECT pg_catalog.set_config('search_path', '', false);). Unqualified
+  // references then fail with 42P01 relation does not exist, while the same
+  // query works in the SQL console. The current data source must therefore be
+  // rendered as <schema>.<table> everywhere.
+
+  BuilderQuery qualifiedQuery() {
+    final query = BuilderQuery()..primaryTable = 'order';
+    query.outputs.addAll(<OutputField>[
+      OutputField(table: 'order', column: 'id'),
+      OutputField(table: 'order', column: 'amount'),
+    ]);
+    query.joins.add(JoinSpec(
+      type: 'LEFT',
+      leftTable: 'order',
+      rightTable: 'user',
+      leftColumn: 'user_id',
+      rightColumn: 'id',
+    ));
+    query.filters.add(FilterEntry.condition(FilterCondition(
+      table: 'order',
+      column: 'status',
+      op: '=',
+      value: 'paid',
+    )));
+    query.orders.add(OrderSpec(table: 'order', column: 'created_at', dir: 'DESC'));
+    return query;
+  }
+
+  test('a data source namespace qualifies FROM / JOIN / columns / filters', () {
+    final sql = build(qualifiedQuery(), defaultNamespace: 'public');
+    expect(sql.preview,
+        contains('SELECT "public"."order"."id" AS "order.id",'
+            ' "public"."order"."amount" AS "order.amount"'));
+    expect(sql.preview, contains('FROM "public"."order"'));
+    expect(sql.preview,
+        contains('LEFT JOIN "public"."user" ON '
+            '"public"."order"."user_id" = "public"."user"."id"'));
+    expect(sql.preview,
+        contains('WHERE "public"."order"."status" = '));
+    expect(
+        sql.preview, contains('ORDER BY "public"."order"."created_at" DESC'));
+    // The executable statement must be qualified too - that is the one the
+    // server actually runs.
+    expect(sql.executable, contains('FROM "public"."order"'));
+    expect(sql.executable, contains('JOIN "public"."user"'));
+    expect(sql.warnings, isEmpty);
+  });
+
+  test('an empty namespace keeps the historical unqualified SQL', () {
+    final sql = build(qualifiedQuery());
+    expect(sql.preview, contains('FROM "order"'));
+    expect(sql.preview, isNot(contains('"public"')));
+    expect(sql.executable, isNot(contains('"public"')));
+  });
+
+  test('a cross-database table keeps its own namespace under a default one', () {
+    final tables = <BuilderTable>[
+      BuilderTable(
+        name: 'order',
+        database: 'other_db',
+        columns: <BuilderColumn>[
+          BuilderColumn(name: 'id', type: 'integer', key: 'PRI'),
+          BuilderColumn(name: 'user_id', type: 'integer'),
+          BuilderColumn(name: 'amount', type: 'numeric'),
+          BuilderColumn(name: 'status', type: 'varchar'),
+          BuilderColumn(name: 'created_at', type: 'timestamp'),
+        ],
+      ),
+      BuilderTable(name: 'user', columns: <BuilderColumn>[
+        BuilderColumn(name: 'id', type: 'integer', key: 'PRI'),
+        BuilderColumn(name: 'name', type: 'varchar'),
+      ]),
+    ];
+    final query = BuilderQuery()..primaryTable = 'other_db.order';
+    query.outputs.add(OutputField(table: 'other_db.order', column: 'id'));
+    final sql = build(query, tables: tables, defaultNamespace: 'public');
+    expect(sql.preview, contains('FROM "other_db"."order"'));
+    expect(sql.preview, contains('SELECT "other_db"."order"."id"'));
+  });
+
+  test('qualified SQL has no bare table reference in the executable', () {
+    // Contract pinned without a live server: once a namespace is known, no
+    // bare table reference may reach the executable statement.
+    final sql = build(qualifiedQuery(), defaultNamespace: 'pagila_public');
+    expect(sql.executable, contains('"pagila_public"."order"'));
+    expect(sql.executable, isNot(contains('FROM "order"')));
+  });
+
+  // ------------------------------------------------- P3-02 (ROUND68) regression
+  // A one-to-many join repeats the primary row once per child; the result
+  // header must name the tables that amplify the count.
+
+  /// film (parent) <- film_actor (child) and film -> language (parent).
+  List<BuilderTable> amplificationSchema() => <BuilderTable>[
+        BuilderTable(name: 'film', columns: <BuilderColumn>[
+          BuilderColumn(name: 'film_id', type: 'int', key: 'PRI'),
+          BuilderColumn(name: 'language_id', type: 'int'),
+        ]),
+        BuilderTable(
+          name: 'film_actor',
+          columns: <BuilderColumn>[
+            BuilderColumn(name: 'actor_id', type: 'int', key: 'PRI'),
+            BuilderColumn(name: 'film_id', type: 'int'),
+          ],
+          foreignKeys: <BuilderForeignKey>[
+            BuilderForeignKey(
+                column: 'film_id', refTable: 'film', refColumn: 'film_id'),
+          ],
+        ),
+        BuilderTable(name: 'language', columns: <BuilderColumn>[
+          BuilderColumn(name: 'language_id', type: 'int', key: 'PRI'),
+          BuilderColumn(name: 'name', type: 'varchar'),
+        ]),
+      ];
+
+  test('a child-side join is reported as a row amplifier', () {
+    final query = BuilderQuery()..primaryTable = 'film';
+    query.joins.add(JoinSpec(
+      type: 'LEFT',
+      leftTable: 'film',
+      rightTable: 'film_actor',
+      leftColumn: 'film_id',
+      rightColumn: 'film_id',
+    ));
+    expect(builderJoinRowAmplifiers(query, amplificationSchema()),
+        ['film_actor']);
+  });
+
+  test('a parent-side join does not amplify rows', () {
+    final query = BuilderQuery()..primaryTable = 'film';
+    query.joins.add(JoinSpec(
+      type: 'LEFT',
+      leftTable: 'film',
+      rightTable: 'language',
+      leftColumn: 'language_id',
+      rightColumn: 'language_id',
+    ));
+    // Joining a table the primary points at cannot multiply the parent rows.
+    expect(builderJoinRowAmplifiers(query, amplificationSchema()), isEmpty);
+  });
+
+  test('incomplete joins are not reported as amplifiers', () {
+    final query = BuilderQuery()..primaryTable = 'film';
+    query.joins.add(JoinSpec(
+        type: 'LEFT', leftTable: 'film', rightTable: 'film_actor'));
+    expect(builderJoinRowAmplifiers(query, amplificationSchema()), isEmpty);
   });
 }

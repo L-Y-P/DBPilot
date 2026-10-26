@@ -209,7 +209,8 @@ Future<bool> confirmDeleteForeignKeyDialog(
 /// 公开接口由 §5.1 固定（导入向导第 5 步与快速建表向导第 4 步都依赖它）：
 /// [database] 是当前数据库 / 模式，[initialTables] 是打开时预置加入的表，
 /// [onChanged] 在关系变化（创建 / 删除 / 建中间表）后回调，[maxTables] 是画布
-/// 上限（默认 10），[height] 决定嵌入高度，[compact] 让向导内嵌更紧凑。
+/// 上限（默认 20；第 68 轮 P3-04 从 10 提高，大 schema 可一次看到更多表），
+/// [height] 决定嵌入高度，[compact] 让向导内嵌更紧凑。
 ///
 /// [onRequestEditFields] 非空时（快速建表向导第 4 步会传）：关系创建失败 / 被
 /// 前置校验阻止 / SQLite 不支持 ALTER 的提示里都会多出一个「返回工作表与字段
@@ -220,7 +221,7 @@ class RelationDesigner extends StatefulWidget {
     required this.database,
     this.initialTables = const <String>[],
     this.onChanged,
-    this.maxTables = 10,
+    this.maxTables = 20,
     this.height = 460,
     this.compact = false,
     this.onRequestEditFields,
@@ -810,6 +811,8 @@ class RelationDesignerState extends State<RelationDesigner> {
       maxTables: widget.maxTables,
     );
     final reachedLimit = allCandidates.length > candidates.length;
+    // 第 68 轮 P3-04：说清还有几张关联表被画布上限挡在外面。
+    final leftOut = allCandidates.length - candidates.length;
     if (candidates.isEmpty) {
       _applyAutoIncludeNotice(
         autoIncludeNotice(
@@ -837,12 +840,14 @@ class RelationDesignerState extends State<RelationDesigner> {
         accepted.add(name);
       }
       if (!mounted || accepted.isEmpty) return;
-      final notice = autoIncludeNotice(
-        addedCount: accepted.length,
-        hasAnyForeignKey: hasAnyForeignKey,
-        reachedLimit: reachedLimit,
-        maxTables: widget.maxTables,
-      );
+      final notice = reachedLimit
+          ? _limitNotice(addedCount: accepted.length, leftOut: leftOut)
+          : autoIncludeNotice(
+              addedCount: accepted.length,
+              hasAnyForeignKey: hasAnyForeignKey,
+              reachedLimit: false,
+              maxTables: widget.maxTables,
+            );
       setState(() {
         _tables = <ErTable>[..._tables, ...loadedTables];
         _localRelations.addAll(loadedRelations);
@@ -855,6 +860,21 @@ class RelationDesignerState extends State<RelationDesigner> {
     } finally {
       _expanding = false;
     }
+  }
+
+  /// 「已达画布上限」提示（第 68 轮 P3-04）。
+  ///
+  /// 原来的文案只说「其余关联表未加入」，用户无法判断还差多少；这里给出被
+  /// 上限挡住的关联表数量，并提示可以分批添加或先移除部分表。
+  String _limitNotice({required int addedCount, required int leftOut}) {
+    return pickText(
+      '已自动加入 $addedCount 张；已达画布上限 ${widget.maxTables} 张，'
+          '还有 $leftOut 张关联表未加入。可先移除部分表，或分批添加后继续。',
+      'Added $addedCount tables automatically; the canvas limit of '
+          '${widget.maxTables} tables has been reached and $leftOut related '
+          'table(s) were left out. Remove some tables, or add the rest in '
+          'batches to continue.',
+    );
   }
 
   /// 更新「自动带入」说明（只在内容变化时 setState，避免无谓重建）。
@@ -2693,6 +2713,14 @@ class RelationDesignerState extends State<RelationDesigner> {
           key: const ValueKey('er-add-table'),
           small: widget.compact,
           icon: Icons.add,
+          // 画布已满时按钮置灰，tooltip 说明原因与做法（第 68 轮 P3-04）。
+          tooltip: _tables.length >= widget.maxTables
+              ? pickText(
+                  '已达画布上限 ${widget.maxTables} 张；可先移除部分表再添加。',
+                  'The canvas limit of ${widget.maxTables} tables has been '
+                      'reached; remove some tables to add more.',
+                )
+              : null,
           onPressed:
               _loading ||
                   _loadError != null ||

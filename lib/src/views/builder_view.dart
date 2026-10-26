@@ -722,6 +722,12 @@ class _BuilderViewState extends State<BuilderView> {
         _tables,
         quote: AppState.instance.quoteIdent,
         dialect: _dialect,
+        // Qualify every table of the current data source: the statement runs on
+        // a pooled connection, which may still carry an empty search_path from
+        // a previous script (pg_dump emits
+        // SELECT pg_catalog.set_config('search_path', '', false);), and an
+        // unqualified name then fails with 42P01 (ROUND68 P1-01).
+        defaultNamespace: _advanced ? '' : (_database ?? ''),
       );
 
   /// Engine the generated SQL is rendered for. The builder branches on this
@@ -1980,6 +1986,15 @@ class _BuilderViewState extends State<BuilderView> {
     }
     parts.add(pickText('共 ' + _resultRowCount.toString() + ' 条',
         _resultRowCount.toString() + ' rows'));
+    // A one-to-many join repeats the primary row once per child, so the count
+    // is no longer the primary table's row count. Say which tables cause it
+    // instead of leaving users to read the rows as duplicates (ROUND68 P3-02).
+    final amplifiers = builderJoinRowAmplifiers(_query, _tables);
+    if (amplifiers.isNotEmpty && _resultRowCount > 0) {
+      parts.add(pickText(
+          '一对多连接可能放大行数（' + amplifiers.join('、') + '）',
+          'one-to-many joins can multiply rows: ' + amplifiers.join(', ')));
+    }
     if (_elapsedMs > 0) {
       parts.add(pickText('耗时 ' + _elapsedMs.toString() + 'ms',
           'took ' + _elapsedMs.toString() + 'ms'));

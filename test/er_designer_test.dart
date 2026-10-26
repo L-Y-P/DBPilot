@@ -144,7 +144,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-reviews')), findsOneWidget);
     expect(find.text('books.author_id → authors.id'), findsOneWidget);
     expect(find.text('reviews.book_id → books.id'), findsOneWidget);
-    expect(find.text('已加入 3/10'), findsOneWidget);
+    expect(find.text('已加入 3/20'), findsOneWidget);
 
     // 移除 books：它的外键边、以及 reviews → books 的边都不再显示。
     await tester.tap(find.byKey(const ValueKey('er-remove-books')));
@@ -152,7 +152,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
     expect(find.text('books.author_id → authors.id'), findsNothing);
     expect(find.text('reviews.book_id → books.id'), findsNothing);
-    expect(find.text('已加入 2/10'), findsOneWidget);
+    expect(find.text('已加入 2/20'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -183,6 +183,8 @@ void main() {
       find.byKey(const ValueKey('er-add-table')),
     );
     expect(addButton.onPressed, isNull);
+    // 第 68 轮 P3-04：画布满时按钮 tooltip 说明上限与做法。
+    expect(addButton.tooltip, contains('已达画布上限 5 张'));
   });
 
   testWidgets('空画布显示引导文案、主按钮与 SQLite 提示', (tester) async {
@@ -197,7 +199,12 @@ void main() {
       findsOneWidget,
     );
     expect(find.byKey(const ValueKey('er-sqlite-hint')), findsOneWidget);
-    expect(find.text('已加入 0/10'), findsOneWidget);
+    expect(find.text('已加入 0/20'), findsOneWidget);
+    // 第 68 轮 P3-04：默认画布上限从 10 提高到 20。
+    expect(
+      tester.widget<RelationDesigner>(find.byType(RelationDesigner)).maxTables,
+      20,
+    );
     // 空状态必须有主行动按钮（P2-5：文员看到空画布会以为功能坏了）。
     expect(find.byKey(const ValueKey('er-empty-add-table')), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('er-empty-add-table')));
@@ -224,7 +231,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-authors')), findsOneWidget);
     expect(find.byKey(const ValueKey('er-node-books')), findsOneWidget);
     expect(find.byKey(const ValueKey('er-node-reviews')), findsOneWidget);
-    expect(find.text('已加入 3/10'), findsOneWidget);
+    expect(find.text('已加入 3/20'), findsOneWidget);
     expect(find.byKey(const ValueKey('er-auto-added-hint')), findsOneWidget);
     expect(find.text('已自动加入关联表：books、reviews'), findsOneWidget);
     // 自动带入的外键直接画出来。
@@ -235,7 +242,7 @@ void main() {
     expect(find.byKey(const ValueKey('er-node-books')), findsNothing);
     expect(find.byKey(const ValueKey('er-node-reviews')), findsNothing);
     expect(find.byKey(const ValueKey('er-auto-added-hint')), findsNothing);
-    expect(find.text('已加入 1/10'), findsOneWidget);
+    expect(find.text('已加入 1/20'), findsOneWidget);
 
     // 手动再加一张无外键的表：撤销掉的关联表不能被自动带回来。
     await tester.tap(find.byKey(const ValueKey('er-add-table')));
@@ -278,7 +285,9 @@ void main() {
     expect(notice.tone, AlertTone.warn);
     expect(notice.message, contains('已自动加入 4 张'));
     expect(notice.message, contains('已达画布上限 5 张'));
-    expect(notice.message, contains('其余关联表未加入'));
+    // 第 68 轮 P3-04：明确还有几张关联表未加入。
+    expect(notice.message, contains('还有 1 张关联表未加入'));
+    expect(notice.message, contains('分批添加'));
     // 可关闭：关掉后提示不再出现。
     await tester.tap(
       find.descendant(
@@ -287,6 +296,69 @@ void main() {
       ),
     );
     await settle(tester);
+    expect(find.byKey(const ValueKey('er-auto-include-notice')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('默认画布上限 20 张：14 张关联表可一次自动带入（第68轮 P3-04）',
+      (tester) async {
+    await setSurface(tester);
+    Directory? directory;
+    final chainId = await tester.runAsync(() async {
+      directory = await Directory.systemTemp.createTemp('rma-er-cap20-');
+      final dbFile = File('${directory!.path}/cap20.sqlite');
+      await dbFile.create(recursive: true);
+      final created = await Api.instance.createConnection(<String, dynamic>{
+        'name': 'ER cap20',
+        'driver': 'sqlite',
+        'database': dbFile.path,
+      });
+      final id = ((created['connection'] as Map)['id']).toString();
+      await AppState.instance.connect(id);
+      for (var i = 1; i <= 14; i++) {
+        final fk = i == 1
+            ? ''
+            : ', k${i - 1}_id INTEGER REFERENCES k${i - 1}(id)';
+        await Api.instance.query(
+            'CREATE TABLE k$i (id INTEGER PRIMARY KEY AUTOINCREMENT$fk)');
+      }
+      return id;
+    });
+    expect(chainId, isNotNull);
+    addTearDown(() {
+      try {
+        directory?.deleteSync(recursive: true);
+      } catch (_) {}
+    });
+    // 恢复共享 fixture 的主连接（后注册的 tearDown 先执行）。
+    addTearDown(() async {
+      try {
+        await AppState.instance.connect(connectionId);
+      } catch (_) {}
+    });
+
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['k1'],
+          height: 520,
+        ),
+      ),
+    );
+    // 13 张关联表要逐个读取，等待轮数比普通场景更多。
+    await settle(tester, rounds: 40);
+
+    // 旧上限 10 会在第 10 张截断；默认 20 应一次带入整条链（1 + 13 = 14）。
+    expect(find.text('已加入 14/20'), findsOneWidget);
+    for (var i = 1; i <= 14; i++) {
+      expect(
+        find.byKey(ValueKey('er-node-k$i')),
+        findsOneWidget,
+        reason: 'node k$i',
+      );
+    }
+    // 没有被上限截断，所以不显示「已达上限」提示。
     expect(find.byKey(const ValueKey('er-auto-include-notice')), findsNothing);
     expect(tester.takeException(), isNull);
   });
@@ -1427,7 +1499,7 @@ void main() {
     expect(find.text('E-R diagram'), findsOneWidget);
     expect(find.text('+ Add table'), findsOneWidget);
     // authors/books + 自动带入的 reviews。
-    expect(find.text('Added 3/10'), findsOneWidget);
+    expect(find.text('Added 3/20'), findsOneWidget);
     expect(
       find.text('Related tables added automatically: reviews'),
       findsOneWidget,

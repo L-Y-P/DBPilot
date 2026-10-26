@@ -761,7 +761,8 @@ class _DatabaseViewState extends State<DatabaseView> {
                               ? '—'
                               : table['tablespace'],
                           mono: true),
-                    gridCell(table['row_count']),
+                    tableRowCountCell(table,
+                        driver: AppState.instance.driver),
                     _sizeCell(table),
                     if (isMysql) gridCell(table['collation'], mono: true),
                     gridCell(table['comment']),
@@ -1161,6 +1162,52 @@ String tableSizeLabel(Json table) {
   }
   return '—';
 }
+
+/// Text of the 行数 cell for one table row.
+///
+/// MySQL's TABLE_ROWS and PostgreSQL's n_live_tup are server statistics, so the
+/// header calls them estimates; the cell marks them with "≈" as well. The value
+/// that must not look exact is InnoDB's 0 for a table that already has storage
+/// pages allocated: the statistics are stale (or the table really is empty), so
+/// the cell says so instead of passing the 0 off as a precise count.
+String tableRowCountLabel(Json table, {required String driver}) {
+  final count = (table['row_count'] as num?)?.toInt();
+  if (count == null) return '';
+  if (driver == 'sqlite') return count.toString();
+  if (driver == 'mysql' && count == 0 && _dataLengthOf(table) > 0) {
+    return pickText('0（统计可能过期）', '0 (statistics may be stale)');
+  }
+  return '≈$count';
+}
+
+/// Hover explanation for the 行数 cell; null when the plain value says enough.
+String? tableRowCountTooltip(Json table, {required String driver}) {
+  if (driver != 'mysql') return null;
+  final count = (table['row_count'] as num?)?.toInt();
+  if (count != 0 || _dataLengthOf(table) <= 0) return null;
+  return pickText(
+    '服务端统计（TABLE_ROWS）显示 0 行，但该表已分配存储空间：统计可能过期，'
+        '也可能确实是空表。打开表页可看到浏览时的精确行数；'
+        '也可以在 SQL 控制台执行 ANALYZE TABLE 刷新统计。',
+    'Server statistics (TABLE_ROWS) report 0 rows, but the table has storage '
+        'allocated: the statistics may be stale, or the table really is empty. '
+        'Open the table page for the exact count while browsing, or run '
+        'ANALYZE TABLE in the SQL console to refresh them.',
+  );
+}
+
+/// The 行数 cell of one table row (see [tableRowCountLabel]).
+///
+/// The tooltip is attached explicitly (not through [gridCell]'s overflow-only
+/// hover) so the stale-statistics explanation is always reachable.
+Widget tableRowCountCell(Json table, {required String driver}) {
+  final cell = gridCell(tableRowCountLabel(table, driver: driver));
+  final tooltip = tableRowCountTooltip(table, driver: driver);
+  return tooltip == null ? cell : Tooltip(message: tooltip, child: cell);
+}
+
+int _dataLengthOf(Json table) =>
+    (table['data_length'] as num?)?.toInt() ?? 0;
 
 /// Number of objects the driver hid from the object panel (round34 P2-03).
 ///

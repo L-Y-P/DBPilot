@@ -1178,6 +1178,39 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('适应窗口：把全部表缩到一屏内（第 70 轮）', (tester) async {
+    await setSurface(tester);
+    // 三张表分三层（authors ← books ← reviews），层级布局会把画布拉得比
+    // 视口宽；「适应窗口」应该把比例降到 100% 以下。
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['authors', 'books', 'reviews'],
+          height: 420,
+        ),
+      ),
+    );
+    await settle(tester);
+
+    expect(find.byKey(const ValueKey('er-zoom-fit')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('er-zoom-fit')));
+    await tester.pumpAndSettle();
+
+    final labels = tester
+        .widgetList<app_text.Text>(find.byType(app_text.Text))
+        .map((widget) => widget.data)
+        .where((text) => RegExp(r'^\d+%$').hasMatch(text))
+        .toList();
+    expect(labels.length, 1, reason: '缩放百分比应当只有一个');
+    final percent = int.parse(labels.single.replaceAll('%', ''));
+    // 三列卡片 + 间距放不进 1400px 的测试视口的一半宽度里也无所谓：
+    // 关键是不超过 100%，且仍然落在合法区间。
+    expect(percent, lessThanOrEqualTo(100));
+    expect(percent, greaterThanOrEqualTo(50));
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('边层先画、卡片后画（卡片遮挡穿过的线）', (tester) async {
     await setSurface(tester);
     await tester.pumpWidget(

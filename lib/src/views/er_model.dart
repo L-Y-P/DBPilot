@@ -994,18 +994,11 @@ Map<String, Offset> layeredErLayout(
       sortLayer(i, fromLeft: false);
     }
   }
-  // 3) 坐标：每层垂直居中，水平从 margin（或居中）开始逐层递增。
-  final layerHeights = <int, double>{};
-  for (var i = 0; i <= maxLayer; i++) {
-    final list = layers[i]!;
-    var height = 0.0;
-    for (var j = 0; j < list.length; j++) {
-      if (j > 0) height += gapY;
-      height += metrics.heightOf(tableByName[list[j]]!);
-    }
-    layerHeights[i] = height;
-  }
-  final maxHeight = layerHeights.values.reduce(math.max);
+  // 3) 坐标：每层**顶对齐**，水平从 margin（或居中）开始逐层递增。
+  //
+  // 早先是按「最高那一列」垂直居中：只要有一列堆了七八张表，其它列的表就会
+  // 被推到离画布顶部很远的位置，看上去像散落在半空中（用户报的「一部分表格
+  // 放得这么远」）。顶对齐后每一列都从同一条基线开始，好找、也省高度。
   final totalWidth = maxLayer * (metrics.cardWidth + gapX) + metrics.cardWidth;
   final left = totalWidth + margin * 2 < viewportWidth
       ? (viewportWidth - totalWidth) / 2
@@ -1013,7 +1006,7 @@ Map<String, Offset> layeredErLayout(
   final positions = <String, Offset>{};
   for (var i = 0; i <= maxLayer; i++) {
     final list = layers[i]!;
-    var y = margin + (maxHeight - (layerHeights[i] ?? 0)) / 2;
+    var y = margin;
     final x = left + i * (metrics.cardWidth + gapX);
     for (final name in list) {
       positions[name] = Offset(x, y);

@@ -2807,6 +2807,16 @@ class RelationDesignerState extends State<RelationDesigner> {
           glyphSize: 14,
           onPressed: _scale >= _kErMaxScale ? null : () => _zoomBy(_kErZoomStep),
         ),
+        const SizedBox(width: 4),
+        // 分层布局把依赖层级一列列往右排，表多时画布很宽；一键看全。
+        IconBtn(
+          Icons.fit_screen,
+          key: const ValueKey('er-zoom-fit'),
+          tooltip: pickText('适应窗口（全部表缩到一屏）', 'Fit all tables in view'),
+          dimension: 24,
+          glyphSize: 14,
+          onPressed: _tables.isEmpty ? null : _fitToView,
+        ),
         const SizedBox(width: 8),
         // 第 54 轮 P2-5：画布之外再给一个「关系列表」，列出现有外键 / 建议
         // 关系 / 多对多，方便找不到线或线被卡片挡住时直接定位。
@@ -3099,13 +3109,34 @@ class RelationDesignerState extends State<RelationDesigner> {
         // 第 70 轮：缩放 = 外层按倍数撑开**布局**尺寸，内层 Transform 等比放大。
         // 布局尺寸必须一起放大，否则滚动范围不跟着变、放大后右下角滚不到。
         // 命中测试交给 Transform 的逆变换，画布内部仍是 layout 逻辑坐标。
+        // 缩小之后内容可能比视口还小，这时视口四周的留白没有任何子节点，
+        // 拖动会「打滑」（用户报的「有些地方无法拖动界面」）。所以再加一层
+        // 铺满视口的手势面：内容命中时由内容自己的手势赢，留白处由它兜底。
         final scaled = SizedBox(
-          width: content.width * _scale,
-          height: content.height * _scale,
-          child: Transform.scale(
-            scale: _scale,
-            alignment: Alignment.topLeft,
-            child: canvas,
+          width: math.max(content.width * _scale, viewport.width),
+          height: math.max(content.height * _scale, viewport.height),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onPanStart: _canvasPanStart,
+            onPanUpdate: _canvasPanUpdate,
+            onPanEnd: (_) => _canvasPanEnd(),
+            onPanCancel: _canvasPanEnd,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: <Widget>[
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  width: content.width * _scale,
+                  height: content.height * _scale,
+                  child: Transform.scale(
+                    scale: _scale,
+                    alignment: Alignment.topLeft,
+                    child: canvas,
+                  ),
+                ),
+              ],
+            ),
           ),
         );
         const locked = NeverScrollableScrollPhysics();
@@ -3164,6 +3195,36 @@ class RelationDesignerState extends State<RelationDesigner> {
   }
 
   void _zoomBy(double delta) => _zoomTo(_scale + delta);
+
+  /// 「适应窗口」：把全部表缩放到一屏内（最多 100%），并滚回左上角。
+  ///
+  /// 分层布局按依赖层级一列一列往右排，表多、链深的时候画布会很宽；
+  /// 这个按钮是「一眼看全」的出口，配合缩放不用再手动拖。
+  void _fitToView() {
+    if (_tables.isEmpty) return;
+    final viewport = _viewportSize;
+    if (viewport.width <= 0 || viewport.height <= 0) return;
+    var maxX = 1.0;
+    var maxY = 1.0;
+    for (final table in _tables) {
+      final position = _positions[table.name];
+      if (position == null) continue;
+      final right = position.dx + _metrics.cardWidth + 24;
+      final bottom = position.dy + _metrics.heightOf(table) + 24;
+      if (right > maxX) maxX = right;
+      if (bottom > maxY) maxY = bottom;
+    }
+    final fit = math.min(
+      math.min(viewport.width / maxX, viewport.height / maxY),
+      1.0,
+    );
+    setState(() => _scale = fit.clamp(_kErMinScale, _kErMaxScale));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_canvasHorizontal.hasClients) _canvasHorizontal.jumpTo(0);
+      if (_canvasVertical.hasClients) _canvasVertical.jumpTo(0);
+    });
+  }
 
   void _resetZoom() => _zoomTo(1);
 

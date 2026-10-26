@@ -210,7 +210,14 @@ jobs:
           test -d "$APP" || { echo "::error::找不到 $APP"; exit 1; }
           echo "产物架构：$(lipo -archs "$APP/Contents/MacOS/DBPilot" 2>/dev/null || echo unknown)"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "DBPilot-$VERSION-macos.zip"
-          ls -lh "DBPilot-$VERSION-macos.zip"
+          # DMG（拖拽安装）：app + /Applications 软链
+          rm -rf dmgroot
+          mkdir -p dmgroot
+          cp -R "$APP" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "DBPilot $VERSION" -srcfolder dmgroot -ov -format UDZO "DBPilot-$VERSION-macos.dmg"
+          hdiutil verify "DBPilot-$VERSION-macos.dmg"
+          ls -lh "DBPilot-$VERSION-macos.zip" "DBPilot-$VERSION-macos.dmg"
 
       # 代码签名（可选）：配了 secrets 就签，没配就跳过。
       - name: Decode signing certificate
@@ -316,6 +323,7 @@ jobs:
             # 通配符末尾要留 *：Windows 产物是 ...-windows-x64-portable.zip，
             # 旧写法 ...-windows-x64.zip 匹配不到，Release 会缺 portable 包。
             DBPilot-*-${{ matrix.artifact }}*.zip
+            DBPilot-*-macos.dmg
             DBPilot-*-windows-x64-setup.exe
           if-no-files-found: error
           retention-days: 7
@@ -352,9 +360,10 @@ jobs:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: ${{ needs.meta.outputs.tag }}
           body_path: release-body.md
-          # 三种资产：macOS zip、Windows NSIS 安装包、Windows 免安装 zip。
+          # 资产：macOS zip + dmg、Windows NSIS 安装包、Windows 免安装 zip。
           files: |
             dist/DBPilot-*.zip
+            dist/DBPilot-*-macos.dmg
             dist/DBPilot-*-windows-x64-setup.exe
           # 同版本重跑时覆盖同名资产，避免 "already exists" 失败
           overwrite_files: true

@@ -1132,6 +1132,52 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('画布缩放：按钮 100% → 110% → 90%，点百分比复位（第 70 轮）', (
+    tester,
+  ) async {
+    await setSurface(tester);
+    await tester.pumpWidget(
+      host(
+        RelationDesigner(
+          database: 'main',
+          initialTables: const <String>['variants'],
+          height: 420,
+        ),
+      ),
+    );
+    await settle(tester);
+
+    expect(find.text('100%'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('er-zoom-in')));
+    await tester.pumpAndSettle();
+    expect(find.text('110%'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('er-zoom-out')));
+    await tester.pumpAndSettle();
+    expect(find.text('100%'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('er-zoom-out')));
+    await tester.pumpAndSettle();
+    expect(find.text('90%'), findsOneWidget);
+
+    // 点百分比复位到 100%。
+    await tester.tap(find.byKey(const ValueKey('er-zoom-reset')));
+    await tester.pumpAndSettle();
+    expect(find.text('100%'), findsOneWidget);
+
+    // 缩放到上限后「放大」按钮禁用，不会越界。
+    for (var i = 0; i < 12; i++) {
+      await tester.tap(
+        find.byKey(const ValueKey('er-zoom-in')),
+        warnIfMissed: false,
+      );
+      await tester.pumpAndSettle();
+    }
+    expect(find.text('200%'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('边层先画、卡片后画（卡片遮挡穿过的线）', (tester) async {
     await setSurface(tester);
     await tester.pumpWidget(

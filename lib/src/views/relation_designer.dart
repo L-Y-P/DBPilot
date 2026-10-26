@@ -12,7 +12,10 @@
 
 import 'dart:math' as math;
 
+import 'package:flutter/gestures.dart'
+    show GestureBinding, PointerScrollEvent, PointerSignalEvent;
 import 'package:flutter/material.dart' hide Text, Tooltip;
+import 'package:flutter/services.dart' show HardwareKeyboard;
 
 import '../api.dart';
 import '../app_state.dart';
@@ -215,6 +218,14 @@ Future<bool> confirmDeleteForeignKeyDialog(
 /// [onRequestEditFields] 非空时（快速建表向导第 4 步会传）：关系创建失败 / 被
 /// 前置校验阻止 / SQLite 不支持 ALTER 的提示里都会多出一个「返回工作表与字段
 /// 修改」按钮，点击后关闭提示并调用它，让宿主回到字段编辑步骤。
+/// 画布缩放范围与步长（第 70 轮）。
+///
+/// 只缩放**显示**，不改变 layout 坐标：所有端点 / 命中测试仍然用 layout 里的
+/// 逻辑坐标，缩放由外层 [Transform.scale] 的逆变换完成。
+const double _kErMinScale = 0.5;
+const double _kErMaxScale = 2;
+const double _kErZoomStep = 0.1;
+
 class RelationDesigner extends StatefulWidget {
   const RelationDesigner({
     super.key,
@@ -321,6 +332,13 @@ class RelationDesignerState extends State<RelationDesigner> {
   final ScrollController _canvasHorizontal = ScrollController();
   final ScrollController _canvasVertical = ScrollController();
   bool _panningCanvas = false;
+
+  // ---- 第 70 轮：画布缩放 ----
+  /// 画布缩放倍数，1.0 = 原始尺寸。
+  double _scale = 1;
+
+  /// 最近一次画布视口尺寸（[LayoutBuilder] 里刷新），缩放时用来保持视口中心。
+  Size _viewportSize = const Size(640, 480);
 
   /// 第 63 轮：孤儿警告里选择「改用同名列」成功后，待重新打开弹窗的引用列。
   String? _pendingCreateRefColumn;
@@ -2126,7 +2144,8 @@ class RelationDesignerState extends State<RelationDesigner> {
     if (_draggingNode != table) return;
     final last = _nodeDragLast;
     if (last == null) return;
-    final delta = globalPosition - last;
+    // 画布缩放后，屏幕上的 1px 只对应 1/scale 个逻辑坐标。
+    final delta = (globalPosition - last) / _scale;
     final position = _positions[table] ?? const Offset(24, 24);
     setState(() {
       _userMoved.add(table);
@@ -2761,6 +2780,34 @@ class RelationDesignerState extends State<RelationDesigner> {
           onPressed: _tables.isEmpty ? null : _autoLayout,
         ),
         const SizedBox(width: 8),
+        // 第 70 轮：画布缩放。Ctrl / ⌘ + 滚轮也能缩放，这三个控件是给
+        // 「不知道有滚轮手势」的人准备的；点百分比回到 100%。
+        IconBtn(
+          Icons.remove,
+          key: const ValueKey('er-zoom-out'),
+          tooltip: pickText('缩小', 'Zoom out'),
+          dimension: 24,
+          glyphSize: 14,
+          onPressed: _scale <= _kErMinScale ? null : () => _zoomBy(-_kErZoomStep),
+        ),
+        const SizedBox(width: 4),
+        Btn(
+          _zoomLabel,
+          key: const ValueKey('er-zoom-reset'),
+          small: true,
+          tooltip: pickText('点击恢复 100%', 'Click to reset to 100%'),
+          onPressed: _scale == 1 ? null : _resetZoom,
+        ),
+        const SizedBox(width: 4),
+        IconBtn(
+          Icons.add,
+          key: const ValueKey('er-zoom-in'),
+          tooltip: pickText('放大', 'Zoom in'),
+          dimension: 24,
+          glyphSize: 14,
+          onPressed: _scale >= _kErMaxScale ? null : () => _zoomBy(_kErZoomStep),
+        ),
+        const SizedBox(width: 8),
         // 第 54 轮 P2-5：画布之外再给一个「关系列表」，列出现有外键 / 建议
         // 关系 / 多对多，方便找不到线或线被卡片挡住时直接定位。
         IconBtn(
@@ -2952,6 +2999,7 @@ class RelationDesignerState extends State<RelationDesigner> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final viewport = Size(constraints.maxWidth, constraints.maxHeight);
+        _viewportSize = viewport;
         _layoutWidth = viewport.width;
         _ensurePositions(viewport.width);
         final layout = _layout;
@@ -3048,16 +3096,31 @@ class RelationDesignerState extends State<RelationDesigner> {
             ),
           ),
         );
+        // 第 70 轮：缩放 = 外层按倍数撑开**布局**尺寸，内层 Transform 等比放大。
+        // 布局尺寸必须一起放大，否则滚动范围不跟着变、放大后右下角滚不到。
+        // 命中测试交给 Transform 的逆变换，画布内部仍是 layout 逻辑坐标。
+        final scaled = SizedBox(
+          width: content.width * _scale,
+          height: content.height * _scale,
+          child: Transform.scale(
+            scale: _scale,
+            alignment: Alignment.topLeft,
+            child: canvas,
+          ),
+        );
         const locked = NeverScrollableScrollPhysics();
         // 第 62 轮：两个轴的控制器由背景拖动直接 jumpTo（clamp 到 maxExtent）。
-        return SingleChildScrollView(
-          controller: _canvasHorizontal,
-          scrollDirection: Axis.horizontal,
-          physics: _dragLocked ? locked : null,
+        return Listener(
+          onPointerSignal: _handleCanvasPointerSignal,
           child: SingleChildScrollView(
-            controller: _canvasVertical,
+            controller: _canvasHorizontal,
+            scrollDirection: Axis.horizontal,
             physics: _dragLocked ? locked : null,
-            child: canvas,
+            child: SingleChildScrollView(
+              controller: _canvasVertical,
+              physics: _dragLocked ? locked : null,
+              child: scaled,
+            ),
           ),
         );
       },
@@ -3082,6 +3145,53 @@ class RelationDesignerState extends State<RelationDesigner> {
     if (_panningCanvas && mounted) {
       setState(() => _panningCanvas = false);
     }
+  }
+
+  /// 缩放后的百分比文案（工具栏按钮用）。
+  String get _zoomLabel => '${(_scale * 100).round()}%';
+
+  /// Ctrl / ⌘ + 滚轮缩放；普通滚轮仍然交给滚动视图。
+  void _handleCanvasPointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    final keyboard = HardwareKeyboard.instance;
+    if (!keyboard.isControlPressed && !keyboard.isMetaPressed) return;
+    // 认领这个信号，滚动视图就不会跟着滚一屏。
+    GestureBinding.instance.pointerSignalResolver.register(event, (signal) {
+      final scroll = signal as PointerScrollEvent;
+      if (scroll.scrollDelta.dy == 0) return;
+      _zoomBy(scroll.scrollDelta.dy > 0 ? -_kErZoomStep : _kErZoomStep);
+    });
+  }
+
+  void _zoomBy(double delta) => _zoomTo(_scale + delta);
+
+  void _resetZoom() => _zoomTo(1);
+
+  /// 缩放到 [next]（clamp 到范围），并保持 [focal]（视口坐标，默认中心）处的
+  /// 内容点不动 —— 否则每次缩放画面都会往左上角跑。
+  void _zoomTo(double next, {Offset? focal}) {
+    final clamped = next.clamp(_kErMinScale, _kErMaxScale);
+    if ((clamped - _scale).abs() < 0.001) return;
+    final point = focal ?? _viewportSize.center(Offset.zero);
+    final contentPoint = Offset(
+          (_canvasHorizontal.hasClients ? _canvasHorizontal.offset : 0) +
+              point.dx,
+          (_canvasVertical.hasClients ? _canvasVertical.offset : 0) + point.dy,
+        ) /
+        _scale;
+    setState(() => _scale = clamped);
+    // 滚动范围要等这一帧布局完才变成新值，所以恢复位置放到帧后。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      void restore(ScrollController controller, double target) {
+        if (!controller.hasClients) return;
+        final position = controller.position;
+        controller.jumpTo(target.clamp(0.0, position.maxScrollExtent));
+      }
+
+      restore(_canvasHorizontal, contentPoint.dx * clamped - point.dx);
+      restore(_canvasVertical, contentPoint.dy * clamped - point.dy);
+    });
   }
 
   void _scrollCanvasBy(Offset delta) {

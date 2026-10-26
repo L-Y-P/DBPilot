@@ -33,6 +33,13 @@ const int kDbTablePageSize = 50;
 /// full visual designer; that lives in TableView's Design tab here so the two
 /// share one implementation, and this view keeps the create-table dialog for
 /// new tables.
+/// True only in a verification build with
+/// --dart-define=DBPILOT_MENU_SMOKE=1.
+///
+/// See [_DatabaseViewState._openMenuForSmokeTest]. Always false in shipping
+/// builds, and because it is a const the smoke branch is removed entirely.
+const bool kMenuSmokeBuild = bool.fromEnvironment('DBPILOT_MENU_SMOKE');
+
 class DatabaseView extends StatefulWidget {
   const DatabaseView({super.key, required this.db, required this.notice});
   final String db;
@@ -82,6 +89,31 @@ class _DatabaseViewState extends State<DatabaseView> {
     _loadedExplorerVersion = AppState.instance.explorerVersion;
     AppState.instance.addListener(_onAppState);
     _load();
+    if (kMenuSmokeBuild) _openMenuForSmokeTest();
+  }
+
+  /// Open this page's context menu once, without a mouse.
+  ///
+  /// Right-click cannot be synthesized on macOS (a synthesized event is not
+  /// delivered to Flutter's gesture recognisers, and posting a real one needs an
+  /// Accessibility grant), so the native menu is otherwise impossible to
+  /// screenshot. A verification build sets
+  /// --dart-define=DBPILOT_MENU_SMOKE=1; kMenuSmokeBuild is a const, so the
+  /// whole branch is tree-shaken out of every normal build.
+  void _openMenuForSmokeTest() {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await showAppContextMenu(
+        context,
+        databaseMenuEntries(
+          context,
+          _namespace,
+          notice: widget.notice,
+          onChanged: _load,
+        ),
+        position: const Offset(430, 250),
+      );
+    });
   }
 
   @override

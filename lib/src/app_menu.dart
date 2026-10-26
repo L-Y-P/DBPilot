@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'text.dart';
 
 import 'i18n_literals.dart';
+import 'native_menu.dart';
 import 'theme.dart';
 
 /// One entry of a context menu.
@@ -35,12 +36,14 @@ class AppMenuEntry {
   bool get isEnabled => enabled && onSelected != null;
 }
 
-/// Width of the menu; wide enough for the longest label, capped so a verbose
-/// entry wraps instead of running off the window.
-const double _kMenuMinWidth = 186;
-const double _kMenuMaxWidth = 340;
+// Geometry copied from a native macOS menu: 22px rows, 4px inner padding, a
+// 6px corner radius and hairline separators. Keeping the numbers in one place
+// makes the menu read as a system menu rather than as another app surface.
+const double _kMenuMinWidth = 168;
+const double _kMenuMaxWidth = 320;
 const double _kRowHeight = 22;
-const double _kRowRadius = 5;
+const double _kRowRadius = 4;
+const double _kMenuPadding = 4;
 
 /// Show [entries] at the pointer and run the chosen action.
 ///
@@ -56,9 +59,27 @@ Future<String?> showAppContextMenu(
   Offset? position,
 }) async {
   if (entries.isEmpty) return null;
-  final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
   final anchor = position ?? _anchorOf(context);
-  final chosen = await Navigator.of(context).push<String>(
+
+  // Capture everything that needs the context *before* awaiting: the native
+  // round trip can outlive this frame, and reaching back into a disposed
+  // context afterwards would be a use-after-dispose.
+  final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+  final navigator = Navigator.of(context);
+
+  // On macOS hand the menu to AppKit: the native NSMenu is the only way to get
+  // the real system look. Falls through to the Flutter-drawn menu below when the
+  // bridge is absent (tests, other platforms).
+  final nativeIndex = await _tryNativeMenu(entries, anchor);
+  if (nativeIndex != null) {
+    if (nativeIndex >= 0 && nativeIndex < entries.length) {
+      entries[nativeIndex].onSelected?.call();
+      return entries[nativeIndex].label;
+    }
+    return null;
+  }
+
+  final chosen = await navigator.push<String>(
     _AppMenuRoute(
       entries: entries,
       position: anchor,
@@ -75,10 +96,86 @@ Future<String?> showAppContextMenu(
   return chosen;
 }
 
+/// Ask the platform for a real menu; null means "draw it yourself".
+Future<int?> _tryNativeMenu(List<AppMenuEntry> entries, Offset anchor) async {
+  if (!hasNativeMenu) return null;
+  final items = <Map<String, Object?>>[];
+  for (final entry in entries) {
+    items.add(<String, Object?>{
+      'label': trLiteral(entry.label),
+      'enabled': entry.isEnabled,
+      'danger': entry.danger,
+      'separator': entry.separatorBefore,
+    });
+  }
+  return showNativeMenu(items, anchor.dx, anchor.dy);
+}
+
 Offset _anchorOf(BuildContext context) {
   final box = context.findRenderObject();
   if (box is! RenderBox || !box.hasSize) return Offset.zero;
   return box.localToGlobal(box.size.center(Offset.zero));
+}
+
+/// The menu's own palette.
+///
+/// A context menu is a system surface, so it deliberately does *not* inherit
+/// the app's accent (orange): native menus use the system accent and neutral
+/// greys, and mixing the two is what made the previous menu look like a
+/// floating card instead of a menu.
+class _MenuColors {
+  const _MenuColors({
+    required this.background,
+    required this.border,
+    required this.shadow,
+    required this.separator,
+    required this.text,
+    required this.mutedText,
+    required this.dangerText,
+    required this.highlight,
+    required this.highlightText,
+  });
+
+  final Color background;
+  final Color border;
+  final Color shadow;
+  final Color separator;
+  final Color text;
+  final Color mutedText;
+  final Color dangerText;
+  final Color highlight;
+  final Color highlightText;
+
+  static _MenuColors of(BuildContext context) {
+    final dark = AppColors.palette.dark;
+    if (dark) {
+      return const _MenuColors(
+        // #2C2C2E is the native dark menu surface.
+        background: Color(0xFF2C2C2E),
+        border: Color(0x1FFFFFFF),
+        shadow: Color(0x66000000),
+        separator: Color(0x26FFFFFF),
+        text: Color(0xFFEDEDED),
+        mutedText: Color(0xFF7C7C80),
+        dangerText: Color(0xFFFF453A),
+        // System accent blue; macOS tints the selected row solid.
+        highlight: Color(0xFF0A84FF),
+        highlightText: Color(0xFFFFFFFF),
+      );
+    }
+    return const _MenuColors(
+      // #F7F7F7 is the native light menu surface (NSMenu's material).
+      background: Color(0xFFF7F7F7),
+      border: Color(0x1A000000),
+      shadow: Color(0x33000000),
+      separator: Color(0x1A000000),
+      text: Color(0xFF1D1D1F),
+      mutedText: Color(0xFF9A9A9E),
+      dangerText: Color(0xFFD70015),
+      highlight: Color(0xFF007AFF),
+      highlightText: Color(0xFFFFFFFF),
+    );
+  }
 }
 
 /// Zero-duration popup route: no fade, no scale, no delay.
@@ -160,13 +257,15 @@ class _AppMenuPanel extends StatelessWidget {
   }
 
   Widget _box(BuildContext context) {
+    final colors = _MenuColors.of(context);
     final children = <Widget>[];
     for (final entry in entries) {
       if (entry.separatorBefore && children.isNotEmpty) {
-        children.add(const _MenuSeparator());
+        children.add(_MenuSeparator(color: colors.separator));
       }
       children.add(_AppMenuRow(
         entry: entry,
+        colors: colors,
         onTap: entry.isEnabled
             ? () => Navigator.of(context).pop(entry.label)
             : null,
@@ -177,17 +276,17 @@ class _AppMenuPanel extends StatelessWidget {
         minWidth: _kMenuMinWidth,
         maxWidth: _kMenuMaxWidth,
       ),
-      padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 5),
+      padding: const EdgeInsets.all(_kMenuPadding),
       decoration: BoxDecoration(
-        color: AppColors.panel,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: AppColors.border.withValues(alpha: 0.7)),
-        boxShadow: const <BoxShadow>[
+        color: colors.background,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colors.border),
+        boxShadow: <BoxShadow>[
           BoxShadow(
-            color: Color(0x26000000),
-            blurRadius: 12,
-            spreadRadius: 1,
-            offset: Offset(0, 4),
+            color: colors.shadow,
+            blurRadius: 20,
+            spreadRadius: 2,
+            offset: const Offset(0, 5),
           ),
         ],
       ),
@@ -201,22 +300,30 @@ class _AppMenuPanel extends StatelessWidget {
 }
 
 class _MenuSeparator extends StatelessWidget {
-  const _MenuSeparator();
+  const _MenuSeparator({required this.color});
+
+  final Color color;
 
   @override
   Widget build(BuildContext context) {
+    // Native menus inset the rule a few pixels from the menu edge.
     return Container(
       height: 1,
-      margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
-      color: AppColors.border.withValues(alpha: 0.75),
+      margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+      color: color,
     );
   }
 }
 
 class _AppMenuRow extends StatefulWidget {
-  const _AppMenuRow({required this.entry, required this.onTap});
+  const _AppMenuRow({
+    required this.entry,
+    required this.colors,
+    required this.onTap,
+  });
 
   final AppMenuEntry entry;
+  final _MenuColors colors;
   final VoidCallback? onTap;
 
   @override
@@ -229,15 +336,16 @@ class _AppMenuRowState extends State<_AppMenuRow> {
   @override
   Widget build(BuildContext context) {
     final entry = widget.entry;
+    final colors = widget.colors;
     final enabled = widget.onTap != null;
     final highlighted = enabled && _hovered;
     final color = highlighted
-        ? AppColors.panel
+        ? colors.highlightText
         : !enabled
-        ? AppColors.muted
+        ? colors.mutedText
         : entry.danger
-        ? AppColors.danger
-        : AppColors.bodyText;
+        ? colors.dangerText
+        : colors.text;
     return MouseRegion(
       cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
       onEnter: (_) => setState(() => _hovered = true),
@@ -249,15 +357,13 @@ class _AppMenuRowState extends State<_AppMenuRow> {
           height: _kRowHeight,
           padding: const EdgeInsets.symmetric(horizontal: 9),
           decoration: BoxDecoration(
-            color: highlighted
-                ? (entry.danger ? AppColors.danger : AppColors.accent)
-                : null,
+            color: highlighted ? colors.highlight : null,
             borderRadius: BorderRadius.circular(_kRowRadius),
           ),
           alignment: Alignment.centerLeft,
           child: Text(
             trLiteral(entry.label),
-            maxLines: 2,
+            maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 13, height: 1.15, color: color),
           ),

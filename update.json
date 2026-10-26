@@ -1,5 +1,5 @@
 {
   "version": "1.1.0",
   "url": "https://github.com/L-Y-P/DBPilot/releases/tag/v1.1.0",
-  "notes": "DBPilot v1.1.0 自 v1.0.0 以来的变更： - release: v1.1.0（版本号 1.1.0+2，重写项目介绍） (4c2bc16) - chore: 移除测试夹具脚本中的本地绝对路径，并补齐本地运行期数据忽略规则 (d3f1ad2) - ER: auto-layout also scrolls back to the top-left, so a re-layout never leaves the canvas parked at a stale offset (1904277) - ER: fold the layered layout into snake rows when the columns do not fit the viewport, so the canvas stays inside one screen width instead of growing to ~2000px (85d3f6b) - ER: tighten layered layout gaps (72/40 -> 52/28) so the dependency..."
+  "notes": "DBPilot v1.1.0 自 v1.0.0 以来的变更： - ci(release): 修复 Windows portable zip 未被上传（glob 缺少 *） (32ab410) - chore(release): update.json -> v1.1.0 (05b2ae0) - release: v1.1.0（版本号 1.1.0+2，重写项目介绍） (4c2bc16) - chore: 移除测试夹具脚本中的本地绝对路径，并补齐本地运行期数据忽略规则 (d3f1ad2) - ER: auto-layout also scrolls back to the top-left, so a re-layout never leaves the canvas parked at a stale offset (1904277) - ER: fold the layered layout into snake rows when the columns do not fit the viewport, so the canvas stays inside one screen..."
 }

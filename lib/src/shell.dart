@@ -5,6 +5,7 @@ import 'tooltip.dart';
 
 import 'api.dart';
 import 'app_state.dart';
+import 'db_actions.dart';
 import 'i18n.dart';
 import 'i18n_literals.dart';
 import 'nav.dart';
@@ -766,13 +767,21 @@ class _SidebarState extends State<_Sidebar> {
       if (name.isEmpty) continue;
       final active = state.activeDatabase == name || route.db == name;
       final expanded = nav.expanded.contains(name);
-      nodes.add(() => _dbRow(
-            name,
-            name,
-            active,
-            expanded,
-            onOpen: () => _openMySQLDatabase(name),
-            onToggle: () => _toggleMySQLDatabase(name),
+      nodes.add(() => ContextMenuRegion(
+            entries: databaseMenuEntries(
+              context,
+              name,
+              notice: widget.notice,
+              onChanged: () => _loadTables(name, force: true),
+            ),
+            child: _dbRow(
+              name,
+              name,
+              active,
+              expanded,
+              onOpen: () => _openMySQLDatabase(name),
+              onToggle: () => _toggleMySQLDatabase(name),
+            ),
           ));
       if (expanded) {
         nodes.addAll(_tableRows(name, nav, route));
@@ -881,14 +890,22 @@ class _SidebarState extends State<_Sidebar> {
         if (schemaName.isEmpty) continue;
         final activeSchema = active && route.db == schemaName;
         final schemaExpanded = active && nav.expanded.contains(schemaName);
-        nodes.add(() => _schemaRow(
-              name,
-              schemaName,
-              activeSchema,
-              schemaExpanded,
-              isDefault: active && schemaName == defaultSchema,
-              onOpen: () => _openSchema(name, schemaName),
-              onToggle: () => _toggleSchema(name, schemaName),
+        nodes.add(() => ContextMenuRegion(
+              entries: databaseMenuEntries(
+                context,
+                schemaName,
+                notice: widget.notice,
+                onChanged: () => _loadTables(schemaName, force: true),
+              ),
+              child: _schemaRow(
+                name,
+                schemaName,
+                activeSchema,
+                schemaExpanded,
+                isDefault: active && schemaName == defaultSchema,
+                onOpen: () => _openSchema(name, schemaName),
+                onToggle: () => _toggleSchema(name, schemaName),
+              ),
             ));
         if (schemaExpanded) {
           nodes.addAll(
@@ -1197,8 +1214,16 @@ class _SidebarState extends State<_Sidebar> {
             : db['title'].toString();
         final isActive = route.db == name;
         final open = nav.expanded.contains(name);
-        nodes.add(
-            () => _dbRow(name, title, isActive, open, indent: 22, tooltip: path));
+        nodes.add(() => ContextMenuRegion(
+              entries: databaseMenuEntries(
+                context,
+                name,
+                notice: widget.notice,
+                onChanged: () => _loadTables(name, force: true),
+              ),
+              child: _dbRow(name, title, isActive, open,
+                  indent: 22, tooltip: path),
+            ));
         if (open) {
           nodes.addAll(_tableRows(name, nav, route));
         }
@@ -1371,7 +1396,17 @@ class _SidebarState extends State<_Sidebar> {
     }
     return [
       for (final table in tables)
-        () => InkWell(
+        // Right-click a table in the tree for its menu; 关系图 is seeded with
+        // that table, so the canvas opens on it and its neighbours.
+        () => ContextMenuRegion(
+              entries: tableMenuEntries(
+                context,
+                db,
+                table,
+                notice: widget.notice,
+                onChanged: () => _loadTables(db, force: true),
+              ),
+              child: InkWell(
               onTap: () =>
                   Navigation.instance.go(AppRoute.tableRoute(db, table)),
               child: Container(
@@ -1392,6 +1427,7 @@ class _SidebarState extends State<_Sidebar> {
                         : FontWeight.normal,
                   ),
                 ),
+              ),
               ),
             ),
     ];

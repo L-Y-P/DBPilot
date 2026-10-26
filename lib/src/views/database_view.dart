@@ -4,6 +4,7 @@ import '../tooltip.dart';
 
 import '../api.dart';
 import '../app_state.dart';
+import '../db_actions.dart';
 import '../i18n_literals.dart';
 import '../i18n.dart';
 import '../nav.dart';
@@ -576,7 +577,18 @@ class _DatabaseViewState extends State<DatabaseView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          PageHead(
+          // The head area (title + toolbar) is the page-level context-menu
+          // target: refresh / create table / from-file / relationships for this
+          // database. The cards keep their own row-level menus, and the
+          // objects-card search field keeps the platform text menu.
+          ContextMenuRegion(
+            entries: databaseMenuEntries(
+              context,
+              _namespace,
+              notice: widget.notice,
+              onChanged: _load,
+            ),
+            child: PageHead(
             titleWidget: Text(_title,
                 style: monoStyle(size: 20, weight: FontWeight.w600)),
             meta: [
@@ -588,9 +600,10 @@ class _DatabaseViewState extends State<DatabaseView> {
             actions: [
               // Refresh re-reads the folder, so a database file added outside
               // the app shows up here.
-              Btn(t('refresh'), onPressed: _refresh),
+              Btn(t('refresh'), icon: Icons.refresh, onPressed: _refresh),
               Btn('新建表',
                   primary: true,
+                  icon: Icons.add_box_outlined,
                   tooltip: _denied(_actionCreateTable)
                       ? _deniedTooltip(_actionCreateTable)
                       : null,
@@ -601,6 +614,7 @@ class _DatabaseViewState extends State<DatabaseView> {
               // It goes through the same CREATE TABLE + import pipeline as the
               // import wizard instead of writing SQL by hand.
               Btn('从文件建表',
+                  icon: Icons.upload_file_outlined,
                   tooltip: '选择 CSV / Excel 等数据文件，按工作表快速建表并导入数据',
                   onPressed:
                       _denied(_actionCreateTable) ? null : _showQuickCreateWizard),
@@ -608,20 +622,34 @@ class _DatabaseViewState extends State<DatabaseView> {
               // import. The importer's last step opens the same designer seeded
               // with the imported table; this entry reopens it later.
               Btn('关系图',
+                  icon: Icons.account_tree_outlined,
                   tooltip: '查看并编辑表之间的外键关系',
                   onPressed: _showRelationDesigner),
+              // A rule separates the everyday actions from the schema- and
+              // database-level (mostly destructive) ones.
+              const ToolbarDivider(),
               if (isSqlite) ...[
-                Btn('打开目录', onPressed: _revealDatabaseFolder),
+                Btn('打开目录',
+                    icon: Icons.folder_open_outlined,
+                    onPressed: _revealDatabaseFolder),
                 // The primary file *is* the connection: deleting it would break
                 // the connection, so only attached files offer deletion.
                 if (!_isPrimaryFile)
                   Btn('删除数据库文件',
-                      danger: true, onPressed: _deleteSqliteFile),
+                      danger: true,
+                      icon: Icons.delete_outline,
+                      onPressed: _deleteSqliteFile),
               ] else if (isPostgres) ...[
-                Btn('新建模式', onPressed: _createSchema),
-                Btn('删除模式', danger: true, onPressed: _dropSchema),
+                Btn('新建模式',
+                    icon: Icons.create_new_folder_outlined,
+                    onPressed: _createSchema),
+                Btn('删除模式',
+                    danger: true,
+                    icon: Icons.folder_delete_outlined,
+                    onPressed: _dropSchema),
                 Btn('删除数据库',
                     danger: true,
+                    icon: Icons.delete_forever_outlined,
                     tooltip: _denied(_actionDropDatabase)
                         ? _deniedTooltip(_actionDropDatabase)
                         : null,
@@ -631,6 +659,7 @@ class _DatabaseViewState extends State<DatabaseView> {
               ] else
                 Btn('删除数据库',
                     danger: true,
+                    icon: Icons.delete_forever_outlined,
                     tooltip: _denied(_actionDropDatabase)
                         ? _deniedTooltip(_actionDropDatabase)
                         : null,
@@ -638,6 +667,7 @@ class _DatabaseViewState extends State<DatabaseView> {
                         ? null
                         : _dropDatabase),
             ],
+            ),
           ),
           if (!isSqlite)
             Padding(
@@ -748,10 +778,22 @@ class _DatabaseViewState extends State<DatabaseView> {
               for (final table in pageRows)
                 TableRow(
                   children: [
-                    InkWell(
-                      onTap: () => Navigation.instance
-                          .go(AppRoute.tableRoute(_namespace, table['name'].toString())),
-                      child: gridCell(table['name'], mono: true, title: table['name']?.toString()),
+                    // Right-clicking a table name offers the table-scoped menu
+                    // (its relationship diagram is seeded with this table).
+                    ContextMenuRegion(
+                      entries: tableMenuEntries(
+                        context,
+                        _namespace,
+                        table['name'].toString(),
+                        notice: widget.notice,
+                        onChanged: _load,
+                      ),
+                      child: InkWell(
+                        onTap: () => Navigation.instance.go(AppRoute.tableRoute(
+                            _namespace, table['name'].toString())),
+                        child: gridCell(table['name'],
+                            mono: true, title: table['name']?.toString()),
+                      ),
                     ),
                     gridCell(table['type']),
                     if (isMysql) gridCell(table['engine']),

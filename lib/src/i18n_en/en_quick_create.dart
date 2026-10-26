@@ -108,6 +108,8 @@ const Map<String, String> enQuickCreate = <String, String>{
   '关系图': 'Relationships',
   '查看并编辑表之间的外键关系':
       'View and edit foreign-key relationships between tables',
+  '在关系图中查看这张表及其关联表':
+      'Open this table and its related tables in the relationship diagram',
 };
 
 /// Interpolated prompts of the quick-create wizard.

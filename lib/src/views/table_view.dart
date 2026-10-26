@@ -6,6 +6,7 @@ import '../text.dart';
 import '../api.dart';
 import '../app_state.dart';
 import '../components/data_grid.dart';
+import '../db_actions.dart';
 import '../i18n.dart';
 import '../i18n_literals.dart';
 import '../import_rules.dart';
@@ -1491,7 +1492,18 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
 
   Widget _header() {
     final total = (_data['total'] as num?)?.toInt() ?? _knownTotal;
-    return PageHead(
+    // Right-clicking the table page offers the page-level actions, with 关系图
+    // seeded by this table: opening the diagram from a table lands on that
+    // table and its neighbours instead of an empty canvas.
+    return ContextMenuRegion(
+      entries: tableMenuEntries(
+        context,
+        widget.db,
+        widget.table,
+        notice: widget.notice,
+        onChanged: _reloadAfterWrite,
+      ),
+      child: PageHead(
       titleWidget: Row(
         children: [
           InkWell(
@@ -1508,9 +1520,21 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
       actions: [
         if (total != null) Pill(I18n.current == AppLang.en ? 'Rows: $total' : '行数：$total'),
         const SizedBox(width: 8),
+        // 关系图 from a table opens the designer seeded with it.
+        Btn('关系图',
+            icon: Icons.account_tree_outlined,
+            tooltip: '在关系图中查看这张表及其关联表',
+            onPressed: () => openRelationshipDiagram(
+                  context,
+                  widget.db,
+                  initialTables: <String>[widget.table],
+                  notice: widget.notice,
+                )),
         Btn(t('back'),
+            icon: Icons.arrow_back,
             onPressed: () => Navigation.instance.go(AppRoute.database(widget.db))),
       ],
+      ),
     );
   }
 

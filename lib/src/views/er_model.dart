@@ -1246,8 +1246,12 @@ ErRelationCurve? relationCurve(
 
 /// 画布上的全部关系曲线（任一端不在画布上的关系被跳过）。
 ///
-/// 同一字段（同一行锚点）有多条边时按 [fanGap] 做垂直扇出：起点/终点分组，
-/// 组内按顺序上下分布，避免多条线叠成一条。
+/// 同一字段（同一行锚点）有多条边时按 [fanGap] 在**子表侧**做垂直扇出，避免
+/// 多条线从同一个外键列出发时叠成一条。
+///
+/// **父表（被引用主键）侧不再扇出**：多条关系指向同一个主键时，箭头端点重合，
+/// 视觉上收成一个箭头（第 70 轮）。父表侧一个主键被引用三次、画出三个几乎重叠
+/// 的箭头既难看也点不准；收成一点后线在端点处自然汇聚成"扇形"。
 List<ErRelationCurve> relationCurves(
   ErCanvasLayout layout,
   List<ErRelation> relations, {
@@ -1261,28 +1265,22 @@ List<ErRelationCurve> relationCurves(
   if (base.length <= 1) return base;
   String pointKey(Offset point) => '${point.dx.round()}:${point.dy.round()}';
   final startGroups = <String, List<int>>{};
-  final endGroups = <String, List<int>>{};
   for (var i = 0; i < base.length; i++) {
     startGroups.putIfAbsent(pointKey(base[i].start), () => <int>[]).add(i);
-    endGroups.putIfAbsent(pointKey(base[i].end), () => <int>[]).add(i);
   }
   final out = <ErRelationCurve>[];
   for (var i = 0; i < base.length; i++) {
     final startGroup = startGroups[pointKey(base[i].start)]!;
-    final endGroup = endGroups[pointKey(base[i].end)]!;
     final startIndex = startGroup.indexOf(i);
-    final endIndex = endGroup.indexOf(i);
     final startFan = startGroup.length <= 1
         ? 0.0
         : (startIndex - (startGroup.length - 1) / 2) * fanGap;
-    final endFan = endGroup.length <= 1
-        ? 0.0
-        : (endIndex - (endGroup.length - 1) / 2) * fanGap;
+    // 父表侧不传 endFan：同一主键上的多条关系共用同一个箭头端点
+    // （见 [relationCurves] 的文档）。
     final curve = relationCurve(
       layout,
       base[i].relation,
       startFan: startFan,
-      endFan: endFan,
     );
     if (curve != null) out.add(curve);
   }

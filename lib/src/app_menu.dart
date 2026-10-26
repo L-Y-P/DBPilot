@@ -43,7 +43,7 @@ class AppMenuEntry {
 // drop shadow. Keeping the numbers in one place keeps the menu reading as a
 // system surface rather than as another app card.
 const double _kMenuMinWidth = 180;
-const double _kMenuMaxWidth = 340;
+const double _kMenuMaxWidth = 188;
 const double _kRowHeight = 24;
 const double _kRowRadius = 5;
 const double _kMenuPadding = 5;
@@ -412,6 +412,11 @@ class _AppMenuRowState extends State<_AppMenuRow> {
               fontSize: 13,
               height: 1.15,
               letterSpacing: -0.08,
+              // Native menus use regular-weight SF text with no decoration.
+              // Spell both out instead of leaning on whatever the ambient
+              // DefaultTextStyle happens to carry.
+              fontWeight: FontWeight.w400,
+              decoration: TextDecoration.none,
               color: color,
             ),
           ),

@@ -687,6 +687,47 @@ void main() {
       expect(curves[0].control1.dy, curves[0].start.dy);
       expect(curves[1].control1.dy, curves[1].start.dy);
     });
+
+    test('多条关系指向同一个主键：箭头端点重合（父表侧不扇出）', () {
+      // sakila.film 有两个外键（language_id / original_language_id）都指向
+      // language.language_id。父表侧如果也扇出，就会画出两个几乎重叠、谁也
+      // 点不准的箭头；这里钉住「父表侧端点完全相同」这一条。
+      final tables = <ErTable>[
+        table('film', <ErColumn>[
+          column('film_id', type: 'INTEGER', primary: true),
+          column('language_id', type: 'SMALLINT', foreignKey: true),
+          column('original_language_id', type: 'SMALLINT', foreignKey: true),
+        ]),
+        table('language', <ErColumn>[
+          column('language_id', type: 'SMALLINT', primary: true),
+        ]),
+      ];
+      final layout = ErCanvasLayout(
+        tables: tables,
+        positions: <String, Offset>{
+          'film': const Offset(24, 24),
+          'language': const Offset(400, 24),
+        },
+      );
+      const r1 = ErRelation(
+        localTable: 'film',
+        localColumn: 'language_id',
+        refTable: 'language',
+        refColumn: 'language_id',
+      );
+      const r2 = ErRelation(
+        localTable: 'film',
+        localColumn: 'original_language_id',
+        refTable: 'language',
+        refColumn: 'language_id',
+      );
+      final curves = relationCurves(layout, <ErRelation>[r1, r2]);
+      expect(curves.length, 2);
+      // 父表侧（箭头所在端）完全重合 —— 两条边收成一个箭头。
+      expect(curves[0].end, curves[1].end);
+      // 子表侧仍然是两个不同的外键列，起点必须分开，否则线会叠在一起。
+      expect(curves[0].start, isNot(curves[1].start));
+    });
   });
 
   group('中间表识别与多对多连线', () {

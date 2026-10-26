@@ -870,8 +870,8 @@ Map<String, Offset> layeredErLayout(
   List<ErRelation> relations, {
   required double viewportWidth,
   ErNodeMetrics metrics = const ErNodeMetrics(),
-  double gapX = 72,
-  double gapY = 40,
+  double gapX = 52,
+  double gapY = 28,
   double margin = 24,
 }) {
   if (tables.isEmpty) return <String, Offset>{};
@@ -994,12 +994,16 @@ Map<String, Offset> layeredErLayout(
       sortLayer(i, fromLeft: false);
     }
   }
-  // 3) 坐标：每层**顶对齐**，水平从 margin（或居中）开始逐层递增。
+  // 3) 坐标：每层**顶对齐**，水平从 margin（或居中）开始逐列递增。
   //
-  // 早先是按「最高那一列」垂直居中：只要有一列堆了七八张表，其它列的表就会
-  // 被推到离画布顶部很远的位置，看上去像散落在半空中（用户报的「一部分表格
-  // 放得这么远」）。顶对齐后每一列都从同一条基线开始，好找、也省高度。
-  final totalWidth = maxLayer * (metrics.cardWidth + gapX) + metrics.cardWidth;
+  // 早先按「最高那一列」垂直居中：只要一列堆了七八张表，其它列的表就被推到离
+  // 顶部很远的位置，像散落在半空 —— 改成顶对齐。
+  //
+  // 注意：**不做折行**。折行会让跨行的外键变成"从右往左指"，和「子表在左、
+  // 被引用父表在右」的分层语义打架（测试 <分层布局：子表在左、被引用父表在右>
+  // 就是钉这个的）。列数由依赖深度决定，深度大就用「适应窗口」缩一下看全。
+  final totalWidth =
+      maxLayer * (metrics.cardWidth + gapX) + metrics.cardWidth;
   final left = totalWidth + margin * 2 < viewportWidth
       ? (viewportWidth - totalWidth) / 2
       : margin;

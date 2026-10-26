@@ -1986,7 +1986,7 @@ void main() {
       );
       expect(
         positions['b']!.dx - positions['a']!.dx,
-        const ErNodeMetrics().cardWidth + 72,
+        const ErNodeMetrics().cardWidth + 52,
       );
     });
   });

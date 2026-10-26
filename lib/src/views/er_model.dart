@@ -994,24 +994,58 @@ Map<String, Offset> layeredErLayout(
       sortLayer(i, fromLeft: false);
     }
   }
-  // 3) 坐标：每层**顶对齐**，水平从 margin（或居中）开始逐列递增。
+  // 3) 坐标：每层顶对齐；放不下就**折行**（一列一列等距排，排满一行接下一行）。
   //
-  // 早先按「最高那一列」垂直居中：只要一列堆了七八张表，其它列的表就被推到离
-  // 顶部很远的位置，像散落在半空 —— 改成顶对齐。
-  //
-  // 注意：**不做折行**。折行会让跨行的外键变成"从右往左指"，和「子表在左、
-  // 被引用父表在右」的分层语义打架（测试 <分层布局：子表在左、被引用父表在右>
-  // 就是钉这个的）。列数由依赖深度决定，深度大就用「适应窗口」缩一下看全。
-  final totalWidth =
-      maxLayer * (metrics.cardWidth + gapX) + metrics.cardWidth;
+  // 折行会让跨行的外键变成「从右往左指」—— 这是刻意的取舍：列数由依赖深度
+  // 决定（sakila 有 payment→customer→address→city→country 这样的 5 跳链），
+  // 不折行时画布 1900px 起，必须横向拖。折行后宽度锁在视口内，箭头方向
+  // 仍然表示「子表指向被引用的父表」，只是父表可能在下一行的开头。
+  final columnsPerBand = viewportWidth <= 0
+      ? maxLayer + 1
+      : math.max(
+          1,
+          ((viewportWidth - margin * 2) / (metrics.cardWidth + gapX)).floor(),
+        );
+  final bandOf = <int, int>{};
+  final slotOf = <int, int>{};
+  for (var i = 0; i <= maxLayer; i++) {
+    final band = i ~/ columnsPerBand;
+    var slot = i % columnsPerBand;
+    // 奇数行从右往左排（蛇形）：行尾接行首，相邻两列不会跳到对角。
+    if (band.isOdd) slot = columnsPerBand - 1 - slot;
+    bandOf[i] = band;
+    slotOf[i] = slot;
+  }
+  final bandCount = maxLayer ~/ columnsPerBand + 1;
+  final bandHeight = <int, double>{};
+  for (var i = 0; i <= maxLayer; i++) {
+    final list = layers[i]!;
+    var height = 0.0;
+    for (var j = 0; j < list.length; j++) {
+      if (j > 0) height += gapY;
+      height += metrics.heightOf(tableByName[list[j]]!);
+    }
+    final band = bandOf[i]!;
+    if (height > (bandHeight[band] ?? 0)) bandHeight[band] = height;
+  }
+  // 行间距比列间距大一点，一眼能看出「这是换了下一行」。
+  final bandGap = gapY * 2;
+  final bandTop = <int, double>{};
+  var nextTop = margin;
+  for (var band = 0; band < bandCount; band++) {
+    bandTop[band] = nextTop;
+    nextTop += (bandHeight[band] ?? 0) + bandGap;
+  }
+  final columnsUsed = math.min(maxLayer + 1, columnsPerBand);
+  final totalWidth = columnsUsed * (metrics.cardWidth + gapX) - gapX;
   final left = totalWidth + margin * 2 < viewportWidth
       ? (viewportWidth - totalWidth) / 2
       : margin;
   final positions = <String, Offset>{};
   for (var i = 0; i <= maxLayer; i++) {
     final list = layers[i]!;
-    var y = margin;
-    final x = left + i * (metrics.cardWidth + gapX);
+    var y = bandTop[bandOf[i]] ?? margin;
+    final x = left + slotOf[i]! * (metrics.cardWidth + gapX);
     for (final name in list) {
       positions[name] = Offset(x, y);
       y += metrics.heightOf(tableByName[name]!) + gapY;

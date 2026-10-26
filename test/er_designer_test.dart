@@ -1247,7 +1247,12 @@ void main() {
   });
 
   testWidgets('分层布局：子表在左、被引用父表在右', (tester) async {
-    await setSurface(tester);
+    // 4 层链需要 4 列（每列 272+52）。窗口够宽时不应该折行，方向保持
+    // 「子表在左、父表在右」；折行是空间不够时的降级（见下一个用例）。
+    tester.view.physicalSize = const Size(1900, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     await tester.pumpWidget(
       host(
         RelationDesigner(

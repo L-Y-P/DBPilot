@@ -1978,6 +1978,49 @@ void main() {
       expect(positions['users']!.dy, lessThan(positions['categories']!.dy));
     });
 
+    test('列数放不下就折行：画布宽度锁在视口内（第 70 轮）', () {
+      ErTable node(String name) =>
+          table(name, <ErColumn>[column('id', type: 'INTEGER', primary: true)]);
+      ErRelation edge(String from, String to) => ErRelation(
+        localTable: from,
+        localColumn: 'id',
+        refTable: to,
+        refColumn: 'id',
+      );
+      final names = <String>['a', 'b', 'c', 'd', 'e', 'f'];
+      final tables = <ErTable>[for (final name in names) node(name)];
+      final relations = <ErRelation>[
+        for (var i = 0; i + 1 < names.length; i++) edge(names[i], names[i + 1]),
+      ];
+      const metrics = ErNodeMetrics();
+      // 视口只放得下 2 列：六层链必须折成 3 行。
+      final narrow = layeredErLayout(
+        tables,
+        relations,
+        viewportWidth: (metrics.cardWidth + 52) * 2 + 48,
+        metrics: metrics,
+      );
+      final xs = narrow.values.map((p) => p.dx).toSet().toList()..sort();
+      expect(xs.length, 2, reason: '两列排满就换行，不应继续往右长');
+      // 第 1 层与第 2 层换行：c 的 y 比 a 大（下一行）。
+      expect(narrow['c']!.dy, greaterThan(narrow['a']!.dy));
+      // 蛇形：偶数行左→右，奇数行右→左。所以行尾的 b 与下一行行首的 c
+      // 落在同一列（上下相邻，不是对角），再往后的 d 才回退一列。
+      expect(narrow['b']!.dx, greaterThan(narrow['a']!.dx));
+      expect(narrow['c']!.dx, narrow['b']!.dx);
+      expect(narrow['c']!.dy, greaterThan(narrow['b']!.dy));
+      expect(narrow['d']!.dx, lessThan(narrow['c']!.dx));
+      // 视口够宽时完全不折行，方向仍是逐列往右。
+      final wide = layeredErLayout(
+        tables,
+        relations,
+        viewportWidth: 4000,
+        metrics: metrics,
+      );
+      expect(wide['c']!.dy, wide['a']!.dy);
+      expect(wide['f']!.dx, greaterThan(wide['a']!.dx));
+    });
+
     test('层距 = 卡片宽 + 间距', () {
       final positions = layeredErLayout(
         <ErTable>[node('a'), node('b')],

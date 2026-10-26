@@ -59,74 +59,106 @@ String _typeFamily(String sqlType) {
 }
 
 /// 中文模式下的一句话类型说明（用于菜单/悬停提示）。
+///
+/// 说明按**具体类型**写，不按类型族写：中文标签本来就会撞车（SMALLINT /
+/// MEDIUMINT / INT 都叫「整数」，TEXT / MEDIUMTEXT / LONGTEXT 都叫「文本」，
+/// DATETIME / TIMESTAMP 都叫「日期时间」）。同族成员之间的差别 —— 取值范围、
+/// 存储大小、是否带时区、单值还是多值 —— 正是用户唯一想知道的东西，所以这里
+/// 写具体数字与语义，而不是一句通用的「整数，适合编号」。
 String _typeDescription(String sqlType) {
   final family = _typeFamily(sqlType);
+  final upper = sqlType.toUpperCase();
   final unsigned = _isUnsigned(sqlType);
   switch (family) {
     case 'TINYINT':
-      // MySQL 的 TINYINT(1) 是布尔约定；其余 TINYINT 仍是整数。
-      if (sqlType.toUpperCase().contains('(1)')) {
-        return '只有「是 / 否」两种取值';
-      }
-      return unsigned ? '很小的非负整数，适合状态、等级等' : '很小的整数，适合状态、等级等';
+      if (upper.contains('(1)')) return '只有「是 / 否」两种取值';
+      return unsigned ? '最小整数 0–255，适合状态、等级' : '最小整数 -128–127，适合状态、等级';
     case 'SMALLINT':
+      return unsigned ? '小范围整数 0–65535' : '小范围整数 -32768–32767';
     case 'MEDIUMINT':
+      return unsigned ? '中范围整数 0–16777215' : '中范围整数 -8388608–8388607';
     case 'INT':
     case 'INTEGER':
-      return unsigned ? '非负整数，适合编号、数量等' : '整数，适合编号、数量等没有小数的值';
+      return unsigned
+          ? '常用整数 0–约 42 亿，适合编号、数量'
+          : '常用整数 -21 亿–21 亿，适合编号、数量';
     case 'BIGINT':
-      return unsigned ? '非负大整数，常用作自增主键' : '大整数，常用作自增主键';
+      return unsigned
+          ? '大范围整数 0–约 1844 亿亿'
+          : '大范围整数 ±922 亿亿，常用作自增主键';
     case 'SERIAL':
     case 'BIGSERIAL':
     case 'SMALLSERIAL':
-      return '会自动递增的整数，常用作主键';
+      return '插入时自动递增的整数，常用作主键';
     case 'DECIMAL':
+      return '精确小数，需指定总位数与小数位（如 DECIMAL(18,2)），适合金额';
     case 'NUMERIC':
+      return '精确小数，与 DECIMAL 等价（PostgreSQL 的叫法）';
     case 'MONEY':
-      return '带小数的精确数字，适合金额、成绩等';
+      return '货币金额，固定小数位数';
     case 'FLOAT':
+      return '单精度近似小数，约 7 位有效数字';
     case 'DOUBLE':
+      return '双精度近似小数，约 15 位有效数字';
     case 'REAL':
-      return '近似小数，适合比率、科学计算等';
+      return '单精度近似小数（PostgreSQL 写法）';
     case 'BOOLEAN':
     case 'BOOL':
-    case 'BIT':
       return '只有「是 / 否」两种取值';
+    case 'BIT':
+      return '位字段：BIT(1) 常当布尔用，BIT(n) 存 n 位二进制';
     case 'DATE':
       return '只记录年月日';
     case 'DATETIME':
+      return '日期加时间，按字面保存，不做时区换算';
     case 'TIMESTAMP':
+      return '日期加时间，按会话时区换算（MySQL 只到 2038 年）';
     case 'TIMESTAMPTZ':
-      return '日期加时间（精确到时分秒）';
+      return '日期加时间，存 UTC 并按查询时区显示';
     case 'TIME':
-    case 'TIMETZ':
       return '只记录时分秒';
-    case 'TEXT':
+    case 'TIMETZ':
+      return '时分秒加时区偏移';
     case 'TINYTEXT':
+      return '短文本，最长 255 字节';
+    case 'TEXT':
+      return '长文本，最长 64KB';
     case 'MEDIUMTEXT':
+      return '中等文本，最长 16MB';
     case 'LONGTEXT':
+      return '超长文本，最长 4GB';
     case 'CLOB':
-      return '长文本，适合备注、说明等';
+      return '大文本对象';
     case 'VARCHAR':
+      return '变长文本，括号里是字符数上限';
     case 'CHAR':
+      return '定长文本，不足长度会用空格补齐';
     case 'CHARACTER':
-      return '有长度上限的文本';
+      return '定长文本，PostgreSQL 的 CHAR 别名';
     case 'CITEXT':
-      return '不区分大小写的文本，适合邮箱等';
+      return '不区分大小写的文本，适合邮箱';
     case 'JSON':
+      return 'JSON 文本，原样保存，查询较慢';
     case 'JSONB':
-      return 'JSON 数据，适合结构不固定的内容';
+      return '二进制 JSON，可建索引，查询更快（PostgreSQL）';
     case 'ENUM':
+      return '只能从列出的值里选一个';
     case 'SET':
-      return '只能取列出的几个值之一';
-    case 'BLOB':
+      return '从列出的值里选，可多选（MySQL）';
     case 'TINYBLOB':
+      return '二进制数据，最长 255 字节';
+    case 'BLOB':
+      return '二进制数据，最长 64KB';
     case 'MEDIUMBLOB':
+      return '二进制数据，最长 16MB';
     case 'LONGBLOB':
+      return '二进制数据，最长 4GB';
     case 'BINARY':
+      return '定长二进制，不足会用 0 补齐';
     case 'VARBINARY':
+      return '变长二进制';
     case 'BYTEA':
-      return '二进制数据（图片、文件内容等）';
+      return '二进制数据（PostgreSQL）';
     case 'YEAR':
       return '只有年份';
     case 'UUID':
@@ -136,9 +168,11 @@ String _typeDescription(String sqlType) {
     case 'INTERVAL':
       return '一段时间（如 1 天、2 小时）';
     case 'INET':
+      return 'IPv4 / IPv6 地址';
     case 'CIDR':
+      return 'IP 网段（如 192.168.0.0/24）';
     case 'MACADDR':
-      return '网络地址';
+      return 'MAC 地址';
     case 'POINT':
       return '平面坐标点';
     case 'TSVECTOR':
@@ -149,78 +183,124 @@ String _typeDescription(String sqlType) {
 }
 
 /// 英文模式下的一句话类型说明（用于菜单/悬停提示）。
+///
+/// Same rule as the Chinese side: per concrete type, not per family, so the
+/// members of a family that share one translated label stay distinguishable.
 String _typeDescriptionEn(String sqlType) {
   final family = _typeFamily(sqlType);
+  final upper = sqlType.toUpperCase();
   final unsigned = _isUnsigned(sqlType);
   switch (family) {
     case 'TINYINT':
-      return sqlType.toUpperCase().contains('(1)')
+      return upper.contains('(1)')
           ? 'true / false'
-          : (unsigned ? 'small non-negative integer' : 'small integer');
+          : (unsigned ? 'smallest integer, 0-255' : 'smallest integer, -128-127');
     case 'SMALLINT':
+      return unsigned ? 'small integer, 0-65535' : 'small integer, -32768-32767';
     case 'MEDIUMINT':
+      return unsigned
+          ? 'medium integer, 0-16777215'
+          : 'medium integer, -8388608-8388607';
     case 'INT':
     case 'INTEGER':
-      return unsigned ? 'non-negative whole numbers' : 'whole numbers';
+      return unsigned
+          ? 'common integer, 0 to about 4.29e9'
+          : 'common integer, about -2.1e9 to 2.1e9';
     case 'BIGINT':
       return unsigned
-          ? 'large non-negative integers, common for auto-increment keys'
-          : 'large integers, common for auto-increment keys';
+          ? 'large integer, 0 to about 1.8e19'
+          : 'large integer, about +/-9.2e18';
     case 'SERIAL':
     case 'BIGSERIAL':
     case 'SMALLSERIAL':
       return 'auto-increment integer, usually a primary key';
     case 'DECIMAL':
+      return 'exact decimal, needs total and fractional digits (e.g. DECIMAL(18,2))';
     case 'NUMERIC':
+      return 'exact decimal, PostgreSQL name for DECIMAL';
     case 'MONEY':
-      return 'exact decimal numbers (money, scores)';
+      return 'currency amount with a fixed number of decimals';
     case 'FLOAT':
+      return 'single-precision approximate decimal, about 7 significant digits';
     case 'DOUBLE':
+      return 'double-precision approximate decimal, about 15 significant digits';
     case 'REAL':
-      return 'approximate decimal numbers';
+      return 'single-precision approximate decimal (PostgreSQL)';
     case 'BOOLEAN':
     case 'BOOL':
-    case 'BIT':
       return 'true / false';
+    case 'BIT':
+      return 'bit field: BIT(1) behaves like a boolean, BIT(n) holds n bits';
     case 'DATE':
       return 'calendar date';
     case 'DATETIME':
+      return 'date and time, stored as written, no time-zone conversion';
     case 'TIMESTAMP':
+      return 'date and time, converted per the session time zone';
     case 'TIMESTAMPTZ':
-      return 'date and time';
+      return 'date and time stored as UTC, shown in the query time zone';
     case 'TIME':
-    case 'TIMETZ':
       return 'time of day';
-    case 'TEXT':
+    case 'TIMETZ':
+      return 'time of day with a time-zone offset';
     case 'TINYTEXT':
+      return 'short text, up to 255 bytes';
+    case 'TEXT':
+      return 'long text, up to 64KB';
     case 'MEDIUMTEXT':
+      return 'medium text, up to 16MB';
     case 'LONGTEXT':
+      return 'very long text, up to 4GB';
     case 'CLOB':
-      return 'long text';
+      return 'character large object';
     case 'VARCHAR':
+      return 'variable-length text with a length limit';
     case 'CHAR':
+      return 'fixed-length text, padded with spaces';
     case 'CHARACTER':
-      return 'text with a length limit';
+      return 'fixed-length text, PostgreSQL alias of CHAR';
     case 'CITEXT':
       return 'case-insensitive text';
     case 'JSON':
+      return 'JSON text, stored verbatim, slower to query';
     case 'JSONB':
-      return 'JSON document';
+      return 'binary JSON, indexable and faster to query (PostgreSQL)';
     case 'ENUM':
+      return 'exactly one of the listed values';
     case 'SET':
-      return 'one of a fixed set of values';
-    case 'BLOB':
+      return 'zero or more of the listed values (MySQL)';
     case 'TINYBLOB':
+      return 'binary data, up to 255 bytes';
+    case 'BLOB':
+      return 'binary data, up to 64KB';
     case 'MEDIUMBLOB':
+      return 'binary data, up to 16MB';
     case 'LONGBLOB':
+      return 'binary data, up to 4GB';
     case 'BINARY':
+      return 'fixed-length binary, zero padded';
     case 'VARBINARY':
+      return 'variable-length binary';
     case 'BYTEA':
-      return 'binary data';
+      return 'binary data (PostgreSQL)';
+    case 'YEAR':
+      return 'year only';
     case 'UUID':
       return 'globally unique identifier';
     case 'XML':
       return 'XML text';
+    case 'INTERVAL':
+      return 'a span of time (1 day, 2 hours)';
+    case 'INET':
+      return 'IPv4 / IPv6 address';
+    case 'CIDR':
+      return 'IP network (e.g. 192.168.0.0/24)';
+    case 'MACADDR':
+      return 'MAC address';
+    case 'POINT':
+      return 'planar point';
+    case 'TSVECTOR':
+      return 'document tokens for full-text search';
     default:
       return '';
   }

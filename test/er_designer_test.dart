@@ -1126,7 +1126,9 @@ void main() {
           .first,
     );
     expect(typeTooltip.message, contains('VARCHAR(255)'));
-    expect(typeTooltip.message, contains('有长度上限的文本'));
+    // 第 70 轮：说明改成「具体成员」的差别（变长 vs 定长 vs 长文本），
+    // 不再是一句适用于整个文本家族的「有长度上限的文本」。
+    expect(typeTooltip.message, contains('变长文本'));
     expect(tester.takeException(), isNull);
   });
 

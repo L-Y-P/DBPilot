@@ -1,3 +1,5 @@
+import 'dart:ui' show ImageFilter;
+
 import 'package:flutter/material.dart' hide Text, Tooltip;
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -36,14 +38,17 @@ class AppMenuEntry {
   bool get isEnabled => enabled && onSelected != null;
 }
 
-// Geometry copied from a native macOS menu: 22px rows, 4px inner padding, a
-// 6px corner radius and hairline separators. Keeping the numbers in one place
-// makes the menu read as a system menu rather than as another app surface.
-const double _kMenuMinWidth = 168;
-const double _kMenuMaxWidth = 320;
-const double _kRowHeight = 22;
-const double _kRowRadius = 4;
-const double _kMenuPadding = 4;
+// Geometry copied from a native macOS menu: 24px rows inside 5px of padding, a
+// 10px corner radius, hairline separators inset from both edges and a floating
+// drop shadow. Keeping the numbers in one place keeps the menu reading as a
+// system surface rather than as another app card.
+const double _kMenuMinWidth = 180;
+const double _kMenuMaxWidth = 340;
+const double _kRowHeight = 24;
+const double _kRowRadius = 5;
+const double _kMenuPadding = 5;
+const double _kMenuRadius = 10;
+const double _kSeparatorInset = 10;
 
 /// Show [entries] at the pointer and run the chosen action.
 ///
@@ -131,6 +136,7 @@ class _MenuColors {
     required this.background,
     required this.border,
     required this.shadow,
+    required this.shadowSoft,
     required this.separator,
     required this.text,
     required this.mutedText,
@@ -142,6 +148,7 @@ class _MenuColors {
   final Color background;
   final Color border;
   final Color shadow;
+  final Color shadowSoft;
   final Color separator;
   final Color text;
   final Color mutedText;
@@ -153,10 +160,12 @@ class _MenuColors {
     final dark = AppColors.palette.dark;
     if (dark) {
       return const _MenuColors(
-        // #2C2C2E is the native dark menu surface.
-        background: Color(0xFF2C2C2E),
+        // #2C2C2E is the native dark menu surface; slightly translucent so the
+        // backdrop blur reads as the system's vibrant material.
+        background: Color(0xE62C2C2E),
         border: Color(0x1FFFFFFF),
         shadow: Color(0x66000000),
+        shadowSoft: Color(0x33000000),
         separator: Color(0x26FFFFFF),
         text: Color(0xFFEDEDED),
         mutedText: Color(0xFF7C7C80),
@@ -167,10 +176,11 @@ class _MenuColors {
       );
     }
     return const _MenuColors(
-      // #F7F7F7 is the native light menu surface (NSMenu's material).
-      background: Color(0xFFF7F7F7),
+      // #F7F6F5 is the native light menu surface (NSMenu's material).
+      background: Color(0xE6F7F6F5),
       border: Color(0x1A000000),
-      shadow: Color(0x33000000),
+      shadow: Color(0x30000000),
+      shadowSoft: Color(0x1F000000),
       separator: Color(0x1A000000),
       text: Color(0xFF1D1D1F),
       mutedText: Color(0xFF9A9A9E),
@@ -252,7 +262,10 @@ class _AppMenuPanel extends StatelessWidget {
               Navigator.of(context).maybePop(),
         },
         child: CustomSingleChildLayout(
-          delegate: _AppMenuLayout(position: position, overlaySize: overlaySize),
+          delegate: _AppMenuLayout(
+            position: position,
+            overlaySize: overlaySize,
+          ),
           child: _box(context),
         ),
       ),
@@ -262,41 +275,64 @@ class _AppMenuPanel extends StatelessWidget {
   Widget _box(BuildContext context) {
     final colors = _MenuColors.of(context);
     final children = <Widget>[];
-    for (final entry in entries) {
+    for (var i = 0; i < entries.length; i++) {
+      final entry = entries[i];
       if (entry.separatorBefore && children.isNotEmpty) {
         children.add(_MenuSeparator(color: colors.separator));
       }
-      children.add(_AppMenuRow(
-        entry: entry,
-        colors: colors,
-        onTap: entry.isEnabled
-            ? () => Navigator.of(context).pop(entry.label)
-            : null,
-      ));
+      children.add(
+        _AppMenuRow(
+          entry: entry,
+          colors: colors,
+          onTap: entry.isEnabled
+              ? () => Navigator.of(context).pop(entry.label)
+              : null,
+        ),
+      );
     }
+    final radius = BorderRadius.circular(_kMenuRadius);
     return Container(
       constraints: const BoxConstraints(
         minWidth: _kMenuMinWidth,
         maxWidth: _kMenuMaxWidth,
       ),
-      padding: const EdgeInsets.all(_kMenuPadding),
       decoration: BoxDecoration(
-        color: colors.background,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: colors.border),
+        borderRadius: radius,
         boxShadow: <BoxShadow>[
+          // A native menu floats: one wide soft shadow for the lift, one tight
+          // one so the edge still reads against a light background.
           BoxShadow(
             color: colors.shadow,
-            blurRadius: 20,
-            spreadRadius: 2,
-            offset: const Offset(0, 5),
+            blurRadius: 28,
+            offset: const Offset(0, 10),
+          ),
+          BoxShadow(
+            color: colors.shadowSoft,
+            blurRadius: 4,
+            offset: const Offset(0, 1),
           ),
         ],
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: children,
+      child: ClipRRect(
+        borderRadius: radius,
+        child: BackdropFilter(
+          // The system menu is a vibrant material: blur whatever sits behind
+          // it and tint that, instead of painting a flat grey card.
+          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+          child: Container(
+            padding: const EdgeInsets.all(_kMenuPadding),
+            decoration: BoxDecoration(
+              color: colors.background,
+              borderRadius: radius,
+              border: Border.all(color: colors.border, width: 0.8),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: children,
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -309,10 +345,14 @@ class _MenuSeparator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Native menus inset the rule a few pixels from the menu edge.
+    // Native menus inset the rule from both edges, so it reads as a divider
+    // between groups rather than as a full-width border.
     return Container(
       height: 1,
-      margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+      margin: const EdgeInsets.symmetric(
+        vertical: 4,
+        horizontal: _kSeparatorInset,
+      ),
       color: color,
     );
   }
@@ -350,7 +390,7 @@ class _AppMenuRowState extends State<_AppMenuRow> {
         ? colors.dangerText
         : colors.text;
     return MouseRegion(
-      cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      // macOS menus keep the arrow cursor; a hand cursor is a web idiom.
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
       child: GestureDetector(
@@ -358,7 +398,7 @@ class _AppMenuRowState extends State<_AppMenuRow> {
         onTap: widget.onTap,
         child: Container(
           height: _kRowHeight,
-          padding: const EdgeInsets.symmetric(horizontal: 9),
+          padding: const EdgeInsets.symmetric(horizontal: 10),
           decoration: BoxDecoration(
             color: highlighted ? colors.highlight : null,
             borderRadius: BorderRadius.circular(_kRowRadius),
@@ -368,7 +408,12 @@ class _AppMenuRowState extends State<_AppMenuRow> {
             trLiteral(entry.label),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 13, height: 1.15, color: color),
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.15,
+              letterSpacing: -0.08,
+              color: color,
+            ),
           ),
         ),
       ),

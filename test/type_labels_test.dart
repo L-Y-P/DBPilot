@@ -71,6 +71,35 @@ void main() {
     }
   });
 
+  // 同族成员的中文标签本来就撞车（SMALLINT / MEDIUMINT / INT 都是「整数」，
+  // TEXT 家族都是「文本」）。撞车的唯一出路是悬停说明必须写出差别，所以这条
+  // 测试盯的就是「说明不能一样」：谁把说明改回一句通用文案，这里立刻红。
+  test('同族成员的悬停说明必须各不相同', () {
+    const families = <List<String>>[
+      <String>['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT'],
+      <String>['TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT'],
+      <String>['DATETIME', 'TIMESTAMP'],
+      <String>['DECIMAL', 'FLOAT', 'DOUBLE'],
+      <String>['TINYBLOB', 'BLOB', 'MEDIUMBLOB', 'LONGBLOB'],
+      <String>['VARCHAR(255)', 'CHAR(36)', 'TEXT'],
+      <String>['ENUM', 'SET'],
+      <String>['INT', 'INT UNSIGNED'],
+    ];
+    for (final family in families) {
+      final descriptions = <String>{};
+      for (final sqlType in family) {
+        final tooltip = columnTypeTooltip(sqlType);
+        expect(tooltip.contains('：'), isTrue, reason: '$sqlType 缺说明：$tooltip');
+        descriptions.add(tooltip.split('：').last);
+      }
+      expect(
+        descriptions.length,
+        family.length,
+        reason: '$family 的说明撞车了：$descriptions',
+      );
+    }
+  });
+
   test('英文模式保持原始 SQL 类型', () {
     I18n.setLang(AppLang.en);
     for (final sqlType in <String>[

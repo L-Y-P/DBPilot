@@ -13,12 +13,16 @@ import 'package:rust_myadmin_desktop/src/native_menu.dart';
 /// The override has to be cleared *inside* the test body: the binding checks
 /// that no foundation debug variable was left set at the end of the body,
 /// before tearDown runs.
+/// The AppKit menu is opt-in (see native_menu.dart: popUp blocks the platform
+/// thread), so these tests switch it on explicitly.
 Future<T> onMacOS<T>(Future<T> Function() body) async {
   debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+  debugNativeMenuEnabled = true;
   try {
     return await body();
   } finally {
     debugDefaultTargetPlatformOverride = null;
+    debugNativeMenuEnabled = false;
   }
 }
 

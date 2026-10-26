@@ -8,18 +8,39 @@ import 'package:flutter/services.dart';
 /// flipping, light/dark) is to let AppKit draw it. The Dart side ships the
 /// labels across this channel and gets the chosen index back; the menu itself
 /// never passes through Flutter.
-///
-/// Everything else — widget tests, Windows, Linux, and any macOS build whose
-/// channel is missing — falls back to the Flutter-drawn menu in app_menu.dart,
-/// so the feature degrades instead of disappearing.
 const MethodChannel nativeMenuChannel = MethodChannel('dbpilot/menu');
+
+/// Opt-in switch for the AppKit menu.
+///
+/// OFF by default, and it should stay that way. `NSMenu.popUp` runs a blocking
+/// tracking loop **on the platform thread** — the thread Dart itself runs on.
+/// A menu shown that way holds the whole app hostage until it closes, and in
+/// practice the app comes back unable to receive clicks at all: every button in
+/// every dialog is dead until some other activation cycle, such as another
+/// right-click, shakes it loose. Three separate reports ("the menu does
+/// nothing", "the dialog does nothing", "nothing responds") all came out of that
+/// one API call. A context menu is not worth freezing the app for.
+///
+/// The Flutter-drawn menu in app_menu.dart is already tuned to look like the
+/// system menu (22px rows, hairline separators, no icons, no animation, system
+/// light/dark colours), never blocks, and is covered by widget tests and a
+/// golden. Build with `--dart-define=DBPILOT_NATIVE_MENU=true` to try the AppKit
+/// menu anyway.
+const bool _nativeMenuEnabled = bool.fromEnvironment('DBPILOT_NATIVE_MENU');
 
 /// True when the running build can hand menus to the platform.
 ///
-/// Only macOS has a bridge today. The check is deliberately cheap and constant
-/// so callers can branch without awaiting anything.
+/// The check is deliberately cheap and constant so callers can branch without
+/// awaiting anything.
+/// Test-only override, so widget tests can still exercise the AppKit path even
+/// though production builds keep it off. Never set this from app code.
+@visibleForTesting
+bool debugNativeMenuEnabled = _nativeMenuEnabled;
+
 bool get hasNativeMenu =>
-    !kIsWeb && defaultTargetPlatform == TargetPlatform.macOS;
+    debugNativeMenuEnabled &&
+    !kIsWeb &&
+    defaultTargetPlatform == TargetPlatform.macOS;
 
 /// Show a native menu at ([x], [y]) in Flutter logical pixels.
 ///

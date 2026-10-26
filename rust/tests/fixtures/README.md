@@ -20,7 +20,7 @@ Rust 单测（`desktop/rust/src/importer.rs` 的 `excel_tests`）直接读取它
 使用 DSH 自带的 Python（openpyxl / xlsxwriter 已内置，xlwt 需要单独装到临时目录）：
 
 ```sh
-PY=/Users/lyp/.dsh/dsh-runtimes/dsh-next-primary-runtime/dependencies/python/bin/python3
+PY=python3
 $PY -m pip install --quiet --target /tmp/xlwt_pkg xlwt
 PYTHONPATH=/tmp/xlwt_pkg $PY gen_fixtures.py
 ```

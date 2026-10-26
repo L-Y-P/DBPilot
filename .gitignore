@@ -90,3 +90,13 @@ app.*.map.json
 
 # 性能测试产物（数据集 SQL / 1GB CSV / 采集报告，可由 tools/perf 重新生成）
 /out/
+
+# 本地运行期数据的防御性规则（第 71 轮补充）：应用会在数据目录写设置/连接/历史，
+# 异常时还会留下 connections.json.bak / .corrupt-* 副本；用户数据归档与截图同样不入库。
+**/settings.json
+**/connections.json*
+**/query_history.json
+**/backups/
+local-userdata-backup*
+*.tar.gz
+**/screenshots/

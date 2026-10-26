@@ -11,7 +11,7 @@
                 -> orders / products（两列外键 = 多对多中间表）
 
 用 DSH 自带 Python（openpyxl）生成，产物直接提交到 fixtures：
-  PY=/Users/lyp/.dsh/dsh-runtimes/dsh-next-primary-runtime/dependencies/python/bin/python3
+  PY=python3
   $PY gen_relational_multi.py
 """
 from __future__ import annotations

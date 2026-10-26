@@ -6,7 +6,7 @@
 工作表 2「年级成绩单」：学号 / 姓名 / 班级 / 语文 / 数学 / 英语 / 科学 / 体育（每科整年级成绩）
 
 用 DSH 自带 Python（openpyxl）生成：
-  PY=/Users/lyp/.dsh/dsh-runtimes/dsh-next-primary-runtime/dependencies/python/bin/python3
+  PY=python3
   $PY gen_chinese_grade.py
 """
 from __future__ import annotations

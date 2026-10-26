@@ -15,7 +15,7 @@ ZIP(xlsx) 与 OLE2(xls) 两条读取路径：
 
 复现命令（使用 DSH 自带 Python；xlwt 不在默认 site-packages 里）：
 
-  PY=/Users/lyp/.dsh/dsh-runtimes/dsh-next-primary-runtime/dependencies/python/bin/python3
+  PY=python3
   $PY -m pip install --quiet --target /tmp/xlwt_pkg xlwt
   PYTHONPATH=/tmp/xlwt_pkg $PY gen_fixtures.py
 

@@ -1,9 +1,25 @@
 # DBPilot
 
-**用 Flutter + Rust 写的跨平台数据库管理桌面客户端**，支持 MySQL / MariaDB、PostgreSQL、SQLite。
-本地单机应用，进程内 FFI 调用，没有服务端和账号体系，连接信息与备份都留在自己机器上。
+[![build](https://github.com/L-Y-P/DBPilot/actions/workflows/build.yml/badge.svg)](https://github.com/L-Y-P/DBPilot/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/L-Y-P/DBPilot)](https://github.com/L-Y-P/DBPilot/releases)
+[![license](https://img.shields.io/github/license/L-Y-P/DBPilot)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)](#编译)
 
-![DBPilot](docs/images/main-connections.png)
+**DBPilot 是一个本地优先、开箱即用的跨平台数据库管理桌面客户端。**
+界面用 Flutter，数据库与网络全部交给 Rust，通过进程内 FFI 直接调用——没有服务端、没有账号体系，
+连接信息、查询历史与备份都只留在你自己的机器上。
+
+支持 **MySQL / MariaDB、PostgreSQL、SQLite**，覆盖日常数据库工作的完整链路：
+**连接管理（SSH 跳板 / TLS·mTLS）→ 库表对象浏览 → 可视化表设计 → 数据浏览与批量编辑 →
+SQL 控制台 / 查询构建器 → Excel·CSV·SQL 导入 → E-R 关系图 → 备份还原与结构同步**；
+界面支持中英双语、深浅色与 6 套主题色。
+
+- **本地优先**：无云端、无遥测上传；数据目录 0700、文件 0600，连接密码不会离开本机。
+- **三平台一致**：macOS（universal x86_64 + arm64）、Windows x64、Linux（AppImage / deb / rpm）。
+- **流式处理**：大文件导入导出、SQL 文件执行、备份还原都不整表载入内存；`keyset` 游标分页替代 OFFSET。
+- **中文友好**：中文类型说明、术语解释，以及面向普通用户的可操作错误提示（如 MySQL 1452 孤儿行预检）。
+
+![DBPilot 连接管理](docs/images/main-connections.png)
 
 | | |
 | --- | --- |

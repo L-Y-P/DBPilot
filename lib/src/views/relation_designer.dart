@@ -668,6 +668,12 @@ class RelationDesignerState extends State<RelationDesigner> {
         ? _layoutWidth
         : (widget.compact ? 660.0 : 860.0);
     setState(() => _relayout(force: true, width: width));
+    // 重排后内容尺寸变了，留在旧滚动位置会看到一片空白/半截卡片 —— 回到左上角。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_canvasHorizontal.hasClients) _canvasHorizontal.jumpTo(0);
+      if (_canvasVertical.hasClients) _canvasVertical.jumpTo(0);
+    });
   }
 
   ErTable? _tableNamed(String name) {

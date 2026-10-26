@@ -94,22 +94,32 @@ final class NativeMenuBridge: NSObject {
     let pointInWindow = view.convert(pointInView, to: nil)
     let pointOnScreen = window.convertPoint(toScreen: pointInWindow)
 
-    // 后台窗口里弹出的菜单点了没反应：先把 app 拉到前台再弹。
-    NSApp.activate(ignoringOtherApps: true)
+    // 关键：不要在 channel handler 里直接 popUp。
+    //
+    // popUp 会跑一个自己的追踪循环，把平台线程（= Dart 所在的线程）整个占住
+    // 直到菜单关闭。如果在 handler 里就这么做，等菜单关掉、我们再把结果回给
+    // Flutter 时，平台线程还在收拾这一轮 channel 调用，紧接着被 push 出来的
+    // 新对话框就会"头几百毫秒点不动"（第一次点击被吞掉）。
+    //
+    // 把弹出动作放到下一个 run-loop turn：先让这一轮 channel 消息干净地结束，
+    // 再让菜单独占线程；关闭后从干净的一轮里回结果。
+    DispatchQueue.main.async { [weak self] in
+        guard let self else {
+            result(-1)
+            return
+        }
+        // 后台窗口里弹出的菜单点了没反应：先把 app 拉到前台再弹。
+        NSApp.activate(ignoringOtherApps: true)
 
-    // popUp 是**阻塞**的：它自己跑事件循环，直到菜单关闭才返回。所以
-    //   * 不能在这里 await 任何东西；
-    //   * 结果必须在它返回**之后**再交给 Flutter —— 在菜单自己的
-    //     tracking 循环里调用 FlutterResult，reply 会被压住/丢弃，表现就是
-    //     "菜单弹得出来，点了没反应"。
-    menu.popUp(positioning: nil, at: pointOnScreen, in: nil)
+        menu.popUp(positioning: nil, at: pointOnScreen, in: nil)
 
-    // 走到这里说明菜单已经关闭，选中项是最终值。
-    // 取消（Esc / 点外面）时 selectedIndex 仍是 nil：必须回 -1 而不是 nil，
-    // 否则 Dart 会当成"平台没有菜单桥"再弹一个自绘菜单。
-    let index = selectedIndex ?? -1
-    selectedIndex = nil
-    result(index)
+        // 走到这里说明菜单已经关闭，选中项是最终值。
+        // 取消（Esc / 点外面）时 selectedIndex 仍是 nil：必须回 -1 而不是 nil，
+        // 否则 Dart 会当成"平台没有菜单桥"再弹一个自绘菜单。
+        let index = self.selectedIndex ?? -1
+        self.selectedIndex = nil
+        result(index)
+    }
   }
 
   @objc private func handleSelect(_ sender: NSMenuItem) {

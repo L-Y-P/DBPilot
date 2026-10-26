@@ -73,6 +73,11 @@ Future<String?> showAppContextMenu(
   final nativeIndex = await _tryNativeMenu(entries, anchor);
   if (nativeIndex != null) {
     if (nativeIndex >= 0 && nativeIndex < entries.length) {
+      // The platform side already shows the menu on its own run-loop turn and
+      // only replies once the menu has closed, so the action runs with the
+      // platform thread idle. Do NOT add a Dart-side delay here: a Timer never
+      // fires under the fake-async zone of widget tests, and the
+      // showAppContextMenu future would hang forever.
       entries[nativeIndex].onSelected?.call();
       return entries[nativeIndex].label;
     }

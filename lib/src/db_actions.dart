@@ -9,6 +9,11 @@ import 'package:flutter/material.dart' hide Text, Tooltip;
 
 import 'api.dart';
 import 'app_menu.dart';
+
+// Call sites (views and the sidebar) import this file for the actions; the menu
+// widget lives in app_menu.dart, so re-export it rather than making every view
+// import both.
+export 'app_menu.dart' show AppMenuEntry, ContextMenuRegion, showAppContextMenu;
 import 'app_state.dart';
 import 'i18n_literals.dart';
 import 'nav.dart';
@@ -153,7 +158,6 @@ List<AppMenuEntry> databaseMenuEntries(
   return <AppMenuEntry>[
     AppMenuEntry(
       label: '刷新',
-      icon: Icons.refresh,
       onSelected: () async {
         await refreshExplorer(notice: notice);
         await onChanged?.call();
@@ -161,20 +165,17 @@ List<AppMenuEntry> databaseMenuEntries(
     ),
     AppMenuEntry(
       label: '新建表',
-      icon: Icons.add_box_outlined,
       separatorBefore: true,
       onSelected: () =>
           run(() => createTableIn(context, database, notice: notice)),
     ),
     AppMenuEntry(
       label: '从文件建表',
-      icon: Icons.upload_file_outlined,
       onSelected: () =>
           run(() => quickCreateTablesIn(context, database, notice: notice)),
     ),
     AppMenuEntry(
       label: '关系图',
-      icon: Icons.account_tree_outlined,
       onSelected: () =>
           openRelationshipDiagram(context, database, notice: notice),
     ),
@@ -195,7 +196,6 @@ List<AppMenuEntry> tableMenuEntries(
   return <AppMenuEntry>[
     AppMenuEntry(
       label: '刷新',
-      icon: Icons.refresh,
       onSelected: () async {
         await refreshExplorer(notice: notice);
         await onChanged?.call();
@@ -203,7 +203,6 @@ List<AppMenuEntry> tableMenuEntries(
     ),
     AppMenuEntry(
       label: '新建表',
-      icon: Icons.add_box_outlined,
       separatorBefore: true,
       onSelected: () async {
         final created = await createTableIn(context, database, notice: notice);
@@ -212,7 +211,6 @@ List<AppMenuEntry> tableMenuEntries(
     ),
     AppMenuEntry(
       label: '关系图',
-      icon: Icons.account_tree_outlined,
       onSelected: () => openRelationshipDiagram(
         context,
         database,
@@ -222,39 +220,6 @@ List<AppMenuEntry> tableMenuEntries(
     ),
   ];
 }
-
-/// Wrap [child] so a right-click opens [entries].
-///
-/// [enabled] false keeps the child untouched (a menu on an empty tree area
-/// would be misleading). [onSecondaryTapDown] is used instead of
-/// `onSecondaryTap` so the menu opens at the exact pointer position.
-class ContextMenuRegion extends StatelessWidget {
-  const ContextMenuRegion({
-    super.key,
-    required this.child,
-    required this.entries,
-    this.enabled = true,
-  });
-
-  final Widget child;
-  final List<AppMenuEntry> entries;
-  final bool enabled;
-
-  @override
-  Widget build(BuildContext context) {
-    if (!enabled) return child;
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onSecondaryTapDown: (details) => showAppContextMenu(
-        context,
-        entries,
-        position: details.globalPosition,
-      ),
-      child: child,
-    );
-  }
-}
-
 /// A thin divider that separates a toolbar's action groups.
 ///
 /// The database and table toolbars mix destructive actions with the everyday

@@ -1472,7 +1472,19 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
 
   @override
   Widget build(BuildContext context) {
-    return PageScroll(
+    // The whole table page is the menu target, seeded with this table: opening
+    // 关系图 from here lands on the table and its neighbours. Cells and text
+    // fields inside the page keep their own menus (the region skips editable
+    // hit targets, and inner regions win over this one).
+    return ContextMenuRegion(
+      entries: tableMenuEntries(
+        context,
+        widget.db,
+        widget.table,
+        notice: widget.notice,
+        onChanged: _reloadAfterWrite,
+      ),
+      child: PageScroll(
       padding: const EdgeInsets.all(AppMetrics.mainPadding),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1487,23 +1499,13 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
           _tabBody(),
         ],
       ),
+      ),
     );
   }
 
   Widget _header() {
     final total = (_data['total'] as num?)?.toInt() ?? _knownTotal;
-    // Right-clicking the table page offers the page-level actions, with 关系图
-    // seeded by this table: opening the diagram from a table lands on that
-    // table and its neighbours instead of an empty canvas.
-    return ContextMenuRegion(
-      entries: tableMenuEntries(
-        context,
-        widget.db,
-        widget.table,
-        notice: widget.notice,
-        onChanged: _reloadAfterWrite,
-      ),
-      child: PageHead(
+    return PageHead(
       titleWidget: Row(
         children: [
           InkWell(
@@ -1534,7 +1536,6 @@ class _TableViewState extends State<TableView> with SingleTickerProviderStateMix
             icon: Icons.arrow_back,
             onPressed: () => Navigation.instance.go(AppRoute.database(widget.db))),
       ],
-      ),
     );
   }
 

@@ -5,10 +5,11 @@
 // the entries can be asserted without opening a popup; the widget test below
 // covers the wiring (right-click opens the menu with those labels).
 import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rust_myadmin_desktop/src/app_menu.dart';
-import 'package:rust_myadmin_desktop/src/db_actions.dart';
+import 'package:rust_myadmin_desktop/src/db_actions.dart' hide ContextMenuRegion;
 
 Widget host(Widget child) => MaterialApp(
   home: Scaffold(body: Builder(builder: (context) => child)),
@@ -117,5 +118,78 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
     expect(find.text('刷新'), findsNothing);
+  });
+
+  testWidgets('the menu appears in one frame (no open animation)',
+      (tester) async {
+    await tester.pumpWidget(host(ContextMenuRegion(
+      entries: <AppMenuEntry>[
+        AppMenuEntry(label: '刷新', onSelected: () {}),
+      ],
+      child: const SizedBox(width: 300, height: 200, child: Text('target')),
+    )));
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.text('target')),
+      kind: PointerDeviceKind.mouse,
+      buttons: kSecondaryMouseButton,
+    );
+    await gesture.up();
+    // One frame only: an animated popup would still be transparent here.
+    await tester.pump();
+    expect(find.text('刷新'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(find.text('刷新'), findsOneWidget);
+  });
+
+  testWidgets('Escape closes the menu', (tester) async {
+    await tester.pumpWidget(host(ContextMenuRegion(
+      entries: <AppMenuEntry>[
+        AppMenuEntry(label: '刷新', onSelected: () {}),
+      ],
+      child: const SizedBox(width: 300, height: 200, child: Text('target')),
+    )));
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.text('target')),
+      kind: PointerDeviceKind.mouse,
+      buttons: kSecondaryMouseButton,
+    );
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(find.text('刷新'), findsOneWidget);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.text('刷新'), findsNothing);
+  });
+
+  testWidgets('a right-click on a text field keeps the platform text menu',
+      (tester) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    var opened = 0;
+    await tester.pumpWidget(host(ContextMenuRegion(
+      entries: <AppMenuEntry>[
+        AppMenuEntry(label: '刷新', onSelected: () => opened++),
+      ],
+      child: SizedBox(
+        width: 300,
+        height: 200,
+        child: TextField(controller: controller),
+      ),
+    )));
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(TextField)),
+      kind: PointerDeviceKind.mouse,
+      buttons: kSecondaryMouseButton,
+    );
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(find.text('刷新'), findsNothing,
+        reason: 'the text field owns its right-click menu');
+    expect(opened, 0);
   });
 }

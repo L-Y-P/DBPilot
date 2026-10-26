@@ -572,23 +572,23 @@ class _DatabaseViewState extends State<DatabaseView> {
 
   @override
   Widget build(BuildContext context) {
-    return PageScroll(
+    // The whole page is the page-level menu target: refresh / create table /
+    // from-file / relationships for this database. Rows inside the tables card
+    // override it with their own table-scoped menu, and text fields keep the
+    // platform text menu (ContextMenuRegion skips editable hit targets).
+    return ContextMenuRegion(
+      entries: databaseMenuEntries(
+        context,
+        _namespace,
+        notice: widget.notice,
+        onChanged: _load,
+      ),
+      child: PageScroll(
       padding: const EdgeInsets.all(AppMetrics.mainPadding),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // The head area (title + toolbar) is the page-level context-menu
-          // target: refresh / create table / from-file / relationships for this
-          // database. The cards keep their own row-level menus, and the
-          // objects-card search field keeps the platform text menu.
-          ContextMenuRegion(
-            entries: databaseMenuEntries(
-              context,
-              _namespace,
-              notice: widget.notice,
-              onChanged: _load,
-            ),
-            child: PageHead(
+          PageHead(
             titleWidget: Text(_title,
                 style: monoStyle(size: 20, weight: FontWeight.w600)),
             meta: [
@@ -667,7 +667,6 @@ class _DatabaseViewState extends State<DatabaseView> {
                         ? null
                         : _dropDatabase),
             ],
-            ),
           ),
           if (!isSqlite)
             Padding(
@@ -715,6 +714,7 @@ class _DatabaseViewState extends State<DatabaseView> {
             _objectsCard(),
           ],
         ],
+      ),
       ),
     );
   }

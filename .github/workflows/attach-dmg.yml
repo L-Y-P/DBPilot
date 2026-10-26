@@ -24,6 +24,9 @@ jobs:
     name: build and attach dmg
     runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Resolve version
         id: v
@@ -49,7 +52,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release download "${{ steps.v.outputs.tag }}" \
+          gh release download "${{ steps.v.outputs.tag }}" --repo "$GH_REPO" \
             --pattern "DBPilot-${{ steps.v.outputs.version }}-macos.zip" --dir .
           ls -lh *-macos.zip
 
@@ -71,11 +74,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release upload "${{ steps.v.outputs.tag }}" \
+          gh release upload "${{ steps.v.outputs.tag }}" --repo "$GH_REPO" \
             "DBPilot-${{ steps.v.outputs.version }}-macos.dmg" --clobber
 
       - name: Show release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view "${{ steps.v.outputs.tag }}" --json assets --jq '.assets[].name'
+          gh release view "${{ steps.v.outputs.tag }}" --repo "$GH_REPO" --json assets --jq '.assets[].name'

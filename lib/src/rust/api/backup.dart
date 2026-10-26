@@ -31,13 +31,20 @@ Future<Object?> readBackup({required String id}) =>
 
 /// Execute every statement in a backup against its original database.
 ///
-/// The dump runs through **one pinned connection** and consecutive DML
-/// statements are grouped into transactions (see
-/// [dbpilot_core::ops::restore_sql]): a 500k-row dump pays a handful of commits
-/// instead of one autocommit per INSERT. Failure reporting is unchanged — one
-/// entry per dump statement, the first 20 errors are returned — and a failed
-/// batch is rolled back and replayed so every other statement is still
-/// attempted.
+/// The dump runs through **one pinned connection**. PostgreSQL and SQLite get
+/// a really atomic restore ([dbpilot_core::ops::restore_sql_atomic]): one
+/// transaction around the whole dump, so a failure at any statement rolls the
+/// schema and data back too. That only works when the dump is transactional:
+/// statements a transaction rejects (PostgreSQL VACUUM / CREATE INDEX
+/// CONCURRENTLY / CREATE DATABASE / ..., SQLite VACUUM / ATTACH / DETACH) or a
+/// dump larger than [dbpilot_core::ops::RESTORE_ATOMIC_MAX_BYTES] fall back to
+/// the grouped path and report the reason in atomic_fallback_reason. MySQL
+/// always uses the grouped path because its DDL implicitly commits — a MySQL
+/// restore can leave the successfully applied prefix behind.
+///
+/// Failure reporting: one entry per executed dump statement, the first 20
+/// errors are returned, and on the grouped path a failed DML batch is rolled
+/// back and replayed so every other statement is still attempted.
 Future<Object?> restoreBackup({required String id}) =>
     RustLib.instance.api.crateApiBackupRestoreBackup(id: id);
 

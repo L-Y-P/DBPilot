@@ -12,6 +12,8 @@ use super::{parse, state};
 use crate::core::dialect::DialectCapability;
 use crate::drivers::CreateTableSpec;
 use crate::error::AppError;
+// 零行命中原因聚合放在 api 之外（见 crate::zero_rows 的模块文档）。
+use crate::zero_rows::ZeroRowReasons;
 
 /// Namespaces visible inside the active database.
 ///
@@ -596,32 +598,6 @@ fn zero_row_results(
             })
         })
         .collect()
-}
-
-/// Aggregated reasons for the zero-row UPDATE / DELETE diagnostics.
-#[derive(Default)]
-struct ZeroRowReasons {
-    not_found: u64,
-    unchanged: u64,
-    unknown: u64,
-}
-
-impl ZeroRowReasons {
-    fn count(&mut self, reason: &str) {
-        match reason {
-            "not_found" => self.not_found += 1,
-            "unchanged" => self.unchanged += 1,
-            _ => self.unknown += 1,
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "not_found": self.not_found,
-            "unchanged": self.unchanged,
-            "unknown": self.unknown,
-        })
-    }
 }
 
 /// Reason for one zero-row change, based on the in-transaction probe.

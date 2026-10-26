@@ -39,6 +39,8 @@ pub mod importer;
 pub mod pools;
 /// Internal SQL-console engine (outside the FRB `api` scan).
 mod query_engine;
+/// 批量改行的零行命中原因聚合（第 70 轮从 api 移出，见模块文档）。
+mod zero_rows;
 pub mod privileges;
 pub mod secure;
 pub mod ssh;

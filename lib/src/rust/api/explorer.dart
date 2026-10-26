@@ -9,8 +9,8 @@ import 'dart:convert';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `has_compound_body`, `parse_row_changes`, `parse_sorts`, `protected_schema`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AlterRequest`, `CreateDatabaseRequest`, `DataQuery`, `ObjectRequest`, `RowChange`
+// These functions are ignored because they are not marked as `pub`: `has_compound_body`, `parse_row_changes`, `parse_sorts`, `probe_sql_for`, `protected_schema`, `zero_row_reason`, `zero_row_results`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AlterRequest`, `CreateDatabaseRequest`, `DataQuery`, `ObjectRequest`, `PlannedChange`, `RowChange`
 
 /// Namespaces visible inside the active database.
 ///
@@ -159,12 +159,27 @@ Future<Object?> changeRow({
 /// Every statement is validated and built **before** the transaction starts, so
 /// a bad item (unknown action, update without keys, ...) cannot leave a
 /// half-applied write behind. The batch then runs through
-/// `ConnectionHandle::execute_transaction` (one sqlx transaction, driver-issued
-/// `BEGIN`/`COMMIT`); the first server error rolls the whole batch back and
-/// the error names the failing item.
+/// `ConnectionHandle::execute_transaction_probing` (one sqlx transaction,
+/// driver-issued `BEGIN`/`COMMIT`); the first server error rolls the whole batch
+/// back and the error names the failing item.
 ///
 /// Returns per-item results plus the total affected rows, so the table page can
-/// show "已保存 N 行" and flag the item that contained a zero-row match.
+/// show "已保存 N 行" and flag the item that matched no row. Matching no row is
+/// **not** a failure: the batch still commits and ok/rows_affected keep their
+/// meaning. [zero_row_results] (added in round 60) lists the UPDATE / DELETE
+/// items whose driver row count was 0; since MySQL counts only rows whose values
+/// changed, that means "the key matched nothing, or the value did not change".
+/// Round 63 resolves that ambiguity with an existence probe
+/// (SELECT 1 ... WHERE keys LIMIT 1), so every item carries
+/// reason = not_found | unchanged | unknown, and zero_row_reasons aggregates the
+/// counts. Round 64 moved that probe **inside the same transaction** (after every
+/// DML, before COMMIT) and batches all of them into a single UNION ALL query
+/// (`execute_transaction_probing`), so a concurrent writer can no longer
+/// change the answer between the write and the probe, and N zero-row UPDATEs no
+/// longer cost N round trips. The probe is diagnostics only — a failed probe
+/// becomes "unknown" and never fails the batch. DELETE zero rows are always
+/// not_found and are never probed.
+///
 Future<Object?> applyRowChanges({
   required String database,
   required String table,

@@ -28,10 +28,9 @@ class MainFlutterWindow: NSWindow {
 ///
 /// Dart 在 macOS 上优先走这里；拿不到 channel（widget 测试、其他平台）时回退
 /// 到 Flutter 自绘的菜单，见 lib/src/app_menu.dart。
-final class NativeMenuBridge: NSObject, NSMenuDelegate {
+final class NativeMenuBridge: NSObject {
   private static var shared: NativeMenuBridge?
 
-  private var result: FlutterResult?
   private var selectedIndex: Int?
   private weak var view: NSView?
 
@@ -59,19 +58,12 @@ final class NativeMenuBridge: NSObject, NSMenuDelegate {
       result(nil)
       return
     }
-    // 一次只允许一个菜单；重入时回 -1（视为取消），避免 result 被覆盖后
-    // 永不回调。注意 nil 有特殊含义：Dart 用它判断"平台没有菜单桥"并回退到
-    // 自绘菜单，所以只有真的弹不出来时才回 nil。
-    if self.result != nil {
-      result(-1)
-      return
-    }
-    self.result = result
+    // 不需要重入保护：popUp 会把平台线程整个占住，菜单没关之前处理不了
+    // 第二个 channel 调用。
     selectedIndex = nil
 
     let menu = NSMenu()
     menu.autoenablesItems = false
-    menu.delegate = self
 
     for (index, raw) in rawItems.enumerated() {
       if raw["separator"] as? Bool == true, menu.items.count > 0 {
@@ -102,21 +94,25 @@ final class NativeMenuBridge: NSObject, NSMenuDelegate {
     let pointInWindow = view.convert(pointInView, to: nil)
     let pointOnScreen = window.convertPoint(toScreen: pointInWindow)
 
+    // 后台窗口里弹出的菜单点了没反应：先把 app 拉到前台再弹。
+    NSApp.activate(ignoringOtherApps: true)
+
+    // popUp 是**阻塞**的：它自己跑事件循环，直到菜单关闭才返回。所以
+    //   * 不能在这里 await 任何东西；
+    //   * 结果必须在它返回**之后**再交给 Flutter —— 在菜单自己的
+    //     tracking 循环里调用 FlutterResult，reply 会被压住/丢弃，表现就是
+    //     "菜单弹得出来，点了没反应"。
     menu.popUp(positioning: nil, at: pointOnScreen, in: nil)
+
+    // 走到这里说明菜单已经关闭，选中项是最终值。
+    // 取消（Esc / 点外面）时 selectedIndex 仍是 nil：必须回 -1 而不是 nil，
+    // 否则 Dart 会当成"平台没有菜单桥"再弹一个自绘菜单。
+    let index = selectedIndex ?? -1
+    selectedIndex = nil
+    result(index)
   }
 
   @objc private func handleSelect(_ sender: NSMenuItem) {
     selectedIndex = sender.tag
-  }
-
-  func menuDidClose(_ menu: NSMenu) {
-    let pending = result
-    let index = selectedIndex
-    result = nil
-    selectedIndex = nil
-    // menuDidClose 是 AppKit 关闭菜单后的回调，此时把结果回给 Dart。
-    // 用户按 Esc 或点空白处取消时 selectedIndex 仍是 nil：必须回 -1 而不是
-    // nil，否则 Dart 会以为"没有菜单桥"，紧接着再弹一个自绘菜单。
-    pending?(index ?? -1)
   }
 }

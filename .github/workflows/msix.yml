@@ -86,10 +86,20 @@ jobs:
 
       - name: Build Rust core (needed by the FFI-backed widget tests)
         # settings_dialog_test 走真实 FRB 桥（AppState.bootstrap 读 coreVersion），
-        # 没有 dylib 会在 setUpAll 直接 fail。msix_shape / update_apply 本身是纯函数，
-        # 但同一次 flutter test 调用会加载整个应用，所以这里必须先编 Rust。
-        working-directory: rust
-        run: cargo build --lib
+        # 没有动态库会在 setUpAll 直接 fail。
+        #
+        # 另有两点注意：
+        #   1) Windows 产物叫 rust_myadmin_core.dll，而测试（约 25 个文件）里写死了
+        #      macOS 的 rust/target/debug/librust_myadmin_core.dylib；改测试文件不现实，
+        #      这里复制一份同内容的 .dylib 兼容别名，让两种命名同时存在。
+        #   2) 必须在 rust/ 下执行 cargo build，否则会找错 crate 根。
+        shell: bash
+        run: |
+          cd rust && cargo build --lib
+          ls -la target/debug/*.dll target/debug/*.so 2>/dev/null || true
+          for f in target/debug/rust_myadmin_core.dll target/debug/librust_myadmin_core.so; do
+            if [ -f "$f" ]; then cp "$f" target/debug/librust_myadmin_core.dylib; echo "aliased $f"; fi
+          done
 
       - name: Flutter test (MSIX shape + update flow)
         # MSIX 形态的判定与「禁用自动更新」分支都在 Dart 侧，出包前先锁死。

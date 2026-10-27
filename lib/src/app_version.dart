@@ -2,10 +2,10 @@
 ///
 /// The desktop bundle has no package_info_plus dependency, so the version is
 /// kept here and must stay in sync with `version:` in desktop/pubspec.yaml
-/// (1.1.4+6). The Rust core crate version is available through the generated
+/// (1.1.3+6). The Rust core crate version is available through the generated
 /// bridge (`rapi.coreVersion()`) but is deliberately not shown in the UI: both
 /// are released together, so the two numbers can never disagree.
-const String kAppVersion = '1.1.4';
+const String kAppVersion = '1.1.3';
 const int kAppBuildNumber = 6;
 
 /// Product name. Mirrors the native bundle name (macOS PRODUCT_NAME, the

@@ -493,8 +493,13 @@ void main() {
     addTearDown(tester.view.resetDevicePixelRatio);
 
     const releasePage = 'https://github.com/L-Y-P/DBPilot/releases/tag/v9.9.9';
-    const packageUrl =
-        'https://github.com/L-Y-P/DBPilot/releases/download/v9.9.9/DBPilot-9.9.9-macos.zip';
+    // 按运行平台选包：autoUpdateAssetUrl 在 Windows 上取 windows_setup，
+    // macOS 取 macos_zip。原先只声明 macos_zip，在 CI 的 Windows runner 上
+    // 该用例必然失败（本地 macOS 跑不出来这个差异）。
+    final packageUrl = Platform.isWindows
+        ? 'https://github.com/L-Y-P/DBPilot/releases/download/v9.9.9/DBPilot-9.9.9-windows-x64-setup.exe'
+        : 'https://github.com/L-Y-P/DBPilot/releases/download/v9.9.9/DBPilot-9.9.9-macos.zip';
+    final packageName = packageUrl.split('/').last;
     settingsUpdateCheck = (String manifestUrl, String currentVersion) async {
       expect(manifestUrl, kUpdateManifestUrl);
       return UpdateCheckResult(
@@ -503,7 +508,10 @@ void main() {
         latestVersion: '9.9.9',
         notes: 'test notes',
         downloadUrl: releasePage,
-        assets: const <String, String>{'macos_zip': packageUrl},
+        assets: <String, String>{
+          if (Platform.isWindows) 'windows_setup': packageUrl,
+          if (!Platform.isWindows) 'macos_zip': packageUrl,
+        },
       );
     };
     String? downloadedUrl;
@@ -542,7 +550,7 @@ void main() {
     // One click on 检查更新 is enough: the package is fetched and installed,
     // then the app asks to quit so it can restart as the new build.
     expect(downloadedUrl, packageUrl);
-    expect(downloadedName, 'DBPilot-9.9.9-macos.zip');
+    expect(downloadedName, packageName);
     expect(appliedVersion, '9.9.9');
     expect(exitCode, 0);
 

@@ -108,11 +108,17 @@ VIAddVersionKey /LANG=2052 "LegalCopyright"  "MIT License"
 ; 也没人调，makensis 会报 warning 6010（install function not referenced）。
 ${Using:StrFunc} UnStrLoc
 ${Using:StrFunc} UnStrCase
+; StrRep 用在 .onInit 里做路径反斜杠归一（安装段，注意不要用 Un 前缀）。
+${Using:StrFunc} StrRep
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 
-; FileFunc.nsh 的 ${GetParameters} 用来在静默卸载时识别 /DELETEUSERDATA。
+; FileFunc.nsh 提供的是**宏**，每个用到的都必须 !insertmacro 展开一次，
+; 否则 makensis 报 "Invalid command: ${GetParameters}"（第 78 轮真机编译踩过）。
+;   GetParameters —— 安装/卸载都要读命令行（/S、/DELETEUSERDATA、/D=）。
+;   GetOptions    —— 取 /D= 后面的目录值，.onInit 与 un.onInit 都用。
 !insertmacro GetParameters
+!insertmacro GetOptions
 
 !define MUI_ABORTWARNING
 ; 未显式传 /DAPP_ICON 时用 runner 里的图标（相对 REPO_ROOT，绝对可靠）。
@@ -239,6 +245,18 @@ Section "Install"
   ; 64 位视图，装完在 HKLM\Software\<App> / Uninstall 下就能直接看到。
   ; 卸载段与 .onInit 也要用同一个视图，否则读/删的是另一棵树。
   SetRegView 64
+
+  ; 先清掉**旧的 32 位视图**记录。
+  ; v1.1.1 及更早的安装包没有 SetRegView，键落在 WOW6432Node 下；升级后如果
+  ; 只写 64 位而留着 32 位那条，「应用和功能」两条记录里会有一条仍显示旧版本，
+  ; 用户看到的就是"升级没成功"（第 79 轮真实案例：64 位显示 1.1.2、32 位显示
+  ; 1.1.1，用户按后者判断）。
+  SetRegView 32
+  DeleteRegKey HKLM "${UNINST_KEY}"
+  DeleteRegKey HKLM "${REG_APP_PATH}"
+  SetRegView 64
+
+  SetOutPath "$INSTDIR"
   WriteRegStr HKLM "${REG_APP_PATH}" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "${UNINST_KEY}" "DisplayName"     "${APP_NAME}"
   WriteRegStr HKLM "${UNINST_KEY}" "DisplayVersion"  "${VERSION}"
@@ -400,9 +418,17 @@ Section "Uninstall"
   ; 删程序目录（RMDir /r 会把 data/ 与 dll 一起删掉）。
   RMDir /r "$INSTDIR"
 
+  ; 两个注册表视图都要删。
+  ; v1.1.1 及更早的版本没有 SetRegView，键落在 WOW6432Node 下；新版写在 64 位视图。
+  ; 只删一边会留下一条"幽灵卸载项"，「应用和功能」里仍显示旧版本（第 79 轮真实
+  ; 案例：64 位 1.1.2 / 32 位 1.1.1 并存，用户按 32 位那条判断成"没更新"）。
   SetRegView 64
   DeleteRegKey HKLM "${UNINST_KEY}"
   DeleteRegKey HKLM "${REG_APP_PATH}"
+  SetRegView 32
+  DeleteRegKey HKLM "${UNINST_KEY}"
+  DeleteRegKey HKLM "${REG_APP_PATH}"
+  SetRegView 64
 
   ; ------------------------------------------------ 按上面答案处理数据 ----
   ; 程序注册表键照旧删（上面已删），用户数据是否删除只由 $un_deleteData 决定。
@@ -455,10 +481,52 @@ Function un.onInit
 FunctionEnd
 
 Function .onInit
-  ; 已经装过就提示升级，直接覆盖安装。
   SetRegView 64
-  ReadRegStr $0 HKLM "${REG_APP_PATH}" "InstallDir"
-  ${If} $0 != ""
-    StrCpy $INSTDIR $0
-  ${EndIf}
+
+  ; ================================================== /D= 的真正语义 ====
+  ; 第 80 轮在真机上**实测**出来的事实（别凭印象改这里）：
+  ;
+  ;   * 进入 .onInit 时，$INSTDIR **已经**是命令行 /D= 给的值；
+  ;   * 但 ${GetParameters} / $CMDLINE 里**看不到** /D=（NSIS 在调到
+  ;     .onInit 之前就把它从命令行里摘掉了）；
+  ;   * .onInit 里对 $INSTDIR 的赋值会**覆盖** /D=，之后不会再被改回来。
+  ;
+  ; 所以三件事必须一起做才对：
+  ;   1) 不能无条件 StrCpy $INSTDIR <注册表值> —— 那会把 /D= 废掉。
+  ;      这正是 v1.1.1 及更早版本的 bug：自动更新传了 /D= 照样被写回
+  ;      Program Files，装到别处的机器升级后出现两套程序。
+  ;   2) 也不能用 ${GetOptions} $CMDLINE "/D=" 来判断 —— 拿不到，
+  ;      永远走"没传 /D"的分支。
+  ;   3) 正确的判断方式是拿 **$INSTDIR 的当前值**和 InstallDir 的默认值比：
+  ;      相同说明用户没指定目录，才回退到注册表里的旧安装位置。
+  ;
+  ; 注意 InstallDir 指令给的是带引号展开后的默认值，这里用同一个表达式
+  ; 重新拼一次与之比较，避免手抄路径抄错。
+  StrCmp $INSTDIR "$PROGRAMFILES64\${APP_NAME}" 0 on_init_done
+
+  ; 没传 /D=（$INSTDIR 还是默认值）：已装过就覆盖装到原位置，
+  ; 这样升级不会装出第二套。
+  ReadRegStr $1 HKLM "${REG_APP_PATH}" "InstallDir"
+  StrCmp $1 "" 0 on_init_use_reg
+  Goto on_init_norm
+  on_init_use_reg:
+  StrCpy $INSTDIR $1
+
+  ; ------------------------------------------------ 路径里的重复反斜杠 ----
+  ; v1.1.1 写进注册表的值是 `C:\Program Files\\DBPilot`（双反斜杠）。
+  ; Win32 路径 API 会把连续反斜杠折叠掉，所以文件照样能装能跑，但注册表和
+  ; 快捷方式里的字面值一直是脏的，读回来再写回去还会**继续累积**。
+  ; 这里读回后立刻折叠一次，把历史脏值纠正掉。
+  ; （含 /D= 的分支也走这里：用户手写的路径同样可能有重复反斜杠。）
+  on_init_norm:
+  ${StrRep} $INSTDIR "$INSTDIR" "\\\\\\\\" "\\\\"
+  ${StrRep} $INSTDIR "$INSTDIR" "\\\\\\" "\\\\"
+  ${StrRep} $INSTDIR "$INSTDIR" "\\\\" "\\"
+  ; 去尾反斜杠（空串不处理）。
+  StrCpy $3 $INSTDIR 1 -1
+  StrCmp $3 "\\" 0 on_init_done
+  StrCmp $INSTDIR "" on_init_done
+  StrCpy $INSTDIR $INSTDIR -1
+
+  on_init_done:
 FunctionEnd

@@ -151,13 +151,102 @@ Future<void> _applyMacos(File package) async {
   await applyProcessStart('open', <String>['-n', bundle.path]);
 }
 
+/// 从正在运行的可执行文件路径反推安装目录（Windows）。
+///
+/// `Platform.resolvedExecutable` 形如 `C:\\Program Files\\DBPilot\\DBPilot.exe`，
+/// 取父目录即可。拿不到（例如在 IDE 里跑调试产物）时返回 null，调用方退回
+/// 不带 `/D=` 的调用，让安装包按注册表里的旧路径升级。
+String? _windowsInstallDir(String executable) {
+  final sep = executable.lastIndexOf('\\');
+  if (sep <= 0) return null;
+  final dir = executable.substring(0, sep);
+  // 盘符根（`C:`）不可能是安装目录，宁可返回 null 让安装包自己决定。
+  if (dir.length <= 2) return null;
+  return dir;
+}
+
+/// Windows 升级脚本的纯逻辑部分（便于单测，不碰真实进程）。
+///
+/// 拆出来是为了能在 `flutter test` 里断言「/D= 位置正确、没有多余引号、
+/// cmd 用 CRLF、占位符被替换」这些细节 —— 每一条都对应一次真机事故。
+class WindowsApplyPlan {
+  const WindowsApplyPlan({
+    required this.stagedPath,
+    required this.cmdBody,
+    required this.cmdScriptPath,
+    required this.psScript,
+  });
+
+  /// 复制出来的安装包副本（原包在 %TEMP% 的更新目录里，可能中途被清理）。
+  final String stagedPath;
+
+  /// .cmd 内容。CRLF 换行：cmd.exe 对只有 LF 的脚本会解析错行。
+  final String cmdBody;
+
+  /// .cmd 落盘路径。
+  final String cmdScriptPath;
+
+  /// 交给 powershell 的提权启动脚本。
+  final String psScript;
+}
+
+/// 组装 Windows 升级所需的全部内容（不执行任何进程）。
+///
+/// [installDir] 为空时只传 `/S`，让安装包按注册表里的旧路径升级。
+WindowsApplyPlan buildWindowsApplyPlan({
+  required String packagePath,
+  required String executable,
+  required String? installDir,
+}) {
+  final cut = packagePath.lastIndexOf(RegExp(r'[/\\]'));
+  final work = cut > 0 ? packagePath.substring(0, cut) : '.';
+  final stagedPath = '$work/DBPilot-setup-staged.exe';
+  final logPath = '$work/update-install.log';
+  final scriptPath = '$work/apply-update.cmd';
+
+  // /D= 必须是最后一项，且**不加引号**：NSIS 取的是原样字符串，引号会进路径。
+  final nsisArgs = (installDir == null || installDir.isEmpty)
+      ? '/S'
+      : '/S /D=$installDir';
+
+  final cmdBody = <String>[
+    '@echo off',
+    '"$stagedPath" $nsisArgs',
+    'echo EXITCODE=%ERRORLEVEL% > "$logPath"',
+    'exit /b %ERRORLEVEL%',
+  ].join('\r\n');
+
+  // 美元符用 fromCharCode 取：它在 Dart 字符串里是插值前缀，写字面量编译不过。
+  final dollar = String.fromCharCode(0x24);
+  final psScript = (
+      'Start-Sleep -Seconds 2; '
+      '@C@p = Start-Process -FilePath ''cmd.exe'' '
+      '-ArgumentList ''/c start "" /wait ""__SCRIPT__""'' '
+      '-Verb RunAs -WindowStyle Hidden -PassThru; '
+      '@C@p.WaitForExit(); '
+      'Start-Process -FilePath ''__EXE__''')
+      .replaceAll('@C@', dollar)
+      .replaceAll('__SCRIPT__', scriptPath)
+      .replaceAll('__EXE__', executable);
+
+  return WindowsApplyPlan(
+    stagedPath: stagedPath,
+    cmdBody: cmdBody,
+    cmdScriptPath: scriptPath,
+    psScript: psScript,
+  );
+}
+
 Future<void> _applyWindows(File package) async {
   final executable = applyResolvedExecutable();
-  String quote(String value) => "'${value.replaceAll("'", "''")}'";
-  final script = 'Start-Sleep -Seconds 2; '
-      'try { \$p = Start-Process -FilePath ${quote(package.path)} '
-      '-ArgumentList "/S" -Verb RunAs -PassThru; \$p.WaitForExit() } '
-      'finally { Start-Process -FilePath ${quote(executable)} }';
+  final plan = buildWindowsApplyPlan(
+    packagePath: package.path,
+    executable: executable,
+    installDir: _windowsInstallDir(executable),
+  );
+  final staged = File(plan.stagedPath);
+  await package.copy(staged.path);
+  await File(plan.cmdScriptPath).writeAsString(plan.cmdBody);
   await applyProcessStart('powershell', <String>[
     '-NoProfile',
     '-WindowStyle',
@@ -165,10 +254,9 @@ Future<void> _applyWindows(File package) async {
     '-ExecutionPolicy',
     'Bypass',
     '-Command',
-    script,
+    plan.psScript,
   ]);
 }
-
 Future<void> _applyLinuxAppImage(File package) async {
   final appImage = (Platform.environment['APPIMAGE'] ?? '').trim();
   if (appImage.isEmpty) {

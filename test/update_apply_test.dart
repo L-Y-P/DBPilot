@@ -137,4 +137,76 @@ void main() {
         isFalse);
     expect(started.single, contains('open -n ${parent.path}/DBPilot.app'));
   });
+
+  group('Windows 升级计划（真机事故的回归锁定）', () {
+    const exe = r'C:\Program Files\DBPilot\DBPilot.exe';
+    const pkg = r'C:\Users\u\AppData\Local\Temp\upd\setup.exe';
+    const dir = r'C:\Program Files\DBPilot';
+
+    test('把应用所在目录作为 /D= 传给安装包', () {
+      final plan = buildWindowsApplyPlan(
+        packagePath: pkg,
+        executable: exe,
+        installDir: dir,
+      );
+      // /D 被 .onInit 覆盖过，导致「装到别处」的机器升级时装出第二套；
+      // 现在显式传，并且必须是不带引号的最后一项。
+      expect(plan.cmdBody, contains('/S /D=$dir'));
+      expect(plan.cmdBody, isNot(contains('"/D=')));
+    });
+
+    test('没有安装目录时只传 /S', () {
+      final plan = buildWindowsApplyPlan(
+        packagePath: pkg,
+        executable: exe,
+        installDir: null,
+      );
+      expect(plan.cmdBody, contains('/S'));
+      expect(plan.cmdBody, isNot(contains('/D=')));
+    });
+
+    test('cmd 脚本用 CRLF 换行', () {
+      final plan = buildWindowsApplyPlan(
+        packagePath: pkg,
+        executable: exe,
+        installDir: dir,
+      );
+      // 只有 LF 的 .cmd 会被 cmd.exe 解析错行，安装根本不执行。
+      // 用 codeUnits 断言，避免测试里的转义写法与源码各写各的。
+      final units = plan.cmdBody.codeUnits;
+      final cr = 0x0D;
+      final lf = 0x0A;
+      expect(units.contains(lf), isTrue);
+      for (var i = 0; i < units.length; i++) {
+        if (units[i] == lf) expect(units[i - 1], cr);
+      }
+    });
+
+    test('安装包先复制再执行（原件可能在更新目录里被清理）', () {
+      final plan = buildWindowsApplyPlan(
+        packagePath: pkg,
+        executable: exe,
+        installDir: dir,
+      );
+      expect(plan.stagedPath, endsWith('DBPilot-setup-staged.exe'));
+      expect(plan.cmdBody, contains(plan.stagedPath));
+      expect(plan.cmdBody, isNot(contains(pkg)));
+    });
+
+    test('用 start /wait 等待安装结束后再重启应用', () {
+      final plan = buildWindowsApplyPlan(
+        packagePath: pkg,
+        executable: exe,
+        installDir: dir,
+      );
+      // 早先用 Start-Process -Verb RunAs 后 WaitForExit 会提前返回，
+      // 旧版应用在安装写盘中途就被拉起 —— 用户看到「重启了但版本没变」。
+      expect(plan.psScript, contains('start "" /wait'));
+      expect(plan.psScript, contains('WaitForExit()'));
+      expect(plan.psScript, contains(exe));
+      expect(plan.psScript, isNot(contains('__SCRIPT__')));
+      expect(plan.psScript, isNot(contains('__EXE__')));
+      expect(plan.psScript, isNot(contains('@C@')));
+    });
+  });
 }

@@ -232,8 +232,11 @@ MySQL 的 DDL 会隐式提交，仍按语句分组提交，界面上会说明无
 包含 `connections.json`（含密码，明文 0600）、`settings.json`、`query_history.json`、`backups/`。
 没有接系统钥匙串，介意的话请用只有该库权限的专用账号。
 
-**检查更新**：设置 → 关于 → 检查更新，读取仓库根 `update.json`（地址编译在
-`lib/src/update_source.dart`，界面不提供输入框）；发版流程见 [docs/RELEASE.md](docs/RELEASE.md)。
+**检查更新 / 自动更新**：设置 → 关于 → 检查更新，读取仓库根 `update.json`（地址编译在
+`lib/src/update_source.dart`，界面不提供输入框）。发现新版本后会按清单里的 `assets`
+自动下载对应平台的安装包、安装并重启（macOS 原地替换 .app；Windows 静默安装并触发 UAC；
+Linux 仅 AppImage 支持原地更新），进度与失败原因都在设置面板里，失败可重试或用下载地址手动更新。
+发版流程见 [docs/RELEASE.md](docs/RELEASE.md)。
 
 逐页操作见 [docs/USAGE.md](docs/USAGE.md)。
 

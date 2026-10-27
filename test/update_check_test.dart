@@ -135,6 +135,30 @@ void main() {
       expect(result.latestVersion, '1.1.0');
       expect(result.downloadUrl, 'https://example.com/download');
       expect(result.notes, 'Fixes and improvements');
+      expect(result.assets, isEmpty);
+    });
+
+    test('per-platform asset URLs are parsed from the manifest', () async {
+      final server = await LocalServer.start((request) => _json(request, {
+            'version': '1.1.0',
+            'assets': {
+              'macos_zip': ' https://example.com/DBPilot-1.1.0-macos.zip ',
+              'windows_setup': 'https://example.com/DBPilot-1.1.0-setup.exe',
+              'ignored_non_string': 42,
+              'ignored_empty': '',
+            },
+          }));
+      addTearDown(server.close);
+
+      final result = await checkForUpdates(
+          manifestUrl: server.baseUrl, currentVersion: '1.0.0');
+      expect(result.hasUpdate, isTrue);
+      expect(result.assets['macos_zip'],
+          'https://example.com/DBPilot-1.1.0-macos.zip');
+      expect(result.assets['windows_setup'],
+          'https://example.com/DBPilot-1.1.0-setup.exe');
+      expect(result.assets.containsKey('ignored_non_string'), isFalse);
+      expect(result.assets.containsKey('ignored_empty'), isFalse);
     });
 
     test('the same version reports no update', () async {
@@ -170,6 +194,7 @@ void main() {
       expect(result.hasUpdate, isTrue);
       expect(result.notes, isEmpty);
       expect(result.downloadUrl, isEmpty);
+      expect(result.assets, isEmpty);
     });
 
     test('a non-200 response is a readable error', () async {

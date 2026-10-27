@@ -53,8 +53,14 @@ const Map<String, String> enSettings = <String, String>{
   '检查更新': 'Check for updates',
   '已是最新版本': 'You are up to date',
   '项目地址': 'Project URL',
-  '仅检查仓库是否有新版本，不会自动下载或安装。':
-      'Checks the repository for a newer release only; nothing is downloaded or installed automatically.',
+  '发现新版本后自动下载并安装（Windows 会请求管理员权限），完成后应用将重启。':
+      'A newer release is downloaded and installed automatically (Windows asks for administrator rights); the app restarts when it finishes.',
+  '重试自动更新': 'Retry update',
+  '已取消更新': 'Update cancelled',
+  '更新下载地址无效': 'The update download URL is not valid',
+  '更新包文件名无效': 'The update package file name is not valid',
+  '下载超时，请稍后重试':
+      'The download timed out; please try again later',
   '无法打开浏览器，请手动复制链接。':
       'Could not open the browser; please copy the link manually.',
   '发现新版本：': 'Update available:',
@@ -91,4 +97,10 @@ final List<Rewrite> rewritesSettings = <Rewrite>[
       (m) => 'Backups apply to the current database ${m[1]}.'),
   Rewrite(RegExp(r'^更新检查失败：(.+)$', dotAll: true),
       (m) => 'Update check failed: ${m[1]}'),
+  Rewrite(RegExp(r'^下载失败：(.+)$', dotAll: true),
+      (m) => 'Download failed: ${m[1]}'),
+  Rewrite(RegExp(r'^下载不完整：收到 (\d+) 字节，应为 (\d+) 字节$'),
+      (m) => 'Incomplete download: received ${m[1]} of ${m[2]} bytes'),
+  Rewrite(RegExp(r'^更新失败：(.+)$', dotAll: true),
+      (m) => 'Update failed: ${m[1]}'),
 ];

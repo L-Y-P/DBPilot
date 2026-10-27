@@ -86,7 +86,7 @@ git push origin v1.1.0
    `notes` 会被压成单行（连续空白折叠、超过 500 字符截断到 497 + `...`），因为设置弹窗里是单行展示。
    `update.json` 无变化时（同版本重跑）跳过提交，不会产生空 commit。
 
-客户端下一次「检查更新」时：`compareVersions("1.1.0", "1.0.0") > 0` → 显示新版本 + notes + 下载按钮。
+客户端下一次「检查更新」时：`compareVersions("1.1.0", "1.0.0") > 0` → 显示新版本 + notes，并自动下载安装包、安装后重启（旧版客户端只显示下载链接）。
 
 ### 2.4 发版后确认
 
@@ -291,8 +291,9 @@ Compress-Archive -Path "build/windows/x64/runner/Release/*" `
 | 字段 | 必填 | 用途 |
 | --- | --- | --- |
 | `version` | 是 | 与 `kAppVersion` 做数值比较（容忍 `v` 前缀、`+build`、`-rc1`） |
-| `url` | 否 | 「下载」按钮跳转地址 |
+| `url` | 否 | Release 页面地址（手动下载兜底） |
 | `notes` | 否 | 结果面板里的一行说明 |
+| `assets` | 否 | 各平台安装包地址，供应用内自动更新：`macos_zip` / `macos_dmg` / `windows_setup` / `windows_portable` / `linux_appimage` / `linux_deb` / `linux_rpm`；release.yml 自动写入。客户端缺失时回退 `releases/download/v<版本>/DBPilot-<版本>-<平台包>` 命名约定 |
 
 缺 `version` 会被判为「更新清单缺少 version 字段」；字段多余不影响解析。
 更新源固定为 `lib/src/update_source.dart` 里的 `kUpdateManifestUrl`，用户不可改。

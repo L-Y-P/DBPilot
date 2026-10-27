@@ -405,17 +405,31 @@ jobs:
           if [ -z "$BODY" ]; then
             BODY="DBPilot $TAG"
           fi
-          # 客户端（lib/src/update_check.dart）只认 version / url / notes 三个字段；
+          # 客户端（lib/src/update_check.dart）认 version / url / notes；
+          # assets 是各平台下载地址（应用内自动下载更新用），客户端读不到时会
+          # 退回 GitHub Release 的命名约定。
           # notes 在设置弹窗里是单行展示，这里把多行压成一行并限制长度。
-          VERSION="$VERSION" URL="$URL" BODY="$BODY" python3 - <<'PY'
+          VERSION="$VERSION" URL="$URL" BODY="$BODY" REPO="$REPO" TAG="$TAG" python3 - <<'PY'
           import json, os, re
           body = re.sub(r"\s+", " ", os.environ["BODY"]).strip()
           if len(body) > 500:
               body = body[:497] + "..."
+          version = os.environ["VERSION"]
+          base = f"https://github.com/{os.environ['REPO']}/releases/download/{os.environ['TAG']}"
+          assets = {
+              "macos_zip": f"{base}/DBPilot-{version}-macos.zip",
+              "macos_dmg": f"{base}/DBPilot-{version}-macos.dmg",
+              "windows_setup": f"{base}/DBPilot-{version}-windows-x64-setup.exe",
+              "windows_portable": f"{base}/DBPilot-{version}-windows-x64-portable.zip",
+              "linux_appimage": f"{base}/DBPilot-{version}-linux-x64.AppImage",
+              "linux_deb": f"{base}/dbpilot_{version}_amd64.deb",
+              "linux_rpm": f"{base}/dbpilot-{version}-1.x86_64.rpm",
+          }
           manifest = {
-              "version": os.environ["VERSION"],
+              "version": version,
               "url": os.environ["URL"],
               "notes": body,
+              "assets": assets,
           }
           with open("update.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f, ensure_ascii=False, indent=2)

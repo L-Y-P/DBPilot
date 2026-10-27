@@ -15,6 +15,7 @@ class UpdateCheckResult {
     required this.latestVersion,
     required this.notes,
     required this.downloadUrl,
+    this.assets = const <String, String>{},
     this.error,
   });
 
@@ -32,6 +33,13 @@ class UpdateCheckResult {
 
   /// Optional download / release page URL from the manifest.
   final String downloadUrl;
+
+  /// Optional per-platform asset URLs from the manifest, keyed by
+  /// `macos_zip`, `windows_setup`, `linux_appimage`, ...
+  ///
+  /// Empty when the manifest does not advertise assets; callers then fall
+  /// back to the GitHub release naming convention.
+  final Map<String, String> assets;
 
   /// Human-readable failure reason, or null on success.
   final String? error;
@@ -57,6 +65,19 @@ int compareVersions(String a, String b) {
   return 0;
 }
 
+/// Reads an optional JSON object of string values (manifest asset URLs).
+Map<String, String> _stringMap(Object? raw) {
+  if (raw is! Map) return const <String, String>{};
+  final out = <String, String>{};
+  raw.forEach((Object? key, Object? value) {
+    if (key is String && value is String) {
+      final text = value.trim();
+      if (text.isNotEmpty) out[key] = text;
+    }
+  });
+  return out;
+}
+
 /// Numeric segments of a version string; a missing/odd segment counts as 0.
 List<int> _versionSegments(String raw) {
   var text = raw.trim();
@@ -80,7 +101,8 @@ List<int> _versionSegments(String raw) {
 ///
 /// The manifest is a small JSON object:
 ///
-/// {"version": "1.1.0", "url": "https://example.com/download", "notes": "..."}
+/// {"version": "1.1.0", "url": "https://example.com/download", "notes": "...",
+///  "assets": {"macos_zip": "https://example.com/DBPilot-1.1.0-macos.zip"}}
 ///
 /// Every field except "version" may be omitted. dart:io is the only
 /// dependency (no package), and [client] can be injected so tests drive the
@@ -97,6 +119,7 @@ Future<UpdateCheckResult> checkForUpdates({
         latestVersion: '',
         notes: '',
         downloadUrl: '',
+        assets: const <String, String>{},
         error: message,
       );
 
@@ -145,6 +168,7 @@ Future<UpdateCheckResult> checkForUpdates({
       latestVersion: latest,
       notes: (decoded['notes'] ?? '').toString(),
       downloadUrl: (decoded['url'] ?? '').toString(),
+      assets: _stringMap(decoded['assets']),
     );
   } on TimeoutException {
     return failed('检查更新超时，请稍后重试');

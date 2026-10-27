@@ -16,7 +16,9 @@ import 'package:rust_myadmin_desktop/src/rust/frb_generated.dart';
 import 'package:rust_myadmin_desktop/src/sqlite_sources.dart';
 import 'package:rust_myadmin_desktop/src/text.dart';
 import 'package:rust_myadmin_desktop/src/theme.dart';
+import 'package:rust_myadmin_desktop/src/update_apply.dart';
 import 'package:rust_myadmin_desktop/src/update_check.dart';
+import 'package:rust_myadmin_desktop/src/update_download.dart';
 import 'package:rust_myadmin_desktop/src/update_source.dart';
 import 'package:rust_myadmin_desktop/src/views/settings_dialog.dart';
 
@@ -84,12 +86,18 @@ void main() {
     AppState.instance.applyAppearance();
     settingsDirPicker = pickFolder;
     settingsUpdateCheck = checkUpdatesForSettings;
+    settingsDownloadUpdate = downloadUpdatePackage;
+    settingsApplyUpdate = applyUpdateAndRestart;
+    settingsExitApp = exit;
     openExternalUrl = openUrlInBrowser;
   });
 
   tearDown(() {
     settingsDirPicker = pickFolder;
     settingsUpdateCheck = checkUpdatesForSettings;
+    settingsDownloadUpdate = downloadUpdatePackage;
+    settingsApplyUpdate = applyUpdateAndRestart;
+    settingsExitApp = exit;
     openExternalUrl = openUrlInBrowser;
     I18n.setLang(AppLang.zh);
     AppColors.applyAppearance(mode: 'system', presetId: 'default');
@@ -453,14 +461,16 @@ void main() {
     expect(find.byKey(const ValueKey('settings-link-error')), findsOneWidget);
   });
 
-  testWidgets('an available update only offers a browser download link',
+  testWidgets('an available update is downloaded and applied automatically',
       (tester) async {
     tester.view.physicalSize = const Size(1200, 900);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    const downloadUrl = 'https://github.com/L-Y-P/DBPilot/releases/tag/v9.9.9';
+    const releasePage = 'https://github.com/L-Y-P/DBPilot/releases/tag/v9.9.9';
+    const packageUrl =
+        'https://github.com/L-Y-P/DBPilot/releases/download/v9.9.9/DBPilot-9.9.9-macos.zip';
     settingsUpdateCheck = (String manifestUrl, String currentVersion) async {
       expect(manifestUrl, kUpdateManifestUrl);
       return UpdateCheckResult(
@@ -468,13 +478,130 @@ void main() {
         currentVersion: currentVersion,
         latestVersion: '9.9.9',
         notes: 'test notes',
-        downloadUrl: downloadUrl,
+        downloadUrl: releasePage,
+        assets: const <String, String>{'macos_zip': packageUrl},
       );
     };
-    String? opened;
-    openExternalUrl = (String url) async {
-      opened = url;
-      return true;
+    String? downloadedUrl;
+    String? downloadedName;
+    settingsDownloadUpdate = ({
+      required String url,
+      required Directory directory,
+      required String fileName,
+      required void Function(UpdateDownloadProgress progress) onProgress,
+      required bool Function() isCancelled,
+    }) async {
+      downloadedUrl = url;
+      downloadedName = fileName;
+      onProgress(const UpdateDownloadProgress(received: 0, total: 2048));
+      onProgress(
+          const UpdateDownloadProgress(received: 2048, total: 2048, done: true));
+      final file = File('${directory.path}/$fileName');
+      await file.create(recursive: true);
+      return file;
+    };
+    String? appliedVersion;
+    settingsApplyUpdate = (File package, String version) async {
+      expect(package.existsSync(), isTrue);
+      appliedVersion = version;
+    };
+    int? exitCode;
+    settingsExitApp = (int code) => exitCode = code;
+
+    await _openDialog(tester);
+    final button = find.byKey(const ValueKey('settings-check-update'));
+    await tester.ensureVisible(button);
+    await tester.pumpAndSettle();
+    await tester.tap(button);
+    await _settle(tester);
+
+    // One click on 检查更新 is enough: the package is fetched and installed,
+    // then the app asks to quit so it can restart as the new build.
+    expect(downloadedUrl, packageUrl);
+    expect(downloadedName, 'DBPilot-9.9.9-macos.zip');
+    expect(appliedVersion, '9.9.9');
+    expect(exitCode, 0);
+
+    expect(find.byKey(const ValueKey('settings-update-result')), findsOneWidget);
+    expect(find.text('发现新版本：'), findsOneWidget);
+    expect(find.text('9.9.9'), findsOneWidget);
+    // Manual fallback stays visible while/if the automatic flow fails.
+    final link = find.byKey(const ValueKey('settings-download-url'));
+    expect(tester.widget<Text>(link).data, releasePage);
+
+    final hint = find.byKey(const ValueKey('settings-update-check-hint'));
+    expect(tester.widget<Text>(hint).data, contains('自动下载'));
+  });
+
+  testWidgets('a failed automatic update shows an error and a retry button',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    settingsUpdateCheck = (String manifestUrl, String currentVersion) async =>
+        UpdateCheckResult(
+          hasUpdate: true,
+          currentVersion: currentVersion,
+          latestVersion: '9.9.9',
+          notes: '',
+          downloadUrl: 'https://github.com/L-Y-P/DBPilot/releases/tag/v9.9.9',
+          assets: const <String, String>{
+            'macos_zip': 'https://example.com/DBPilot-9.9.9-macos.zip',
+          },
+        );
+    settingsDownloadUpdate = ({
+      required String url,
+      required Directory directory,
+      required String fileName,
+      required void Function(UpdateDownloadProgress progress) onProgress,
+      required bool Function() isCancelled,
+    }) async {
+      throw const UpdateDownloadException('下载失败：HTTP 500');
+    };
+    var applied = false;
+    settingsApplyUpdate = (File package, String version) async => applied = true;
+
+    await _openDialog(tester);
+    final button = find.byKey(const ValueKey('settings-check-update'));
+    await tester.ensureVisible(button);
+    await tester.pumpAndSettle();
+    await tester.tap(button);
+    await _settle(tester);
+
+    expect(applied, isFalse);
+    expect(find.byKey(const ValueKey('settings-update-error')), findsOneWidget);
+    expect(find.byKey(const ValueKey('settings-retry-update')), findsOneWidget);
+    expect(find.textContaining('HTTP 500'), findsOneWidget);
+  });
+
+  testWidgets('cancelling the automatic download reports the cancelled state',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    settingsUpdateCheck = (String manifestUrl, String currentVersion) async =>
+        UpdateCheckResult(
+          hasUpdate: true,
+          currentVersion: currentVersion,
+          latestVersion: '9.9.9',
+          notes: '',
+          downloadUrl: 'https://github.com/L-Y-P/DBPilot/releases/tag/v9.9.9',
+          assets: const <String, String>{
+            'macos_zip': 'https://example.com/DBPilot-9.9.9-macos.zip',
+          },
+        );
+    settingsDownloadUpdate = ({
+      required String url,
+      required Directory directory,
+      required String fileName,
+      required void Function(UpdateDownloadProgress progress) onProgress,
+      required bool Function() isCancelled,
+    }) async {
+      throw const UpdateCancelledException();
     };
 
     await _openDialog(tester);
@@ -484,22 +611,7 @@ void main() {
     await tester.tap(button);
     await _settle(tester);
 
-    // Only an informational panel appears: a version, notes and a link. There
-    // is no download/install button and the check itself never fetches a
-    // package.
-    expect(find.byKey(const ValueKey('settings-update-result')), findsOneWidget);
-    expect(find.text('发现新版本：'), findsOneWidget);
-    expect(find.text('9.9.9'), findsOneWidget);
-
-    final hint = find.byKey(const ValueKey('settings-update-check-hint'));
-    expect(tester.widget<Text>(hint).data, contains('不会自动下载'));
-
-    final link = find.byKey(const ValueKey('settings-download-url'));
-    expect(tester.widget<Text>(link).data, downloadUrl);
-    await tester.ensureVisible(link);
-    await tester.pumpAndSettle();
-    await tester.tap(link);
-    await _settle(tester);
-    expect(opened, downloadUrl);
+    expect(find.byKey(const ValueKey('settings-update-error')), findsOneWidget);
+    expect(find.text('已取消更新'), findsOneWidget);
   });
 }

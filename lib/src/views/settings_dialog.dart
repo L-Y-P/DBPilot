@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart' hide Text, Tooltip;
 
 import '../app_state.dart';
@@ -9,7 +11,9 @@ import '../sqlite_sources.dart';
 import '../text.dart';
 import '../theme.dart';
 import '../tooltip.dart';
+import '../update_apply.dart';
 import '../update_check.dart';
+import '../update_download.dart';
 import '../update_source.dart';
 import '../widgets.dart';
 
@@ -28,6 +32,22 @@ Future<UpdateCheckResult> checkUpdatesForSettings(
 /// Test seam for the update check. Production never reassigns it.
 Future<UpdateCheckResult> Function(String manifestUrl, String currentVersion)
     settingsUpdateCheck = checkUpdatesForSettings;
+
+/// Test seam for downloading an update package.
+Future<File> Function({
+  required String url,
+  required Directory directory,
+  required String fileName,
+  required void Function(UpdateDownloadProgress progress) onProgress,
+  required bool Function() isCancelled,
+}) settingsDownloadUpdate = downloadUpdatePackage;
+
+/// Test seam for installing a downloaded update package.
+Future<void> Function(File package, String version) settingsApplyUpdate =
+    applyUpdateAndRestart;
+
+/// Test seam for quitting the app once an update has been applied.
+void Function(int code) settingsExitApp = exit;
 
 /// The settings dialog: language, appearance, backups and the update check.
 ///
@@ -58,6 +78,13 @@ class _SettingsBodyState extends State<_SettingsBody> {
   bool _checking = false;
   UpdateCheckResult? _result;
   bool _linkOpenFailed = false;
+
+  /// Non-null while the automatic download/install is running.
+  _UpdatePhase? _phase;
+  int _received = 0;
+  int? _total;
+  String? _updateError;
+  bool _cancelRequested = false;
 
   Future<void> _setLanguage(AppLang lang) async {
     await AppState.instance.setLanguage(lang);
@@ -120,7 +147,67 @@ class _SettingsBodyState extends State<_SettingsBody> {
     setState(() {
       _checking = false;
       _result = result;
+      _updateError = null;
     });
+    // Requirement: unlike a plain "is there a newer version?" check, this
+    // flow downloads and installs the update automatically, then restarts.
+    if (result.hasUpdate) {
+      await _autoUpdate(result);
+    }
+  }
+
+  /// Downloads the package for [result] and applies it, restarting the app.
+  ///
+  /// Automatically started right after a check reports a newer version, so
+  /// the only user action is pressing 检查更新. Failures stay in the dialog
+  /// with a retry button and the manual browser link as a fallback.
+  Future<void> _autoUpdate(UpdateCheckResult result) async {
+    if (_phase != null) return;
+    final url = autoUpdateAssetUrl(result);
+    if (url == null) return; // panel shows the manual fallback
+    _cancelRequested = false;
+    setState(() {
+      _phase = _UpdatePhase.downloading;
+      _received = 0;
+      _total = null;
+      _updateError = null;
+    });
+    final directory = Directory(
+        '${Directory.systemTemp.path}/dbpilot-update-${DateTime.now().millisecondsSinceEpoch}');
+    try {
+      final package = await settingsDownloadUpdate(
+        url: url,
+        directory: directory,
+        fileName: updateFileNameFromUrl(url),
+        onProgress: (UpdateDownloadProgress progress) {
+          if (!mounted) return;
+          setState(() {
+            _received = progress.received;
+            _total = progress.total;
+          });
+        },
+        isCancelled: () => _cancelRequested,
+      );
+      if (!mounted) return;
+      setState(() => _phase = _UpdatePhase.installing);
+      await settingsApplyUpdate(package, result.latestVersion);
+      if (mounted) settingsExitApp(0);
+    } on UpdateCancelledException {
+      if (!mounted) return;
+      setState(() {
+        _phase = null;
+        _updateError = '已取消更新';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _phase = null;
+        _updateError = e is UpdateDownloadException ||
+                e is UpdateApplyException
+            ? e.toString()
+            : '更新失败：$e';
+      });
+    }
   }
 
   Future<void> _openUrl(String url) async {
@@ -341,7 +428,7 @@ class _SettingsBodyState extends State<_SettingsBody> {
               ),
               const SizedBox(height: 6),
               Text(
-                '仅检查仓库是否有新版本，不会自动下载或安装。',
+                '发现新版本后自动下载并安装（Windows 会请求管理员权限），完成后应用将重启。',
                 key: const ValueKey('settings-update-check-hint'),
                 style: TextStyle(fontSize: 12, color: AppColors.muted),
               ),
@@ -366,7 +453,7 @@ class _SettingsBodyState extends State<_SettingsBody> {
         '检查更新',
         key: const ValueKey('settings-check-update'),
         busy: _checking,
-        onPressed: _checking ? null : _checkUpdate,
+        onPressed: (_checking || _phase != null) ? null : _checkUpdate,
       );
 
   /// A muted caption followed by its control, mirroring [FormRow]'s rhythm.
@@ -451,11 +538,100 @@ class _SettingsBodyState extends State<_SettingsBody> {
             _externalLink(result.downloadUrl,
                 key: const ValueKey('settings-download-url')),
           ],
+          if (_phase != null) ...<Widget>[
+            const SizedBox(height: 8),
+            _updateProgressPanel(),
+          ] else if (_updateError != null) ...<Widget>[
+            const SizedBox(height: 8),
+            AlertBox(
+              _updateError!,
+              key: const ValueKey('settings-update-error'),
+              tone: AlertTone.error,
+              liveRegion: true,
+            ),
+            if (autoUpdateAssetUrl(result) != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Btn(
+                  '重试自动更新',
+                  key: const ValueKey('settings-retry-update'),
+                  onPressed: () => _autoUpdate(result),
+                ),
+              ),
+          ] else if (autoUpdateAssetUrl(result) == null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                pickText(
+                  '当前安装方式不支持应用内自动更新，请用上面的下载链接手动更新。',
+                  'This installation cannot be updated in place; use the download link above to update manually.',
+                ),
+                key: const ValueKey('settings-update-unsupported'),
+                noTranslate: true,
+                style: TextStyle(fontSize: 12, color: AppColors.infoText),
+              ),
+            ),
         ],
       ),
     );
   }
+
+  /// Progress + cancel UI for the automatic download/install flow.
+  Widget _updateProgressPanel() {
+    final total = _total;
+    final downloading = _phase == _UpdatePhase.downloading;
+    final fraction = (downloading && total != null && total > 0)
+        ? (_received / total).clamp(0.0, 1.0).toDouble()
+        : null;
+    final receivedMb = (_received / (1024 * 1024)).toStringAsFixed(1);
+    final totalMb =
+        total == null ? null : (total / (1024 * 1024)).toStringAsFixed(1);
+    final label = !downloading
+        ? pickText('正在安装更新，应用即将重启…',
+            'Installing the update; the app will restart…')
+        : _cancelRequested
+            ? pickText('正在取消下载…', 'Cancelling the download…')
+            : pickText('正在下载更新…', 'Downloading the update…');
+    final sizeText = totalMb == null
+        ? pickText('已下载 $receivedMb MB', 'Downloaded $receivedMb MB')
+        : pickText('已下载 $receivedMb / $totalMb MB',
+            'Downloaded $receivedMb / $totalMb MB');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          label,
+          key: const ValueKey('settings-update-phase'),
+          noTranslate: true,
+          style: TextStyle(fontSize: 12, color: AppColors.infoText),
+        ),
+        const SizedBox(height: 6),
+        LinearProgressIndicator(value: fraction, minHeight: 6),
+        if (downloading) ...<Widget>[
+          const SizedBox(height: 4),
+          Text(
+            sizeText,
+            key: const ValueKey('settings-update-progress'),
+            noTranslate: true,
+            style: TextStyle(fontSize: 12, color: AppColors.infoText),
+          ),
+          if (!_cancelRequested)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Btn(
+                '取消',
+                key: const ValueKey('settings-cancel-update'),
+                onPressed: () => setState(() => _cancelRequested = true),
+              ),
+            ),
+        ],
+      ],
+    );
+  }
 }
+
+/// Where the automatic update flow currently is.
+enum _UpdatePhase { downloading, installing }
 
 /// One titled block of the settings dialog.
 class _Section extends StatelessWidget {

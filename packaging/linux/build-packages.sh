@@ -10,6 +10,11 @@
 #        dist/dbpilot_<version>_amd64.deb
 #        dist/dbpilot-<version>-1.x86_64.rpm
 #
+#  可选签名：设置 GPG_PRIVATE_KEY（base64 的 armored 私钥）后，本脚本在打包结束时
+#  自动调用 packaging/linux/sign-artifacts.sh 生成 <产物>.asc / SHA256SUMS(.asc) /
+#  DBPILOT-GPG-KEY.asc。**未设置时不签名、也不失败**，保持原有发版流程可用。
+#  详细说明见 packaging/linux/VERIFYING.md。
+#
 #  依赖（Ubuntu 24.04）：
 #    apt-get install -y file libfuse2 rpm zstd desktop-file-utils
 #    AppImage 需要 appimagetool（https://github.com/AppImage/AppImageKit/releases）
@@ -22,7 +27,7 @@ OUT="dist"
 APP=DBPilot
 PKG_ID=dbpilot
 
-[ -d "$BUNDLE" ] || { echo "找不到 $BUNDLE，先跑 flutter build linux --release" >&2; exit 1; }
+[ -d "$BUNDLE" ] || { echo "找不到 ${BUNDLE}，先跑 flutter build linux --release" >&2; exit 1; }
 [ -x "$BUNDLE/$APP" ] || { echo "$BUNDLE/$APP 不存在" >&2; exit 1; }
 mkdir -p "$OUT"
 
@@ -142,6 +147,19 @@ EOF
   echo "  完成：$(ls "$OUT"/*.rpm | head -1)"
 else
   echo "  跳过 rpm：未找到 rpmbuild（apt-get install -y rpm）" >&2
+fi
+
+# ------------------------------------------------------------------ 签名（可选）
+# GPG_PRIVATE_KEY 为空时直接跳过，**不影响退出码**，产物照常可用。
+# 真正不签名的逻辑在 sign-artifacts.sh 里，这里只负责转发环境变量。
+echo "== GPG 签名 =="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/sign-artifacts.sh" ]; then
+  # 注意：不能把 sign-artifacts.sh 的非 0 当成整体失败 —— 它在缺密钥时本来就返回 0，
+  # 只有真正的签名错误（密钥损坏等）才返回非 0，这种才应该让 CI 失败。
+  bash "$SCRIPT_DIR/sign-artifacts.sh" "$OUT"
+else
+  echo "  跳过：未找到 $SCRIPT_DIR/sign-artifacts.sh" >&2
 fi
 
 echo

@@ -87,6 +87,15 @@ const Map<String, String> enSettings = <String, String>{
   '发现新版本：': 'Update available:',
   '更新说明': 'Release notes',
   '下载地址': 'Download',
+  // ---- Microsoft Store (MSIX) builds -------------------------------------
+  // A Store build cannot update itself (Windows forbids a packaged app from
+  // running the NSIS installer, and the Store re-signs every release), so the
+  // about section swaps the GitHub wording for the Store one. The sentence is
+  // shared with update_apply.dart's UpdateApplyException (kMsixUpdateGuidance).
+  '当前为 Microsoft Store 版本，应用内自动更新已停用，请从 Microsoft Store 更新。':
+      'This is the Microsoft Store version: in-app updates are disabled. '
+          'Please update from the Microsoft Store.',
+  '更新方式：Microsoft Store': 'Updates: Microsoft Store',
   // ---- update check failures ---------------------------------------------
   '未配置更新源': 'No update source configured',
   '更新检查失败：更新地址无效':

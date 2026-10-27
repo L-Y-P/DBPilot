@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DBPilot - AppxManifest TEMPLATE (not directly packable: placeholders below are
+  replaced by make-msix.ps1 before makeappx runs).
+
+    __IDENTITY_NAME__         Partner Center Package/Identity/Name, e.g. 1234ABCD.DBPilot
+    __PUBLISHER_ID__          Partner Center Package/Identity/Publisher, e.g. CN=1A2B...
+    __DISPLAY_NAME__          Package display name
+    __PUBLISHER_DISPLAY_NAME__ Publisher display name
+    __VERSION__               Four-segment MSIX version (1.1.3 -> 1.1.3.0)
+    __ARCH__                  x64 (x86 / arm64 are reserved, see make-msix.ps1 -Arch)
+    __EXE_NAME__              Entry executable, DBPilot.exe
+
+  The Store RE-SIGNS every submission, so this package only has to be valid on
+  its own; no signing step is required to upload it.
+
+  Design constraints:
+   * EntryPoint="Windows.FullTrustApplication" - mandatory for a desktop exe;
+     anything else makes the package fail to launch;
+   * Capability runFullTrust - mandatory for a full-trust desktop app. It already
+     allows arbitrary outbound network access (database servers), child
+     processes and the user filesystem, so no UWP-style capability is added;
+   * TargetDeviceFamily Windows.Desktop, MinVersion 10.0.19041.0 (Windows 10
+     2004) - the floor for the Flutter Windows runner;
+   * no Restricted capabilities (Partner Center asks extra questions for those
+     and nothing here needs one).
+
+  KEEP THIS FILE PURE ASCII: make-msix.ps1 reads it with Get-Content -Raw, which
+  on Windows PowerShell 5.1 decodes BOM-less files with the ANSI code page. A
+  non-ASCII character would be mojibake and makeappx would reject the manifest
+  with 0x80080204 / C00CEE3B (invalid XML). Display strings that must be
+  localised belong in Package.appxresources PRI files, not inline.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 rescap">
+
+  <!--
+    Publisher must match the signing certificate subject character for
+    character. The Store matches it against the Publisher registered in Partner
+    Center (CN=<your PublisherId>); a mismatch is rejected on upload.
+  -->
+  <Identity
+    Name="__IDENTITY_NAME__"
+    Publisher="__PUBLISHER_ID__"
+    Version="__VERSION__"
+    ProcessorArchitecture="__ARCH__" />
+
+  <Properties>
+    <DisplayName>__DISPLAY_NAME__</DisplayName>
+    <PublisherDisplayName>__PUBLISHER_DISPLAY_NAME__</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>DBPilot - MySQL / MariaDB / PostgreSQL desktop client</Description>
+  </Properties>
+
+  <Dependencies>
+    <!--
+      MinVersion 10.0.19041.0 = Windows 10 2004. MaxVersionTested only declares
+      what has been tested; it does not affect installation.
+    -->
+    <TargetDeviceFamily
+      Name="Windows.Desktop"
+      MinVersion="10.0.19041.0"
+      MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="zh-CN" />
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <Application Id="DBPilot" Executable="__EXE_NAME__"
+                 EntryPoint="Windows.FullTrustApplication">
+      <!--
+        A full-trust Application may only carry uap:VisualElements (no UWP
+        SplashScreen / Extensions). Square44x44 and Square150x150 are the two
+        sizes the Store requires; the wide tile improves the Start menu layout.
+        Every file named here must exist in the package or makeappx pack fails
+        with 0x80080204; make-msix.ps1 generates them all from the app icon.
+      -->
+      <uap:VisualElements
+        DisplayName="__DISPLAY_NAME__"
+        Description="DBPilot - MySQL / MariaDB / PostgreSQL desktop client"
+        BackgroundColor="#1E1E2E"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="default">
+        <uap:DefaultTile
+          Wide310x150Logo="Assets\Wide310x150Logo.png"
+          Square71x71Logo="Assets\Square71x71Logo.png"
+          Square310x310Logo="Assets\LargeTile.png"
+          ShortName="DBPilot" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- The only capability a full-trust desktop app needs: it does not limit
+         network, filesystem or child-process access. -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

@@ -7,6 +7,12 @@ name: linux
 #
 # 三种打包都在 packaging/linux/build-packages.sh 里完成，本地与 CI 共用同一份逻辑。
 # 发布仓库根 = desktop/ 目录，所以路径都没有 desktop/ 前缀。
+#
+# GPG 签名（可选）：
+#   配置 secret GPG_PRIVATE_KEY（base64 的 armored 私钥）+ 可选的 GPG_PASSPHRASE 后，
+#   每个产物会有 <文件名>.asc 分离签名，另出 SHA256SUMS / SHA256SUMS.asc /
+#   DBPILOT-GPG-KEY.asc。**未配置时不签名且不失败**，产物照常上传。
+#   详见 packaging/linux/VERIFYING.md。
 
 on:
   push:
@@ -102,6 +108,26 @@ jobs:
         env:
           VERSION: ${{ env.VERSION }}
 
+      # GPG 签名（可选）：配了 secret 就签，没配就只打警告、退出码 0。
+      # secrets 不能在 job 级 env 里判空，所以这一步永远执行、由脚本自己判断。
+      # 私钥只导入 mktemp -d 出来的临时 GNUPGHOME，脚本结束即删除，不进工作区/日志。
+      - name: Sign packages (GPG, optional)
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::warning::未配置 GPG_PRIVATE_KEY，产物将不签名"
+            echo "产物仍会上传，只是没有 .asc / SHA256SUMS。"
+            # 不跑签名脚本（跑也无害，但显式跳过更清楚），保持原有流程
+            exit 0
+          fi
+          # 注意 pipeline 退出码：base64 -d 在脚本内部用 pipefail 处理
+          bash packaging/linux/sign-artifacts.sh dist
+
       - name: Show packages
         run: ls -lh dist/
 
@@ -113,10 +139,18 @@ jobs:
             dist/*.AppImage
             dist/*.deb
             dist/*.rpm
+            dist/*.AppImage.asc
+            dist/*.deb.asc
+            dist/*.rpm.asc
+            dist/SHA256SUMS
+            dist/SHA256SUMS.asc
+            dist/DBPILOT-GPG-KEY.asc
           if-no-files-found: error
           retention-days: 14
 
       # tag 触发时直接补到同一个 Release；workflow_dispatch 只出 artifact。
+      # 签名文件用通配 *.asc / SHA256SUMS*：未配置 GPG 时这些 glob 匹配不到，
+      # 所以 fail_on_unmatched_files 必须为 false，否则未签名发版会被判失败。
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -126,7 +160,10 @@ jobs:
             dist/*.AppImage
             dist/*.deb
             dist/*.rpm
+            dist/*.asc
+            dist/SHA256SUMS
           overwrite_files: true
-          fail_on_unmatched_files: true
+          # 不能是 true：未签名（无 .asc）时通配符匹配不到会直接失败
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

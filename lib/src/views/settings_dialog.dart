@@ -9,6 +9,7 @@ import '../data_dir_overview.dart';
 import '../external_links.dart';
 import '../i18n.dart';
 import '../i18n_literals.dart';
+import '../platform_shape.dart';
 import '../sqlite_sources.dart';
 import '../text.dart';
 import '../theme.dart';
@@ -324,6 +325,8 @@ class _SettingsBodyState extends State<_SettingsBody> {
   /// with a retry button and the manual browser link as a fallback.
   Future<void> _autoUpdate(UpdateCheckResult result) async {
     if (_phase != null) return;
+    // Store builds never download: the result panel points at the Store.
+    if (isRunningAsMsix()) return;
     final url = autoUpdateAssetUrl(result);
     if (url == null) return; // panel shows the manual fallback
     _cancelRequested = false;
@@ -677,10 +680,18 @@ class _SettingsBodyState extends State<_SettingsBody> {
                 children: <Widget>[
                   _checkUpdateButton(),
                   Text(
-                    pickText(
-                      '更新源：GitHub · $kUpdateRepoLabel',
-                      'Update source: GitHub · $kUpdateRepoLabel',
-                    ),
+                    // A Store build is updated by the Store, so naming GitHub as
+                    // its update source would be a lie; the caption switches to
+                    // the managed channel instead.
+                    isRunningAsMsix()
+                        ? pickText(
+                            '更新方式：Microsoft Store',
+                            'Updates: Microsoft Store',
+                          )
+                        : pickText(
+                            '更新源：GitHub · $kUpdateRepoLabel',
+                            'Update source: GitHub · $kUpdateRepoLabel',
+                          ),
                     key: const ValueKey('settings-update-source'),
                     // The caption is already in its final language (pickText
                     // chose it), so the literal translator must not touch it
@@ -692,7 +703,9 @@ class _SettingsBodyState extends State<_SettingsBody> {
               ),
               const SizedBox(height: 6),
               Text(
-                '发现新版本后自动下载并安装（Windows 会请求管理员权限），完成后应用将重启。',
+                isRunningAsMsix()
+                    ? kMsixUpdateGuidance
+                    : '发现新版本后自动下载并安装（Windows 会请求管理员权限），完成后应用将重启。',
                 key: const ValueKey('settings-update-check-hint'),
                 style: TextStyle(fontSize: 12, color: AppColors.muted),
               ),
@@ -805,7 +818,20 @@ class _SettingsBodyState extends State<_SettingsBody> {
           if (_phase != null) ...<Widget>[
             const SizedBox(height: 8),
             _updateProgressPanel(),
-          ] else if (_updateError != null) ...<Widget>[
+          ] else if (isRunningAsMsix())
+            // Store build: there is nothing to download and nothing to retry,
+            // only where the update comes from. Its own key lets a test tell it
+            // apart from the generic unsupported-installation caption below.
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                kMsixUpdateGuidance,
+                key: const ValueKey('settings-update-msix-store'),
+                noTranslate: true,
+                style: TextStyle(fontSize: 12, color: AppColors.infoText),
+              ),
+            )
+          else if (_updateError != null) ...<Widget>[
             const SizedBox(height: 8),
             AlertBox(
               _updateError!,

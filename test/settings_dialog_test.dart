@@ -12,6 +12,7 @@ import 'package:rust_myadmin_desktop/src/app_state.dart';
 import 'package:rust_myadmin_desktop/src/app_version.dart';
 import 'package:rust_myadmin_desktop/src/external_links.dart';
 import 'package:rust_myadmin_desktop/src/i18n.dart';
+import 'package:rust_myadmin_desktop/src/platform_shape.dart';
 import 'package:rust_myadmin_desktop/src/rust/frb_generated.dart';
 import 'package:rust_myadmin_desktop/src/sqlite_sources.dart';
 import 'package:rust_myadmin_desktop/src/text.dart';
@@ -74,6 +75,25 @@ Future<void> _openDialog(WidgetTester tester) async {
   await tester.tap(find.byKey(const ValueKey('open-settings')));
   await tester.pumpAndSettle();
   expect(find.byKey(const ValueKey('settings-lang-zh')), findsOneWidget);
+}
+
+const String _msixExe =
+    r'C:\Program Files\WindowsApps\DBPilot_8wekyb3d8bbwe\DBPilot.exe';
+
+/// Runs [body] pretending this process is an MSIX (Microsoft Store) build.
+///
+/// The dialog reads [isRunningAsMsix], which is backed by the two seams below;
+/// swapping them is the only way to render the Store shape on a test host.
+Future<void> asMsix(Future<void> Function() body) async {
+  platformShapeExecutable = () => _msixExe;
+  platformShapeEnvironment =
+      () => <String, String>{kAppxPackageFamilyNameEnv: 'DBPilot_8wekyb3d8bbwe'};
+  try {
+    await body();
+  } finally {
+    platformShapeExecutable = () => Platform.resolvedExecutable;
+    platformShapeEnvironment = () => Platform.environment;
+  }
 }
 
 void main() {
@@ -617,5 +637,96 @@ void main() {
 
     expect(find.byKey(const ValueKey('settings-update-error')), findsOneWidget);
     expect(find.text('已取消更新'), findsOneWidget);
+  });
+
+  // ------------------------------------------------------ Store (MSIX) 形态
+  //
+  // A Microsoft Store build must not offer an in-app download: Windows forbids
+  // a packaged app from running the NSIS installer, and the Store re-signs every
+  // release. These two tests pin the managed path (nothing is downloaded, the
+  // copy points at the Store) and, in the same run, prove the unpackaged path is
+  // untouched — the second half re-checks the GitHub wording without any MSIX
+  // seam, so a regression there fails here too.
+
+  testWidgets('MSIX 形态：检查更新只提示从商店更新，不下载任何包', (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    // Pretend to be the Store build for the duration of this test.
+    await asMsix(() async {
+      settingsUpdateCheck = (String manifestUrl, String currentVersion) async =>
+          UpdateCheckResult(
+            hasUpdate: true,
+            currentVersion: currentVersion,
+            latestVersion: '9.9.9',
+            notes: '',
+            downloadUrl: 'https://github.com/L-Y-P/DBPilot/releases/tag/v9.9.9',
+            // Even with an asset URL advertised, nothing may be downloaded.
+            assets: const <String, String>{
+              'windows_setup': 'https://example.com/DBPilot-9.9.9-windows-x64-setup.exe',
+              'macos_zip': 'https://example.com/DBPilot-9.9.9-macos.zip',
+            },
+          );
+      var downloads = 0;
+      var applied = false;
+      settingsDownloadUpdate = ({
+        required String url,
+        required Directory directory,
+        required String fileName,
+        required void Function(UpdateDownloadProgress progress) onProgress,
+        required bool Function() isCancelled,
+      }) async {
+        downloads++;
+        throw const UpdateDownloadException('不应下载');
+      };
+      settingsApplyUpdate = (File package, String version) async => applied = true;
+      int? exitCode;
+      settingsExitApp = (int code) => exitCode = code;
+
+      await _openDialog(tester);
+
+      // The caption names the managed channel instead of GitHub.
+      final source = find.byKey(const ValueKey('settings-update-source'));
+      expect(tester.widget<Text>(source).data, '更新方式：Microsoft Store');
+      final hint = find.byKey(const ValueKey('settings-update-check-hint'));
+      expect(tester.widget<Text>(hint).data, kMsixUpdateGuidance);
+
+      final button = find.byKey(const ValueKey('settings-check-update'));
+      await tester.ensureVisible(button);
+      await tester.pumpAndSettle();
+      await tester.tap(button);
+      await _settle(tester);
+
+      // A check still runs (the version information is useful), but the panel
+      // offers the Store instead of a download, and nothing is fetched.
+      expect(downloads, 0);
+      expect(applied, isFalse);
+      expect(exitCode, isNull);
+      expect(find.text('发现新版本：'), findsOneWidget);
+      expect(find.byKey(const ValueKey('settings-update-msix-store')),
+          findsOneWidget);
+      expect(find.byKey(const ValueKey('settings-update-unsupported')),
+          findsNothing);
+      expect(find.byKey(const ValueKey('settings-retry-update')), findsNothing);
+      expect(find.byKey(const ValueKey('settings-update-error')), findsNothing);
+    });
+  });
+
+  testWidgets('非 MSIX 形态：更新源仍写 GitHub，且不会出现商店提示', (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await _openDialog(tester);
+
+    final source = find.byKey(const ValueKey('settings-update-source'));
+    expect(tester.widget<Text>(source).data,
+        contains('GitHub · $kUpdateRepoLabel'));
+    final hint = find.byKey(const ValueKey('settings-update-check-hint'));
+    expect(tester.widget<Text>(hint).data, contains('自动下载'));
+    expect(find.byKey(const ValueKey('settings-update-msix-store')), findsNothing);
   });
 }

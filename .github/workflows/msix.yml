@@ -1,0 +1,199 @@
+name: msix
+
+# Microsoft Store 出包：构建 Windows Release，再用 packaging/windows/msix/make-msix.ps1 打成 MSIX。
+#
+# 与其他工作流的关系：
+#   * build.yml   —— 日常双平台构建（含 NSIS 安装包），不看 tag；
+#   * release.yml —— 正式发版（GitHub Release + update.json），不看 MSIX；
+#   * 本文件      —— 只出 MSIX，供提交 Partner Center。tag v* 时与 release 并行跑，
+#                    互不阻塞（商店包不参与 GitHub Release 的 update.json 流程）。
+#
+# 商店会**重新签名**每个提交，所以这里默认不签名（不配任何证书 secret 也能出包）。
+# Publisher / IdentityName 来自 repository variables：
+#   MSIX_IDENTITY_NAME = 1234ABCD.DBPilot
+#   MSIX_PUBLISHER     = CN=1A2B3C4D-1234-5678-9ABC-DEF012345678
+# 没配时脚本用占位符出包并打警告（产物不可提交，只用来验证流水线）。
+# 发布仓库根 = desktop/ 目录，所以路径都没有 desktop/ 前缀。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不带 v，例如 1.1.3）；留空则用 pubspec.yaml 的 version"
+        required: false
+        type: string
+      identity_name:
+        description: "Partner Center 的 Package/Identity/Name（留空用仓库变量，再缺省则用占位符）"
+        required: false
+        type: string
+      publisher:
+        description: "Partner Center 的 Package/Identity/Publisher（CN=...）"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msix-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 与 build.yml / release.yml 保持一致。
+  FLUTTER_VERSION: "3.47.7"
+  CARGO_TERM_COLOR: always
+  FLUTTER_SUPPRESS_ANALYTICS: "true"
+
+jobs:
+  msix:
+    name: build msix (x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # 与 build.yml 相同的策略：只缓存 cargo 下载缓存，不缓存 rust/target。
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-msix-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msix-
+            ${{ runner.os }}-cargo-build-
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Flutter test (MSIX shape + update flow)
+        # MSIX 形态的判定与「禁用自动更新」分支都在 Dart 侧，出包前先锁死。
+        run: |
+          flutter test test/msix_shape_test.dart test/update_apply_test.dart test/settings_dialog_test.dart
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      # 版本号：tag/输入优先，否则取 pubspec.yaml（唯一版本源）。
+      # 只用 sed/bash，Windows runner 的 Git Bash 可用。
+      - name: Resolve version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = "tag" ]; then
+            VERSION="${REF_NAME#v}"
+          else
+            VERSION="${INPUT_VERSION#v}"
+          fi
+          if [ -z "$VERSION" ]; then
+            VERSION="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml | head -1)"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::解析不到版本号（pubspec.yaml 里没有 version）"
+            exit 1
+          fi
+          # 和 release.yml 一样校验 app_version.dart，避免商店包版本与应用内显示不一致。
+          APP_VERSION="$(sed -nE "s/^.*kAppVersion[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" lib/src/app_version.dart | head -1)"
+          if [ "$VERSION" != "$APP_VERSION" ]; then
+            echo "::error::版本不一致：本次 = ${VERSION}，kAppVersion = ${APP_VERSION}。请先同步 lib/src/app_version.dart。"
+            exit 1
+          fi
+          echo "MSIX version: $VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # Publisher / IdentityName 解析：手动输入 > 仓库变量 > 占位符。
+      # 占位符时打 ::warning:: 让产物一眼看出不可提交，但**不失败**（PR/无凭证也能验证流水线）。
+      - name: Resolve store identity
+        shell: bash
+        env:
+          INPUT_IDENTITY: ${{ inputs.identity_name }}
+          INPUT_PUBLISHER: ${{ inputs.publisher }}
+          VARS_IDENTITY: ${{ vars.MSIX_IDENTITY_NAME }}
+          VARS_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+        run: |
+          set -euo pipefail
+          IDENTITY="${INPUT_IDENTITY:-$VARS_IDENTITY}"
+          PUBLISHER="${INPUT_PUBLISHER:-$VARS_PUBLISHER}"
+          if [ -z "$IDENTITY" ]; then
+            echo "::warning::未配置 MSIX_IDENTITY_NAME（repository variable），使用占位符出包 —— 该 MSIX 不可提交商店"
+          fi
+          if [ -z "$PUBLISHER" ]; then
+            echo "::warning::未配置 MSIX_PUBLISHER（repository variable），使用占位符出包 —— 该 MSIX 不可提交商店"
+          fi
+          {
+            echo "MSIX_IDENTITY=$IDENTITY"
+            echo "MSIX_PUBLISHER_VALUE=$PUBLISHER"
+          } >> "$GITHUB_ENV"
+          echo "Identity : ${IDENTITY:-<placeholder>}"
+          echo "Publisher: ${PUBLISHER:-<placeholder>}"
+
+      - name: Pack MSIX
+        shell: pwsh
+        # 脚本本身是纯 ASCII 的（见其头部注释）；这里用 pwsh 7 调用不影响产物。
+        run: |
+          $args = @{
+            SourceDir      = "build/windows/x64/runner/Release"
+            Version        = $env:VERSION
+            OutFile        = "DBPilot-$($env:VERSION)-x64.msix"
+            Arch           = "x64"
+            PublisherDisplayName = "DBPilot"
+          }
+          if ($env:MSIX_IDENTITY) { $args.IdentityName = $env:MSIX_IDENTITY }
+          if ($env:MSIX_PUBLISHER_VALUE) { $args.Publisher = $env:MSIX_PUBLISHER_VALUE }
+          & .\packaging\windows\msix\make-msix.ps1 @args
+          if ($LASTEXITCODE -ne 0) { Write-Error "make-msix.ps1 failed ($LASTEXITCODE)"; exit 1 }
+
+      # 产物信息写进 job summary，方便复制到 Partner Center 对照。
+      - name: Report package
+        shell: pwsh
+        run: |
+          $msix = Get-Item "DBPilot-$($env:VERSION)-x64.msix"
+          $hash = (Get-FileHash $msix.FullName -Algorithm SHA256).Hash
+          $sizeMb = "{0:N1} MB" -f ($msix.Length / 1MB)
+          $identity = if ($env:MSIX_IDENTITY) { $env:MSIX_IDENTITY } else { 'DBPilot.Placeholder (placeholder)' }
+          $publisher = if ($env:MSIX_PUBLISHER_VALUE) { $env:MSIX_PUBLISHER_VALUE } else { 'CN=DBPilot-Local-Test (placeholder)' }
+          $lines = @(
+            '### MSIX package'
+            ''
+            '| field | value |'
+            '| --- | --- |'
+            "| file | `$($msix.Name)` |"
+            "| size | $sizeMb |"
+            "| sha256 | `$hash` |"
+            "| version | `$($env:VERSION).0` |"
+            "| identity name | `$identity` |"
+            "| publisher | `$publisher` |"
+            ''
+            'Upload this file to Partner Center; the Store re-signs it, so no local certificate is needed.'
+          )
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbpilot-msix-x64
+          path: DBPilot-*-x64.msix
+          if-no-files-found: error
+          retention-days: 30

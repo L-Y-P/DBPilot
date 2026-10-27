@@ -4,6 +4,8 @@ name: release
 #   1) meta：解析版本号，校验 pubspec.yaml 与 lib/src/app_version.dart 一致，生成 Release 说明；
 #   2) build：macOS + Windows 双平台出包；
 #   3) release：softprops/action-gh-release 建 Release 并上传 zip；
+#      Linux 三件套（AppImage/deb/rpm）由 linux.yml 单独构建并附到同一 Release，
+#      本 workflow 负责把它们的 .asc / SHA256SUMS(.asc) / 公钥一并挂上去；
 #   4) manifest：把 version / url / notes 写进仓库根的 update.json 并提交回 main。
 # 客户端固定读取 https://raw.githubusercontent.com/L-Y-P/DBPilot/main/update.json 。
 # 发布仓库根 = desktop/ 目录，所以路径都没有 desktop/ 前缀。
@@ -349,6 +351,14 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Linux 三件套（AppImage / deb / rpm）由 linux.yml 单独构建：它同样在 tag 触发时
+      # 用 softprops/action-gh-release 把产物直接补到**同一个** Release。所以这里不再
+      # 二次下载 Linux artifact（跨 workflow 下载要么需要第三方 action，要么依赖
+      # download-artifact 的 run-id 特性，都容易在发版时把 release job 拖挂）。
+      #
+      # 本 job 只负责 macOS / Windows 资产；Release 上最终会同时出现 Linux 产物
+      # 及其 .asc / SHA256SUMS(.asc) / DBPILOT-GPG-KEY.asc，因为下面 files 里的
+      # dist/*.asc、dist/SHA256SUMS 通配符会把它们一并纳入（存在才上传）。
       - name: Show packages
         run: ls -lh dist
 
@@ -360,14 +370,22 @@ jobs:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: ${{ needs.meta.outputs.tag }}
           body_path: release-body.md
-          # 资产：macOS zip + dmg、Windows NSIS 安装包、Windows 免安装 zip。
+          # 资产：macOS zip + dmg、Windows NSIS 安装包 + 免安装 zip、Linux 三件套，
+          # 以及它们的 GPG 签名（.asc / SHA256SUMS）与公钥。
           files: |
             dist/DBPilot-*.zip
             dist/DBPilot-*-macos.dmg
             dist/DBPilot-*-windows-x64-setup.exe
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+            dist/*.asc
+            dist/SHA256SUMS
           # 同版本重跑时覆盖同名资产，避免 "already exists" 失败
           overwrite_files: true
-          fail_on_unmatched_files: true
+          # 必须为 false：Linux 产物来自另一个 workflow，可能还没跑完；
+          # 签名文件在未配置 GPG 时也不存在。true 会让整个 release 失败。
+          fail_on_unmatched_files: false
           draft: false
           prerelease: false
         env:

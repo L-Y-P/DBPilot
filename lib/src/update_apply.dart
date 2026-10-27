@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'platform_shape.dart';
 import 'update_check.dart';
 import 'update_source.dart';
 
@@ -29,13 +30,34 @@ Future<void> Function(String executable, List<String> arguments)
 /// in-place swap can be exercised without touching /Applications.
 String Function() applyResolvedExecutable = () => Platform.resolvedExecutable;
 
+/// Message shown wherever the Store build would otherwise offer an in-app
+/// update. Kept next to the code that refuses the update so the dialog, the
+/// exception and the tests cannot drift apart.
+const String kMsixUpdateGuidance =
+    '当前为 Microsoft Store 版本，应用内自动更新已停用，请从 Microsoft Store 更新。';
+
+/// English of [kMsixUpdateGuidance].
+///
+/// The dialog renders one of the two via `pickText`; the exception carries the
+/// Chinese copy and the translator rewrites it (see en_settings.dart), so both
+/// surfaces agree word for word.
+const String kMsixUpdateGuidanceEn =
+    'This is the Microsoft Store version: in-app updates are disabled. '
+    'Please update from the Microsoft Store.';
+
 /// Picks the package that [applyUpdateAndRestart] can install on this host.
 ///
 /// The manifest may advertise explicit asset URLs (`assets` in update.json);
 /// when it does not, the GitHub release naming convention is used. Returns
 /// null when this installation cannot be updated in place (for example a
-/// Linux deb/rpm install, which needs the system package manager).
+/// Linux deb/rpm install, which needs the system package manager, or an MSIX
+/// build, which only the Store may update).
 String? autoUpdateAssetUrl(UpdateCheckResult result) {
+  // MSIX/Store builds are re-signed on every release and may not run an
+  // external installer, so there is no package this process is allowed to
+  // apply. Returning null leaves the dialog on its manual/managed path.
+  if (isRunningAsMsix()) return null;
+
   final version = result.latestVersion.trim();
   if (version.isEmpty) return null;
 
@@ -81,7 +103,14 @@ String updateFileNameFromUrl(String url) {
 /// DBPilot when it returns. Linux: replaces the running AppImage.
 ///
 /// The caller must quit the current process right after this returns.
+///
+/// An MSIX (Microsoft Store) build refuses before looking at the package:
+/// Windows does not let a packaged app run the NSIS installer to replace
+/// itself, and the Store re-signs every release, so updating is its job.
 Future<void> applyUpdateAndRestart(File package, String version) async {
+  if (isRunningAsMsix()) {
+    throw const UpdateApplyException(kMsixUpdateGuidance);
+  }
   if (!package.existsSync()) {
     throw const UpdateApplyException('更新包不存在');
   }

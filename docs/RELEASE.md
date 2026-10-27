@@ -297,3 +297,28 @@ Compress-Archive -Path "build/windows/x64/runner/Release/*" `
 
 缺 `version` 会被判为「更新清单缺少 version 字段」；字段多余不影响解析。
 更新源固定为 `lib/src/update_source.dart` 里的 `kUpdateManifestUrl`，用户不可改。
+
+## 9. Microsoft Store（MSIX）出包
+
+商店渠道与上面的 GitHub Release 流程**互不影响**：`.github/workflows/msix.yml` 只出 MSIX，
+不建 Release、不改 `update.json`。push tag `v*` 时它与 `release` 并行跑，也可以手动触发。
+
+| 目的 | 操作 |
+| --- | --- |
+| 出商店包 | push tag `v*`（自动）或手动跑 **msix** 工作流（可填 version / identity_name / publisher） |
+| 产物 | artifact `dbpilot-msix-x64`（保留 30 天），文件名 `DBPilot-<ver>-x64.msix` |
+| 提交 | 在 Partner Center 上传该 `.msix`；**商店会重新签名**，不需要我们签名 |
+| 本地安装测试 | 用 `make-msix.ps1 -CertPath/-CertPassword` 自签（见 `packaging/windows/msix/README.md`） |
+
+需要配置两个 **repository variables**（不是 secrets，无需保密）：
+
+```
+MSIX_IDENTITY_NAME = 1234ABCD.DBPilot                                     # Package/Identity/Name
+MSIX_PUBLISHER     = CN=1A2B3C4D-1234-5678-9ABC-DEF012345678             # Package/Identity/Publisher
+```
+
+未配置时工作流用占位符出包并打 `::warning::`（产物不可提交，只用于验证流水线）。
+
+应用侧行为（`lib/src/platform_shape.dart` 的 `isMsixPackaged`）：「商店版本不自己更新」——
+`autoUpdateAssetUrl()` 返回 null、`applyUpdateAndRestart()` 抛 `UpdateApplyException`、
+设置页提示从 Microsoft Store 更新。细节见 `packaging/windows/msix/README.md`。

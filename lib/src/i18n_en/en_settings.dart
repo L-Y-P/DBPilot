@@ -46,9 +46,30 @@ const Map<String, String> enSettings = <String, String>{
   '选择备份保存目录': 'Choose a folder for backups',
   '备份文件默认保存在数据目录的 backups 子目录，可另选一个位置。':
       'Backups are stored in the backups folder inside the data directory by default; pick a different location here.',
+  // ---- data & uninstall ---------------------------------------------------
+  '数据与卸载': 'Data & uninstall',
+  '数据目录': 'Data folder',
+  '打开数据目录': 'Open data folder',
+  '执行清空…': 'Erase user data…',
+  '刷新': 'Refresh',
+  '占用空间': 'Space used',
+  '内容': 'Contents',
+  '尚未创建': 'Not created yet',
+  '空目录（0 B）': 'Empty (0 B)',
+  '占用未知': 'Space used unknown',
+  '数据目录不可用': 'Data folder unavailable',
+  '正在读取数据目录…': 'Reading the data folder…',
+  '正在统计占用…': 'Measuring disk usage…',
+  '确定清空用户数据吗？': 'Erase all user data?',
+  '将删除 {path} 里的全部文件（连接配置、查询历史、设置与备份），此操作不可撤销。':
+      'Everything inside {path} will be deleted (connections, query history, settings and backups). This cannot be undone.',
+  '清空': 'Erase',
+  '卸载应用不会自动删除这个目录：卸载前请在这里清空，或卸载后手动删除该路径。Windows 安装包在卸载时会询问是否删除用户数据。':
+      'Uninstalling the app does not delete this folder. Erase it here before uninstalling, '
+          'or delete the folder manually afterwards. On Windows the uninstaller asks whether '
+          'to remove the user data.',
   // ---- about / updates ----------------------------------------------------
   '应用版本': 'App version',
-  '核心版本': 'Core version',
   '未知': 'Unknown',
   '检查更新': 'Check for updates',
   '已是最新版本': 'You are up to date',

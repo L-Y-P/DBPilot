@@ -136,7 +136,9 @@ void main() {
     expect(find.byKey(const ValueKey('settings-project-url')), findsOneWidget);
     expect(find.text(kUpdateRepoUrl), findsOneWidget);
     expect(find.byKey(const ValueKey('settings-version')), findsOneWidget);
-    expect(find.byKey(const ValueKey('settings-core-version')), findsOneWidget);
+    // 核心版本行已删除：Rust 与 Dart 同源发布，两个号永远一致，那一行只会
+    // 让用户困惑「到底哪个才是版本」。
+    expect(find.byKey(const ValueKey('settings-core-version')), findsNothing);
     expect(find.byKey(const ValueKey('settings-update-check-hint')),
         findsOneWidget);
     // The update row is a button plus the fixed GitHub source caption; the
@@ -144,7 +146,9 @@ void main() {
     expect(find.byKey(const ValueKey('settings-update-url')), findsNothing);
     expect(find.byKey(const ValueKey('settings-check-update')), findsOneWidget);
     expect(find.byKey(const ValueKey('settings-update-source')), findsOneWidget);
-    expect(find.text('$kAppVersion (build $kAppBuildNumber)'), findsOneWidget);
+    // 只显示三段式版本号，(build N) 后缀已去掉。
+    expect(find.text(kAppVersion), findsOneWidget);
+    expect(find.textContaining('(build'), findsNothing);
 
     // The shared header close button dismisses the dialog.
     expect(find.byKey(const ValueKey('dialog-close')), findsOneWidget);

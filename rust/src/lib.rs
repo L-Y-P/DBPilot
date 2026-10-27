@@ -45,6 +45,8 @@ pub mod privileges;
 pub mod secure;
 pub mod ssh;
 pub mod state;
+/// 用户数据目录盘点与清空（「数据与卸载」面板 / 卸载安装包时的清理）。
+pub mod uninstall;
 
 // ---------------------------------------------------------------------------
 // 兼容别名：契约层已拆成独立 crate `dbpilot_core`（33 轮）。

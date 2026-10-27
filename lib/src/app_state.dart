@@ -56,10 +56,10 @@ class AppState extends ChangeNotifier {
   bool lazyBigFields = true;
 
   /// Version of this desktop bundle (see app_version.dart).
+  ///
+  /// Read by the update check (it compares against the manifest), not by the
+  /// About area any more: the settings dialog shows [kAppVersion] directly.
   String appVersion = kAppVersion;
-
-  /// Version reported by the Rust core crate.
-  String coreVersion = '';
 
   // ------------------------------------------------------------- connection
 
@@ -363,11 +363,8 @@ class AppState extends ChangeNotifier {
       final config = await Api.instance.appConfig();
       title = (config['title'] ?? kAppName).toString();
       backupDir = (config['backup_dir'] ?? '').toString();
-      try {
-        coreVersion = Api.instance.coreVersion();
-      } catch (_) {
-        coreVersion = (config['version'] ?? '').toString();
-      }
+      // 不再抓 coreVersion：核心版本行已从设置页移除，Rust 与 Dart 同源发布，
+      // 两个版本号永远一致，留着只会多一次 FFI 调用和一个没人读的字段。
       final settings = await Api.instance.getSettings();
       final lang = (settings['language'] ?? 'zh').toString();
       I18n.setLang(lang == 'en' ? AppLang.en : AppLang.zh);

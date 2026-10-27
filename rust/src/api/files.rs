@@ -122,3 +122,55 @@ pub async fn save_window_state(body: Value) -> anyhow::Result<Value> {
     let saved = state.update_settings(settings).await?;
     Ok(serde_json::to_value(saved.window).unwrap_or(Value::Null))
 }
+
+// ------------------------------------------------- 数据与卸载（用户数据清理）
+
+/// 清空用户数据所需的确认短语。
+///
+/// 单独成常量而不是字面量：Dart 需要把它展示给用户照抄，测试也要断言大小写
+/// 不敏感，三处必须同源。
+const WIPE_CONFIRM_TOKEN: &str = "DELETE-USER-DATA";
+
+/// 数据目录，供盘点/清空使用。
+///
+/// 面板要在 `initApp` 成功之前也能打开（用户可能正打算卸载），所以取不到全局
+/// 状态时退回平台默认目录，而不是像其它接口那样直接报"应用尚未初始化"。
+fn panel_data_dir() -> std::path::PathBuf {
+    match state() {
+        Ok(state) => state.config.data_dir.clone(),
+        Err(_) => crate::config::default_data_dir(),
+    }
+}
+
+/// 「数据与卸载」面板用的数据目录盘点。
+///
+/// 返回字段：
+/// * `path` / `exists`：数据目录及是否已创建；
+/// * `total_bytes` / `file_count`：整目录占用与文件数（符号链接不计入）；
+/// * `files: [{name, path, bytes, count, kind}]`：顶层子项，按体积降序，
+///   `kind` 为 `"file"` 或 `"dir"`；
+/// * `contains_secrets`：是否仍存在 connections/settings/history 等敏感文件。
+pub fn data_dir_summary() -> anyhow::Result<Value> {
+    Ok(crate::uninstall::overview_json(&panel_data_dir()))
+}
+
+/// 清空用户数据目录（卸载/重置前置动作）。
+///
+/// `confirm` 必须与 [`WIPE_CONFIRM_TOKEN`] 完整相等（忽略大小写），否则返回
+/// 错误且一个文件都不动。成功后返回 `{"ok": true, "removed_bytes": N, "path": ...}`。
+///
+/// 刻意**不重置**全局 `STATE`：连接池、备份索引与内存中的设置都还指着刚被删掉
+/// 的文件，在这里顺手清理只会留下一个半初始化的状态。重启应用由 Dart 侧提示。
+/// 全函数没有任何 `unwrap`/`panic!` 路径，失败一律走 `AppError`。
+pub async fn wipe_user_data(confirm: String) -> anyhow::Result<Value> {
+    let dir = panel_data_dir();
+    // 体积必须在删除前统计：删完只剩空目录，回报不了"释放了多少"。
+    let removed_bytes = crate::uninstall::data_dir_bytes(&dir);
+    crate::uninstall::wipe_data_dir(&dir, &confirm, WIPE_CONFIRM_TOKEN).map_err(AppError::bad)?;
+    Ok(json!({
+        "ok": true,
+        "removed_bytes": removed_bytes,
+        "path": dir.to_string_lossy(),
+    }))
+}
+

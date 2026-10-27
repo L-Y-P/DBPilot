@@ -182,8 +182,6 @@ class Api {
 
   Future<Json> appConfig() async => _asMap(await _guard(rapi.appConfig));
 
-  /// Version of the Rust core crate (shown in the settings dialog).
-  String coreVersion() => rapi.coreVersion();
 
   Future<Json> getSettings() async => _asMap(await _guard(rapi.getSettings));
 
@@ -194,6 +192,21 @@ class Api {
       _asMap(await _guard(() => rfiles.saveWindowState(body: patch)));
 
   Future<Json> dataDir() async => _asMap(await _guard(rfiles.dataDir));
+
+  /// 数据目录盘点，供设置页「数据与卸载」展示。
+  ///
+  /// 故意不加“应用已初始化”的前置判断：用户可能是想在卸载前先看看占了多大，
+  /// Rust 侧在取不到全局状态时会退回平台默认目录（见 /*files::panel_data_dir*/），
+  /// 这样面板在初始化失败时也仍然给得出路径。
+  Future<Json> dataDirSummary() async =>
+      _asMap(await _guard(() => rfiles.dataDirSummary()));
+
+  /// 清空用户数据目录。confirm 必须是 [wipeUserDataConfirmToken]。
+  ///
+  /// Rust 侧拿不到这个短语就一个文件都不动（返回错误）；确认短语只在这里
+  /// 定义一次，UI 展示与测试断言都引用它，避免两处字面量各改各的。
+  Future<Json> wipeUserData({String confirm = wipeUserDataConfirmToken}) async =>
+      _asMap(await _guard(() => rfiles.wipeUserData(confirm: confirm)));
 
   // -------------------------------------------------------------- connections
 
@@ -674,6 +687,12 @@ String formatBytes(num? bytes) {
   if (i == 0) return '${value.toInt()} B';
   return '${value.toStringAsFixed(2)} ${units[i]}';
 }
+
+/// 清空用户数据需要的确认短语（与 Rust 侧 `WIPE_CONFIRM_TOKEN` 同源）。
+///
+/// 放在 API 层而不是 UI 层：设置页要把它显示给用户照抄，测试也要断言它被
+/// 原样传给 Rust，两处引用同一个常量才能保证改一处不会漏另一处。
+const String wipeUserDataConfirmToken = 'DELETE-USER-DATA';
 
 /// Debug helper used by the startup self-check.
 void logApiError(Object error) {

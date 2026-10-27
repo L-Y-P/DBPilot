@@ -84,6 +84,13 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
+      - name: Build Rust core (needed by the FFI-backed widget tests)
+        # settings_dialog_test 走真实 FRB 桥（AppState.bootstrap 读 coreVersion），
+        # 没有 dylib 会在 setUpAll 直接 fail。msix_shape / update_apply 本身是纯函数，
+        # 但同一次 flutter test 调用会加载整个应用，所以这里必须先编 Rust。
+        working-directory: rust
+        run: cargo build --lib
+
       - name: Flutter test (MSIX shape + update flow)
         # MSIX 形态的判定与「禁用自动更新」分支都在 Dart 侧，出包前先锁死。
         run: |

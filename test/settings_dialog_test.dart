@@ -10,11 +10,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rust_myadmin_desktop/src/api.dart';
 import 'package:rust_myadmin_desktop/src/app_state.dart';
 import 'package:rust_myadmin_desktop/src/app_version.dart';
+import 'package:rust_myadmin_desktop/src/external_links.dart';
 import 'package:rust_myadmin_desktop/src/i18n.dart';
 import 'package:rust_myadmin_desktop/src/rust/frb_generated.dart';
 import 'package:rust_myadmin_desktop/src/sqlite_sources.dart';
 import 'package:rust_myadmin_desktop/src/text.dart';
 import 'package:rust_myadmin_desktop/src/theme.dart';
+import 'package:rust_myadmin_desktop/src/update_check.dart';
 import 'package:rust_myadmin_desktop/src/update_source.dart';
 import 'package:rust_myadmin_desktop/src/views/settings_dialog.dart';
 
@@ -81,10 +83,14 @@ void main() {
     AppState.instance.themeColor = kDefaultThemePreset;
     AppState.instance.applyAppearance();
     settingsDirPicker = pickFolder;
+    settingsUpdateCheck = checkUpdatesForSettings;
+    openExternalUrl = openUrlInBrowser;
   });
 
   tearDown(() {
     settingsDirPicker = pickFolder;
+    settingsUpdateCheck = checkUpdatesForSettings;
+    openExternalUrl = openUrlInBrowser;
     I18n.setLang(AppLang.zh);
     AppColors.applyAppearance(mode: 'system', presetId: 'default');
   });
@@ -119,8 +125,12 @@ void main() {
     expect(find.byKey(const ValueKey('settings-backup-change')), findsOneWidget);
     expect(find.byKey(const ValueKey('settings-backup-reset')), findsOneWidget);
     // About / updates.
+    expect(find.byKey(const ValueKey('settings-project-url')), findsOneWidget);
+    expect(find.text(kUpdateRepoUrl), findsOneWidget);
     expect(find.byKey(const ValueKey('settings-version')), findsOneWidget);
     expect(find.byKey(const ValueKey('settings-core-version')), findsOneWidget);
+    expect(find.byKey(const ValueKey('settings-update-check-hint')),
+        findsOneWidget);
     // The update row is a button plus the fixed GitHub source caption; the
     // editable manifest-URL field is gone.
     expect(find.byKey(const ValueKey('settings-update-url')), findsNothing);
@@ -395,5 +405,101 @@ void main() {
     // exists after _checkUpdate ran (the network path itself is covered by
     // update_check_test.dart against a loopback server).
     expect(find.byKey(const ValueKey('settings-update-result')), findsNothing);
+  });
+
+  testWidgets('the About project URL opens in the default browser',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    String? opened;
+    openExternalUrl = (String url) async {
+      opened = url;
+      return true;
+    };
+
+    await _openDialog(tester);
+    final link = find.byKey(const ValueKey('settings-project-url'));
+    expect(link, findsOneWidget);
+    expect(tester.widget<Text>(link).data, kUpdateRepoUrl);
+
+    await tester.ensureVisible(link);
+    await tester.pumpAndSettle();
+    await tester.tap(link);
+    await _settle(tester);
+
+    expect(opened, kUpdateRepoUrl);
+    expect(find.byKey(const ValueKey('settings-link-error')), findsNothing);
+  });
+
+  testWidgets('a failed browser launch shows the copy-the-link hint',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    openExternalUrl = (String url) async => false;
+
+    await _openDialog(tester);
+    final link = find.byKey(const ValueKey('settings-project-url'));
+    await tester.ensureVisible(link);
+    await tester.pumpAndSettle();
+    await tester.tap(link);
+    await _settle(tester);
+
+    expect(find.byKey(const ValueKey('settings-link-error')), findsOneWidget);
+  });
+
+  testWidgets('an available update only offers a browser download link',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    const downloadUrl = 'https://github.com/L-Y-P/DBPilot/releases/tag/v9.9.9';
+    settingsUpdateCheck = (String manifestUrl, String currentVersion) async {
+      expect(manifestUrl, kUpdateManifestUrl);
+      return UpdateCheckResult(
+        hasUpdate: true,
+        currentVersion: currentVersion,
+        latestVersion: '9.9.9',
+        notes: 'test notes',
+        downloadUrl: downloadUrl,
+      );
+    };
+    String? opened;
+    openExternalUrl = (String url) async {
+      opened = url;
+      return true;
+    };
+
+    await _openDialog(tester);
+    final button = find.byKey(const ValueKey('settings-check-update'));
+    await tester.ensureVisible(button);
+    await tester.pumpAndSettle();
+    await tester.tap(button);
+    await _settle(tester);
+
+    // Only an informational panel appears: a version, notes and a link. There
+    // is no download/install button and the check itself never fetches a
+    // package.
+    expect(find.byKey(const ValueKey('settings-update-result')), findsOneWidget);
+    expect(find.text('发现新版本：'), findsOneWidget);
+    expect(find.text('9.9.9'), findsOneWidget);
+
+    final hint = find.byKey(const ValueKey('settings-update-check-hint'));
+    expect(tester.widget<Text>(hint).data, contains('不会自动下载'));
+
+    final link = find.byKey(const ValueKey('settings-download-url'));
+    expect(tester.widget<Text>(link).data, downloadUrl);
+    await tester.ensureVisible(link);
+    await tester.pumpAndSettle();
+    await tester.tap(link);
+    await _settle(tester);
+    expect(opened, downloadUrl);
   });
 }

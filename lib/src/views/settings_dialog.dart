@@ -2,6 +2,7 @@ import 'package:flutter/material.dart' hide Text, Tooltip;
 
 import '../app_state.dart';
 import '../app_version.dart';
+import '../external_links.dart';
 import '../i18n.dart';
 import '../i18n_literals.dart';
 import '../sqlite_sources.dart';
@@ -18,6 +19,15 @@ import '../widgets.dart';
 /// 更改 substitutes this function instead of opening a real dialog. Production
 /// code never reassigns it.
 Future<String?> Function({String? title}) settingsDirPicker = pickFolder;
+
+/// Production update check used by the settings dialog.
+Future<UpdateCheckResult> checkUpdatesForSettings(
+        String manifestUrl, String currentVersion) =>
+    checkForUpdates(manifestUrl: manifestUrl, currentVersion: currentVersion);
+
+/// Test seam for the update check. Production never reassigns it.
+Future<UpdateCheckResult> Function(String manifestUrl, String currentVersion)
+    settingsUpdateCheck = checkUpdatesForSettings;
 
 /// The settings dialog: language, appearance, backups and the update check.
 ///
@@ -47,6 +57,7 @@ class _SettingsBody extends StatefulWidget {
 class _SettingsBodyState extends State<_SettingsBody> {
   bool _checking = false;
   UpdateCheckResult? _result;
+  bool _linkOpenFailed = false;
 
   Future<void> _setLanguage(AppLang lang) async {
     await AppState.instance.setLanguage(lang);
@@ -101,9 +112,9 @@ class _SettingsBodyState extends State<_SettingsBody> {
     // The manifest address is fixed at compile time ([kUpdateManifestUrl]); the
     // user can no longer point the check somewhere else, so there is nothing to
     // persist before the request goes out.
-    final result = await checkForUpdates(
-      manifestUrl: kUpdateManifestUrl,
-      currentVersion: state.appVersion,
+    final result = await settingsUpdateCheck(
+      kUpdateManifestUrl,
+      state.appVersion,
     );
     if (!mounted) return;
     setState(() {
@@ -111,6 +122,36 @@ class _SettingsBodyState extends State<_SettingsBody> {
       _result = result;
     });
   }
+
+  Future<void> _openUrl(String url) async {
+    final ok = await openExternalUrl(url);
+    if (!mounted) return;
+    setState(() => _linkOpenFailed = !ok);
+  }
+
+  /// A link-styled URL that opens in the user's default browser on click.
+  ///
+  /// Only http(s) URLs reach the OS (see [openUrlInBrowser]); URLs are
+  /// language-neutral, hence noTranslate.
+  Widget _externalLink(String url, {Key? key}) => MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: () => _openUrl(url),
+          child: Text(
+            url,
+            key: key,
+            noTranslate: true,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 13,
+              color: AppColors.link,
+              decoration: TextDecoration.underline,
+              decorationColor: AppColors.link,
+            ),
+          ),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -249,6 +290,11 @@ class _SettingsBodyState extends State<_SettingsBody> {
               ]),
               const SizedBox(height: 8),
               _infoRow(
+                '项目地址',
+                _externalLink(kUpdateRepoUrl,
+                    key: const ValueKey('settings-project-url')),
+              ),
+              _infoRow(
                 '应用版本',
                 Text(
                   '$kAppVersion (build $kAppBuildNumber)',
@@ -293,6 +339,21 @@ class _SettingsBodyState extends State<_SettingsBody> {
                   ),
                 ],
               ),
+              const SizedBox(height: 6),
+              Text(
+                '仅检查仓库是否有新版本，不会自动下载或安装。',
+                key: const ValueKey('settings-update-check-hint'),
+                style: TextStyle(fontSize: 12, color: AppColors.muted),
+              ),
+              if (_linkOpenFailed)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    '无法打开浏览器，请手动复制链接。',
+                    key: const ValueKey('settings-link-error'),
+                    style: TextStyle(fontSize: 12, color: AppColors.danger),
+                  ),
+                ),
               if (_result != null) _resultPanel(_result!),
             ]),
           ],
@@ -387,8 +448,8 @@ class _SettingsBodyState extends State<_SettingsBody> {
             const SizedBox(height: 6),
             Text('下载地址',
                 style: TextStyle(fontSize: 12, color: AppColors.infoText)),
-            SelectableText(result.downloadUrl,
-                style: TextStyle(fontSize: 12, color: AppColors.infoText)),
+            _externalLink(result.downloadUrl,
+                key: const ValueKey('settings-download-url')),
           ],
         ],
       ),

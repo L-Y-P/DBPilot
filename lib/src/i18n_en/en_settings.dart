@@ -52,6 +52,11 @@ const Map<String, String> enSettings = <String, String>{
   '未知': 'Unknown',
   '检查更新': 'Check for updates',
   '已是最新版本': 'You are up to date',
+  '项目地址': 'Project URL',
+  '仅检查仓库是否有新版本，不会自动下载或安装。':
+      'Checks the repository for a newer release only; nothing is downloaded or installed automatically.',
+  '无法打开浏览器，请手动复制链接。':
+      'Could not open the browser; please copy the link manually.',
   '发现新版本：': 'Update available:',
   '更新说明': 'Release notes',
   '下载地址': 'Download',

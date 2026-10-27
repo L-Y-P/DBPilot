@@ -134,8 +134,16 @@ jobs:
           VARS_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
         run: |
           set -euo pipefail
-          IDENTITY="${INPUT_IDENTITY:-$VARS_IDENTITY}"
-          PUBLISHER="${INPUT_PUBLISHER:-$VARS_PUBLISHER}"
+          # 第三优先：仓库里提交的 store-identity.env（Partner Center 的真实身份）。
+          # 这样不配 repository variables 也能出可提交的包。
+          ENV_FILE=packaging/windows/msix/store-identity.env
+          FILE_IDENTITY=''; FILE_PUBLISHER=''
+          if [ -f "$ENV_FILE" ]; then
+            FILE_IDENTITY=$(grep -E '^[[:space:]]*IDENTITY_NAME=' "$ENV_FILE" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"[[:space:]]*$//')
+            FILE_PUBLISHER=$(grep -E '^[[:space:]]*PUBLISHER=' "$ENV_FILE" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"[[:space:]]*$//')
+          fi
+          IDENTITY="${INPUT_IDENTITY:-${VARS_IDENTITY:-$FILE_IDENTITY}}"
+          PUBLISHER="${INPUT_PUBLISHER:-${VARS_PUBLISHER:-$FILE_PUBLISHER}}"
           if [ -z "$IDENTITY" ]; then
             echo "::warning::未配置 MSIX_IDENTITY_NAME（repository variable），使用占位符出包 —— 该 MSIX 不可提交商店"
           fi

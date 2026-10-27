@@ -162,17 +162,43 @@ $msixVersion = ConvertTo-MsixVersion $Version
 Write-Step "Version $Version -> MSIX $msixVersion"
 
 # --------------------------------------------------------------- identity
+# Values come from three places, in priority order:
+#   1. explicit -IdentityName / -Publisher parameters
+#   2. store-identity.env next to this script (the real Partner Center values)
+#   3. obvious placeholders so a local layout-only package still builds
+# The third case is deliberately loud: such a package is NOT submittable.
+$identityFile = Join-Path $PSScriptRoot 'store-identity.env'
+if (Test-Path $identityFile) {
+    # Parsed by hand instead of ConvertFrom-StringData: the file holds a
+    # UTF-8 Chinese publisher name and PowerShell 5.1 would mis-decode it.
+    foreach ($line in Get-Content -LiteralPath $identityFile -Encoding UTF8) {
+        if ($line -match '^\s*#') { continue }
+        if ($line -match '^\s*IDENTITY_NAME="?([^"]*)"?\s*$') { $envIdentity = $Matches[1] }
+        if ($line -match '^\s*PUBLISHER="?([^"]*)"?\s*$') { $envPublisher = $Matches[1] }
+        if ($line -match '^\s*PUBLISHER_DISPLAY_NAME="?([^"]*)"?\s*$') { $envPublisherDisplay = $Matches[1] }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($IdentityName) -and -not [string]::IsNullOrWhiteSpace($envIdentity)) {
+    $IdentityName = $envIdentity.Trim()
+    Write-Step "Identity from store-identity.env: $IdentityName"
+}
+if ([string]::IsNullOrWhiteSpace($Publisher) -and -not [string]::IsNullOrWhiteSpace($envPublisher)) {
+    $Publisher = $envPublisher.Trim()
+}
+if ($PublisherDisplayName -eq 'DBPilot' -and -not [string]::IsNullOrWhiteSpace($envPublisherDisplay)) {
+    $PublisherDisplayName = $envPublisherDisplay.Trim()
+}
 if ([string]::IsNullOrWhiteSpace($IdentityName)) {
     # Partner Center identity names look like <PublisherId>.<Name>. The local
     # placeholder is deliberately obvious so nobody uploads the result.
     $IdentityName = 'DBPilot.Placeholder'
-    Write-Warning '-IdentityName not supplied: placeholder DBPilot.Placeholder (NOT submittable)'
+    Write-Warning '-IdentityName not supplied and store-identity.env missing: placeholder DBPilot.Placeholder (NOT submittable)'
 }
 if ([string]::IsNullOrWhiteSpace($Publisher)) {
     # Publisher must equal the signing certificate subject; the placeholder is
     # only usable for an unsigned, layout-only local package.
     $Publisher = 'CN=DBPilot-Local-Test'
-    Write-Warning '-Publisher not supplied: placeholder CN=DBPilot-Local-Test (NOT submittable)'
+    Write-Warning '-Publisher not supplied and store-identity.env missing: placeholder CN=DBPilot-Local-Test (NOT submittable)'
 }
 # The package family name only becomes final after the Store claims the app;
 # a derived value keeps local test machines free of odd package names.

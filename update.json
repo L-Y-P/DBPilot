@@ -1,14 +1,14 @@
 {
-  "version": "1.1.3",
-  "url": "https://github.com/L-Y-P/DBPilot/releases/tag/v1.1.3",
-  "notes": "DBPilot v1.1.3 自 v1.1.2 以来的变更： - fix(test): 自动更新用例按运行平台选包，Windows CI 上不再误判 (2d92c1e) - fix(ci): Windows 上为 Rust dylib 建 .dylib 兼容别名 (7463f08) - fix(ci): msix 工作流先编 Rust core 再跑 flutter test (1d299e1) - release: 版本号回到 1.1.3+6（签名包替换 v1.1.3） (8ef0808) - chore(msix): 写入 Partner Center 真实应用标识 (9a882c4) - feat(release): Linux GPG 签名自动化 + MSIX（Microsoft Store）打包支持 (15d7474) - chore(release): update.json -> v1.1.3 (ad799d9) - fix(update): 修复 Windows 自动更新装不上/装错目录；安装包尊重 /D= (aeaf586) - chore(release): ...",
+  "version": "1.1.4",
+  "url": "https://github.com/L-Y-P/DBPilot/releases/tag/v1.1.4",
+  "notes": "DBPilot v1.1.4 自 v1.1.3 以来的变更： - release: v1.1.4（版本号 1.1.4+7） (faa52ae) - feat(perf): 大数据显示卡顿修复（方案 A/A+）+ 修复 Windows 窗口控件不显示 (e8371ea) - chore(release): update.json -> v1.1.3 (5f858b9) ## 下载 | 平台 | 文件 | 说明 | | --- | --- | --- | | macOS（universal，x86_64 + arm64） | DBPilot-1.1.4-macos.zip | 解压得到 DBPilot.app | | Windows x64 | DBPilot-1.1.4-windows-x64-setup.exe | NSIS 安装包（推荐） | | Windows x64 | DBPilot-1.1.4-windows-x64-portable.zip | 免安装版，解压即用 | > macOS 包为 ad-hoc 签名（未公证），首次打开请右键 → 打开，或执行： > `xat...",
   "assets": {
-    "macos_zip": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.3/DBPilot-1.1.3-macos.zip",
-    "macos_dmg": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.3/DBPilot-1.1.3-macos.dmg",
-    "windows_setup": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.3/DBPilot-1.1.3-windows-x64-setup.exe",
-    "windows_portable": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.3/DBPilot-1.1.3-windows-x64-portable.zip",
-    "linux_appimage": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.3/DBPilot-1.1.3-linux-x64.AppImage",
-    "linux_deb": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.3/dbpilot_1.1.3_amd64.deb",
-    "linux_rpm": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.3/dbpilot-1.1.3-1.x86_64.rpm"
+    "macos_zip": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.4/DBPilot-1.1.4-macos.zip",
+    "macos_dmg": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.4/DBPilot-1.1.4-macos.dmg",
+    "windows_setup": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.4/DBPilot-1.1.4-windows-x64-setup.exe",
+    "windows_portable": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.4/DBPilot-1.1.4-windows-x64-portable.zip",
+    "linux_appimage": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.4/DBPilot-1.1.4-linux-x64.AppImage",
+    "linux_deb": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.4/dbpilot_1.1.4_amd64.deb",
+    "linux_rpm": "https://github.com/L-Y-P/DBPilot/releases/download/v1.1.4/dbpilot-1.1.4-1.x86_64.rpm"
   }
 }

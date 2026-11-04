@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart' hide Text, Tooltip;
 import '../text.dart';
 
@@ -9,6 +11,7 @@ import '../i18n_literals.dart';
 import '../import_rules.dart';
 import '../nav.dart';
 import '../notice.dart';
+import '../row_batcher.dart';
 import '../sql_highlight.dart';
 import '../sqlite_sources.dart';
 import '../theme.dart';
@@ -39,6 +42,23 @@ class _SqlViewState extends State<SqlView> {
 
   /// Query-metrics run id of the last console run (for paging telemetry).
   int? _metricRunId;
+
+  /// Round 85 / Plan A: streaming batches are buffered and merged so a 50k-row
+  /// result rebuilds the card ~5-10 times instead of once per 500-row batch.
+  /// The batcher (pure logic) decides the row-count threshold; this state owns
+  /// the 100 ms coalescing timer and drains the buffer at every terminal point.
+  static const Duration _flushInterval = Duration(milliseconds: 100);
+  final RowBatcher _batcher = RowBatcher();
+  Timer? _flushTimer;
+
+  /// Convert the streaming [QueryEvent.rows] to JSON cell lists once, outside
+  /// the (deferred) setState, so the flush itself does only list appends.
+  static List<List<dynamic>> _convertRows(List<dynamic> rows) => <List<dynamic>>[
+        for (final row in rows)
+          <dynamic>[
+            for (final cell in row) cellValueToJson(cell),
+          ],
+      ];
 
   /// SQL-file execution: the Rust core streams the file and executes it
   /// statement by statement; this state polls progress and shows the summary.
@@ -93,6 +113,7 @@ class _SqlViewState extends State<SqlView> {
 
   @override
   void dispose() {
+    _flushTimer?.cancel();
     _filePoller?.dispose();
     _editor.dispose();
     super.dispose();
@@ -108,6 +129,11 @@ class _SqlViewState extends State<SqlView> {
     // event paints into the result list, so the first page shows up while the
     // server is still reading rows instead of after the whole result set has
     // crossed the bridge and been materialised.
+    // A new run starts from an empty buffer: cancel any pending coalescing
+    // timer and forget the previous run's first-flush bookkeeping.
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _batcher.reset();
     setState(() {
       _running = true;
       _error = null;
@@ -129,6 +155,7 @@ class _SqlViewState extends State<SqlView> {
           case queryEventDone:
             await _streamDone(event);
           case queryEventFailed:
+            _flushPending();
             setState(() => _error = event.message);
           default:
             break;
@@ -137,6 +164,9 @@ class _SqlViewState extends State<SqlView> {
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
     } finally {
+      // Safety net: flush anything still buffered regardless of how the run
+      // ended (success, exception, or cancellation) so no rows are lost.
+      _flushPending();
       wall.stop();
       QueryMetrics.instance.finishRun(
         runId: runId,
@@ -191,36 +221,55 @@ class _SqlViewState extends State<SqlView> {
     });
   }
 
-  /// `batch` event: append the rows read so far (the grid only builds the
-  /// first page, so one setState per batch stays cheap even for 50k rows).
+  /// `batch` event: buffer the rows and flush on a threshold/timer (Plan A).
+  ///
+  /// The grid only builds the first page, but calling setState per batch still
+  /// rebuilt the whole result card ~100 times for a 50k-row result and each
+  /// rebuild re-copied the full row list. Buffering into [RowBatcher] and
+  /// flushing every 2000 rows (or 100 ms) merges those into a handful of
+  /// rebuilds while the first page still appears almost immediately.
   void _streamBatch(QueryEvent event) {
     final index = event.statementIndex.toInt();
     if (index >= _results.length) return;
+    // Convert here, off the setState path, so the flush only appends.
+    final converted = _convertRows(event.rows);
+    final due = _batcher.add(
+      statementIndex: index,
+      rows: converted,
+      columns: event.columns.isEmpty ? null : columnsToJson(event.columns),
+      truncated: event.truncated,
+    );
+    if (due) {
+      _flushPending();
+    } else {
+      _flushTimer ??= Timer(_flushInterval, _flushPending);
+    }
+  }
+
+  /// Drain the batcher into [_results] in one setState. Safe to call when
+  /// nothing is buffered (no-op). Called from the threshold path, the timer,
+  /// and every terminal point so no buffered rows are ever lost.
+  void _flushPending() {
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    if (_batcher.isEmpty) return;
+    final flushes = _batcher.drain();
+    if (!mounted) return;
     setState(() {
-      final result = _results[index];
-      final rows = result['rows'] as List<dynamic>;
-      for (final row in event.rows) {
-        rows.add(<dynamic>[
-          for (final cell in row) cellValueToJson(cell),
-        ]);
+      for (final flush in flushes) {
+        final index = flush.statementIndex;
+        if (index < 0 || index >= _results.length) continue;
+        RowBatcher.applyFlush(_results[index], flush);
       }
-      // Column metadata only rides on the first batch of the statement.
-      if (event.columns.isNotEmpty) {
-        result['columns'] = columnsToJson(event.columns);
-      }
-      // A batch means this statement returns rows: mark the kind now so the
-      // grid paints its first page while later batches are still arriving
-      // (waiting for statement_done would defeat the progressive rendering).
-      if (event.columns.isNotEmpty || event.rows.isNotEmpty) {
-        result['kind'] = 'rows';
-      }
-      if (event.truncated) result['truncated'] = true;
     });
   }
 
   /// `statement_done` event: merge the per-statement metadata. The event's
   /// rows are empty by contract — the batches already delivered them.
   void _streamStatementDone(QueryEvent event) {
+    // Flush buffered batches first so the statement's rows are complete before
+    // its metadata (row count, columns fallback) is merged.
+    _flushPending();
     final meta = event.result;
     final index = event.statementIndex.toInt();
     if (meta == null || index >= _results.length) return;
@@ -244,6 +293,9 @@ class _SqlViewState extends State<SqlView> {
 
   /// `done` event: run summary, search_path, then the post-DDL tree refresh.
   Future<void> _streamDone(QueryEvent event) async {
+    // Flush buffered batches before the summary/DDL refresh so the tree refresh
+    // and metrics see the complete result set.
+    _flushPending();
     final summary = event.summary;
     if (summary != null) {
       setState(() {

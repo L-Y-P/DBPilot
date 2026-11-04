@@ -106,9 +106,14 @@ String rowChangeKey({
 /// Throws [ArgumentError] for a row index outside [rows], or for a column name
 /// that is not in [columns] (a stale grid view), instead of sending a silently
 /// wrong UPDATE.
+///
+/// [rows] may be the raw result list (`List<dynamic>`, elements are cell
+/// lists); only the rows named by [edits] are ever read, so a large result is
+/// not copied here. Each element is treated as a cell list, and a malformed
+/// element is read as an empty row (keys become null) rather than throwing.
 List<Map<String, dynamic>> buildRowChanges({
   required List<Map<String, dynamic>> columns,
-  required List<List<dynamic>> rows,
+  required List<dynamic> rows,
   required List<String> primaryKey,
   required List<DirtyCell> edits,
 }) {
@@ -129,7 +134,8 @@ List<Map<String, dynamic>> buildRowChanges({
   }
   final changes = <Map<String, dynamic>>[];
   for (final entry in byRow.entries) {
-    final row = rows[entry.key];
+    final rawRow = rows[entry.key];
+    final row = rawRow is List ? rawRow : const <dynamic>[];
     changes.add(<String, dynamic>{
       'action': 'update',
       'keys': _rowKeys(columns, row, primaryKey),

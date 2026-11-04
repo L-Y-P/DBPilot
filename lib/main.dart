@@ -5,6 +5,7 @@ import 'package:flutter/material.dart' hide Text, Tooltip;
 import 'src/text.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:screen_retriever/screen_retriever.dart';
 
 import 'src/api.dart';
 import 'src/app_state.dart';
@@ -17,6 +18,7 @@ import 'src/settings_channel.dart';
 import 'src/shell.dart';
 import 'src/rust/frb_generated.dart';
 import 'src/theme.dart';
+import 'src/window_placement.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -81,16 +83,41 @@ Future<void> main() async {
   final maximized = win['maximized'] == true;
 
   await windowManager.ensureInitialized();
+
+  // Clamp the initial window to the current display's work area so the native
+  // title bar (minimise / maximise / close) is always reachable. Without this,
+  // a saved/default size larger than the screen (e.g. 1440x900 on a 1024x768
+  // SunLogin/RDP virtual monitor) is centred to a negative Y and the window
+  // controls end up above the visible screen ("窗口控件无法显示", round 85).
+  Rect workArea = const Rect.fromLTWH(0, 0, 1280, 800);
+  try {
+    final display = await screenRetriever.getPrimaryDisplay();
+    final pos = display.visiblePosition ?? Offset.zero;
+    final size = display.visibleSize ?? display.size;
+    if (size.width > 0 && size.height > 0) {
+      workArea = Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height);
+    }
+  } catch (_) {
+    // No display info (rare): fall back to the conservative default above; the
+    // placement helper still clamps against it.
+  }
+  final placement = resolveWindowPlacement(
+    workArea: workArea,
+    savedSize: (x == null && y == null && win['width'] == null) ? null : Size(width, height),
+    savedPosition: (x == null || y == null) ? null : Offset(x, y),
+    maximized: maximized,
+  );
+
   final options = WindowOptions(
-    size: Size(width, height),
+    size: placement.size,
     minimumSize: const Size(960, 600),
-    center: x == null || y == null,
+    center: false, // explicit position from the placement helper
     title: kAppName,
     titleBarStyle: TitleBarStyle.normal,
   );
   await windowManager.waitUntilReadyToShow(options, () async {
-    if (x != null && y != null && !maximized) {
-      await windowManager.setPosition(Offset(x, y));
+    if (!maximized) {
+      await windowManager.setPosition(placement.position);
     }
     if (maximized) await windowManager.maximize();
     // 窗口底色已在 MainFlutterWindow.swift 里换成系统窗口底色（窗口 +

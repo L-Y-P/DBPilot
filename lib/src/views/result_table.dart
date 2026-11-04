@@ -93,7 +93,11 @@ class ResultTable extends StatelessWidget {
     final kind = (result['kind'] ?? '').toString();
     final rowCount = (result['row_count'] as num?)?.toInt() ?? 0;
     final columns = _columns(result);
-    final rows = _rows(result);
+    // Round 85 / Plan A+: hand the raw row list straight to the row view; it
+    // slices only the current page (50 rows) per build instead of copying the
+    // whole result set on every rebuild (which was up to 50k rows x ~100
+    // rebuilds while streaming).
+    final rawRows = _rawRows(result);
     final table = database == null ? null : inferSingleTable(statement, columns);
     final editable = table != null;
 
@@ -119,7 +123,7 @@ class ResultTable extends StatelessWidget {
           _RowsResultView(
             key: ValueKey('result-rows-$index'),
             columns: columns,
-            rows: rows,
+            rawRows: rawRows,
             statement: statement,
             database: database,
             resultIndex: index,
@@ -130,15 +134,15 @@ class ResultTable extends StatelessWidget {
             onPaged: onPaged,
             onDeleteSelected: editable
                 ? (indices) =>
-                    _deleteRows(context, index, columns, rows, indices)
+                    _deleteRows(context, index, columns, rawRows, indices)
                 : null,
             onSaveCell: editable
                 ? (rowIndex, column, value, isNull) => _saveCell(context, index,
-                    columns, rows, rowIndex, column, value, isNull)
+                    columns, rawRows, rowIndex, column, value, isNull)
                 : null,
             onApplyEdits: editable
-                ? (edits) =>
-                    _applyDirtyEdits(context, index, columns, rows, edits)
+                ? (edits) => _applyDirtyEdits(
+                    context, index, columns, rawRows, edits)
                 : null,
           )
         else
@@ -170,10 +174,23 @@ class ResultTable extends StatelessWidget {
     return value.map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
-  List<List<dynamic>> _rows(Json result) {
+  /// The raw row list from a result, unmodified.
+  ///
+  /// Deliberately does NOT copy: [_RowsResultView] slices only the current page
+  /// per build, and the edit/delete callbacks read individual rows on demand
+  /// (only when the user acts), so a large result is never copied wholesale on
+  /// every rebuild.
+  List<dynamic> _rawRows(Json result) {
     final value = result['rows'];
-    if (value is! List) return <List<dynamic>>[];
-    return value.map((row) => row is List ? row : <dynamic>[]).toList();
+    return value is List ? value : const <dynamic>[];
+  }
+
+  /// One row of a raw row list as a cell list (defensive against a malformed
+  /// element); cheap, used only for the rows a callback actually touches.
+  static List<dynamic> _rowCells(List<dynamic> rawRows, int index) {
+    if (index < 0 || index >= rawRows.length) return const <dynamic>[];
+    final row = rawRows[index];
+    return row is List ? row : const <dynamic>[];
   }
 
   /// Delete rows from a single-table result. Runs sequentially and stops at the
@@ -182,7 +199,7 @@ class ResultTable extends StatelessWidget {
     BuildContext context,
     int resultIndex,
     List<Json> columns,
-    List<List<dynamic>> rows,
+    List<dynamic> rawRows,
     List<int> indices,
   ) async {
     final table = inferSingleTable(
@@ -199,11 +216,11 @@ class ResultTable extends StatelessWidget {
     if (!ok) return;
     var deleted = 0;
     for (final index in indices) {
+      final cells = _rowCells(rawRows, index);
       final keys = <String, dynamic>{};
       for (var i = 0; i < columns.length; i++) {
-        keys[columns[i]['name'].toString()] = index < rows.length && i < rows[index].length
-            ? rows[index][i]
-            : null;
+        keys[columns[i]['name'].toString()] =
+            i < cells.length ? cells[i] : null;
       }
       try {
         await Api.instance.changeRow(database!, table, {
@@ -232,7 +249,7 @@ class ResultTable extends StatelessWidget {
     BuildContext context,
     int resultIndex,
     List<Json> columns,
-    List<List<dynamic>> rows,
+    List<dynamic> rawRows,
     List<DirtyCell> edits,
   ) async {
     final table = inferSingleTable(
@@ -240,9 +257,11 @@ class ResultTable extends StatelessWidget {
       columns,
     );
     if (table == null || database == null) return false;
+    // buildRowChanges reads only the edited rows out of the raw list, so the
+    // whole result is never copied here (a user action, not a per-build path).
     final changes = buildRowChanges(
       columns: columns,
-      rows: rows,
+      rows: rawRows,
       primaryKey: const <String>[],
       edits: edits,
     );
@@ -263,7 +282,7 @@ class ResultTable extends StatelessWidget {
     BuildContext context,
     int resultIndex,
     List<Json> columns,
-    List<List<dynamic>> rows,
+    List<dynamic> rawRows,
     int rowIndex,
     String column,
     Object? value,
@@ -274,10 +293,10 @@ class ResultTable extends StatelessWidget {
       columns,
     );
     if (table == null || database == null) return;
+    final cells = _rowCells(rawRows, rowIndex);
     final keys = <String, dynamic>{};
     for (var i = 0; i < columns.length; i++) {
-      keys[columns[i]['name'].toString()] =
-          rowIndex < rows.length && i < rows[rowIndex].length ? rows[rowIndex][i] : null;
+      keys[columns[i]['name'].toString()] = i < cells.length ? cells[i] : null;
     }
     try {
       await Api.instance.changeRow(database!, table, {
@@ -306,7 +325,7 @@ class _RowsResultView extends StatefulWidget {
   const _RowsResultView({
     super.key,
     required this.columns,
-    required this.rows,
+    required this.rawRows,
     required this.statement,
     required this.database,
     required this.resultIndex,
@@ -321,7 +340,10 @@ class _RowsResultView extends StatefulWidget {
   });
 
   final List<Json> columns;
-  final List<List<dynamic>> rows;
+
+  /// The result's raw row list (elements are cell lists). Only the current page
+  /// is sliced per build; the edit/delete callbacks read rows on demand.
+  final List<dynamic> rawRows;
   final String statement;
   final String? database;
   final int resultIndex;
@@ -370,8 +392,9 @@ class _RowsResultViewState extends State<_RowsResultView> {
   @override
   void didUpdateWidget(covariant _RowsResultView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // New run / new result rows: start at the first page again.
-    if (!identical(oldWidget.rows, widget.rows)) {
+    // New run / new result list: start at the first page again. Streaming
+    // appends to the same list reference, so a growing result keeps the page.
+    if (!identical(oldWidget.rawRows, widget.rawRows)) {
       _page = 1;
     }
   }
@@ -507,11 +530,17 @@ class _RowsResultViewState extends State<_RowsResultView> {
 
   @override
   Widget build(BuildContext context) {
-    final rows = widget.rows;
-    final pages = pageCountFor(rows.length, _pageSize);
-    final page = clampPage(_page, rows.length, _pageSize);
+    final rawRows = widget.rawRows;
+    final total = rawRows.length;
+    final pages = pageCountFor(total, _pageSize);
+    final page = clampPage(_page, total, _pageSize);
     final base = (page - 1) * _pageSize;
-    final pageRows = pageSlice(rows, page, _pageSize);
+    // Slice only the current page (<= 50 rows) into cell lists; the rest of the
+    // raw list is never touched on this build.
+    final pageRows = <List<dynamic>>[
+      for (var i = base; i < total && i < base + _pageSize; i++)
+        rawRows[i] is List ? rawRows[i] as List<dynamic> : const <dynamic>[],
+    ];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -560,11 +589,11 @@ class _RowsResultViewState extends State<_RowsResultView> {
                       ),
                   ]),
         ),
-        if (rows.isNotEmpty)
+        if (total > 0)
           TablePager(
             page: page,
             pages: pages,
-            total: rows.length,
+            total: total,
             visible: pageRows.length,
             onPage: (next) {
               setState(() => _page = next);

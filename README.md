@@ -266,7 +266,7 @@ flutter build linux   --release   # build/linux/x64/release/bundle/
 
 # Linux 三种安装包（AppImage / deb / rpm，本地与 CI 共用同一份脚本）
 # 依赖：apt install -y file libfuse2 rpm zstd desktop-file-utils，另需 appimagetool
-VERSION=1.0.0 bash packaging/linux/build-packages.sh
+VERSION=1.1.4 bash packaging/linux/build-packages.sh
 ```
 
 Rust 部分由 cargokit 在 `flutter build` 内部自动触发，产物落在 `build/` 下，不复用 `rust/target`。
@@ -296,7 +296,7 @@ make rust-live-down # 停库并删卷
 live 套件的端点全部来自环境变量 `DBPILOT_TEST_MYSQL_*` / `DBPILOT_TEST_PG_*`，
 仓库里不含任何账号密码；详见 [docs/CI_LIVE_TESTS.md](docs/CI_LIVE_TESTS.md)。
 
-当前基线：`dart analyze` 0 issue、`flutter test` 380 passed + 11 skip、`cargo test` 183 passed / 17 ignored。
+当前基线：`dart analyze` 0 issue、`flutter test` 958 passed / 20 skipped、`cargo test`（dbpilot-core 41 + rust_myadmin_core 282 passed / 2 ignored）。
 
 **常见构建坑**
 

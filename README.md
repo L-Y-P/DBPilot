@@ -35,7 +35,7 @@ SQL 控制台 / 查询构建器 → Excel·CSV·SQL 导入 → E-R 关系图 →
 
 | 层 | 组件 | 说明 |
 | --- | --- | --- |
-| UI | **Flutter 3.47.7 / Dart 3.13** | Material 3；`window_manager` 管窗口、`file_picker` 管文件对话框、`path_provider` 管数据目录 |
+| UI | **Flutter 3.47.7 / Dart 3.13** | Material 3；`window_manager` 管窗口、`screen_retriever` 取显示器工作区（把初始窗口钳制进屏幕，避免标题栏越界）、`file_picker` 管文件对话框、`path_provider` 管数据目录、`crypto` 做校验 |
 | FFI | **flutter_rust_bridge 2.13** | 类型安全的进程内调用，不起 HTTP 服务、不开本地端口 |
 | 契约层 | **dbpilot-core**（独立 crate） | `DatabaseDialect` / `DatabaseDriver` / `DriverRegistry` / `ConnectionHandle`，不依赖任何驱动实现 |
 | 驱动 | **sqlx 0.8**（mysql / postgres / sqlite） | 三个内置驱动作为静态插件注册，方言 SQL 落在 `drivers/<id>/dialect.rs` |
@@ -175,29 +175,41 @@ MySQL 的 DDL 会隐式提交，仍按语句分组提交，界面上会说明无
 
 ## 性能
 
-本机实测，同机前后对照（含约 14 ms 测试框架开销）：
+> 数据来自真机实测（macOS / Windows 双平台；方法见 [docs/PERFORMANCE_TESTING.md](docs/PERFORMANCE_TESTING.md)）。
+> 弱机（Windows i5-8250U / 8 GB / SATA SSD）绝对数字更保守，但趋势一致。
 
-| 场景 | 优化前 | 优化后 | 做法 |
-| --- | --- | --- | --- |
-| DataGrid 40 列 × 500 行首帧 | 2.40 s | **1.30 s** | 列宽缓存 + 列虚拟化 + 采样 200 → 50 行 |
-| DataGrid 父级重建 | 734 ms | **157 ms** | 同上；单帧单元格 1200 → 390 |
-| GridTable 600 行首帧 | 1297 ms | **137 ms** | 行虚拟化（>150 行走固定表头 + ListView.builder） |
-| 构建器结果预览单帧单元格 | 943 | **207** | 按（结果身份, 页码）复用 widget + 列虚拟化 |
-| 构建器结果预览翻页 | 301 ms | **118.9 ms** | 同上 |
-| 查询构建器 tab 切换 | 37 ms | **13.7 ms** | ValueNotifier 局部重建 + IndexedStack 常驻 |
-| 100 MB CSV 导入 MySQL（252 万行） | 21.48 s / 4.66 MB/s | **14.58 s / 6.86 MB/s** | ROUND65 零拷贝快速路径 + ROUND66 独立 Tokio 消费者/单写入连接有界流水线；DB 时间≈14.5 s（详见 analysis/IMPORT_PERF_ROUND65.md、IMPORT_PIPELINE_ROUND66.md） |
+### 界面渲染
 
-其它与数据处理相关的设计：
+应用自身工作量很小，帧预算绰绰有余（应用内 `DBPILOT_FRAME_TRACE=1` 采样 FrameTiming）：
 
-- **keyset 游标分页**替代 OFFSET（单列主键升序时走索引范围扫描），配合延迟关联；游标页不发 `COUNT(*)`。
+| 指标 | 实测（RTX 5060 / NVIDIA • Linux GLES） | 说明 |
+| --- | --- | --- |
+| build（UI 线程）p50 | **0.07–0.85 ms** | 布局 + 绘制指令，远低于单帧预算 |
+| raster（GPU 合成）p50 | **≈ 2.0 ms** | 占 60 fps 预算（16.7 ms）约 12% |
+| 滚动 jank 率 | **0%**（稳定窗口） | 关键帧总量 3–4 ms，肉眼无感 |
+
+- 表格用 `ListView.builder + itemExtent` 虚拟滚动，屏幕上只渲染可见行；翻页 / 滚动 / 切每页条数都流畅。
+- **首屏与总行数解耦**：大结果流式渲染只重建当前页（方案 A/A+），50 万行表首屏与滚动不受总行数影响。
+- 已知一次性开销：首次打开大表时，初始化（元数据 + 行数统计 + 首帧）会有可感知等待（弱机更明显），之后交互即流畅。
+
+### 后端吞吐（Rust core）
+
+| 场景 | 结果 | 备注 |
+| --- | --- | --- |
+| 大结果集 1000 万行：首屏 100 行 / 1000 行 | **2.5 ms / 6.1 ms** | 上限 5 万行 189 ms |
+| 网格编辑 1 万行保存：逐行 vs 批量 | 51.8 s → **535 ms（96.8×）** | 单事务批量写入 |
+| 导出 100 万行 | CSV **3.62 s / 46.2 MB**；XLS 5.27 s / 217.8 MB | 流式写出 |
+| 对象浏览器 5000 表 | 冷 206 ms / 预热 **119 ms**；搜 5000 表名 0.5 ms | |
+| 10 路并发查询 | wall 41.5 ms（ratio 3.38） | 连接池生效，尾延迟略高 |
+| 连死端口 | **2.05 s** 返回可读错误 | （历史 30 s 已修复） |
+| 100 MB / 252 万行 CSV 导入 MySQL | macOS **14.58 s / 6.86 MB/s**；Windows 弱机 2.17–2.41 MB/s | 瓶颈在数据库 fsync，非 CPU |
+
+### 数据处理相关设计
+
+- **keyset 游标分页**替代 OFFSET（单列主键升序走索引范围扫描）+ 延迟关联；游标页不发 `COUNT(*)`。
 - **大字段延迟加载**：超过 200 字符只渲染前 120 字符 + 徽标，双击看全文。
 - **自动列宽可关闭**：关掉后所有列固定 160 px，完全不跑 `TextPainter` 测量。
-- **导入流式**：文本格式 64 KiB 分块；Excel 全格式按行流式解析与校验（xlsx/xlsm 用 zip+XML、xls 用 OLE2+BIFF record、xlsb 用 ZIP entry+BRT record），批量 INSERT 默认 500 行、可取消；单记录 8 MiB / 单语句 16 MiB 上限。
-  分隔文本（CSV/TSV）走零拷贝快速路径：复用记录缓冲、按字节区间切字段、直接写 INSERT 缓冲，不再逐格创建 String/Vec<Value>；带引号的记录仍走完整引号/转义状态机。批量行数可配置（默认 500，500–2000 实测接近，5000 更慢）；`transaction_batches` 为实验选项（默认 1，实测合并事务反而更慢）。`pipeline_batches` 默认 2：CSV 生产者在独立 Tokio task 中与单写入连接消费者重叠，100 MB / 252 万行实测 14.58 s / 6.86 MB/s（相对串行 18.69 s / 5.35 MB/s，耗时 −22%、吞吐 +28%），队列容量 2/4 差异 <1%；详见 analysis/IMPORT_PIPELINE_ROUND66.md。显式设 1 可回退串行。
-  共享字符串表（xlsx sharedStrings / xls SST / xlsb sharedStrings）为该格式决定的字符串索引表，一次性加载。
-  单文件超过 **5 GiB（5×1024³ 字节）** 时给出提示（统一 GiB 口径，并提醒共享字符串表/SST 的内存峰值风险；
-  能流式读取的格式只提醒耗时；将来若出现必须整表载入的读取路径会直接拒绝）。护栏判定只读文件头，
-  不会为了判断而预解析整个工作簿。
+- **导入 / 导出全流式**：文本格式 64 KiB 分块；Excel（xlsx/xlsm/xls/xlsb/ods）按行流式解析校验；批量 INSERT 默认 500 行、可取消；单文件超 5 GiB 给出提示。CSV/TSV 走零拷贝快速路径 + 独立 Tokio 消费者与单写入连接的有界流水线（详见 [docs/DATA_TRANSFER_OPTIMISATION.md](docs/DATA_TRANSFER_OPTIMISATION.md)、[docs/EXPORT_IMPORT_CONTRACT.md](docs/EXPORT_IMPORT_CONTRACT.md)）。
 - **导出流式**：逐行写出，不把整表拼成一个大字符串。
 
 ## 使用

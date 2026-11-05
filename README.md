@@ -25,7 +25,7 @@ SQL 控制台 / 查询构建器 → Excel·CSV·SQL 导入 → E-R 关系图 →
 | --- | --- |
 | 界面 | Flutter 3.47.7 / Dart 3.13（Material 3，中英双语，深浅色 + 6 套主题色） |
 | 内核 | Rust 2021（sqlx 0.8 / tokio 1 / russh 0.45 / rustls） |
-| 桥接 | flutter_rust_bridge 2.13（类型安全 FFI，无 HTTP、无本地端口） |
+| 桥接 | flutter_rust_bridge 2.13（类型安全 FFI，无 HTTP、无本地端口；大字节以外部 TypedData 零拷贝过界） |
 | 平台 | macOS（universal x86_64 + arm64）、Windows x64、Linux（GTK3） |
 | 许可 | MIT，见 [LICENSE](LICENSE) |
 
@@ -36,18 +36,18 @@ SQL 控制台 / 查询构建器 → Excel·CSV·SQL 导入 → E-R 关系图 →
 | 层 | 组件 | 说明 |
 | --- | --- | --- |
 | UI | **Flutter 3.47.7 / Dart 3.13** | Material 3；`window_manager` 管窗口、`screen_retriever` 取显示器工作区（把初始窗口钳制进屏幕，避免标题栏越界）、`file_picker` 管文件对话框、`path_provider` 管数据目录、`crypto` 做校验 |
-| FFI | **flutter_rust_bridge 2.13** | 类型安全的进程内调用，不起 HTTP 服务、不开本地端口 |
+| FFI | **flutter_rust_bridge 2.13** | 类型安全的进程内调用，不起 HTTP 服务、不开本地端口；结果集按需选用「JSON 载荷 / typed struct / 流式」三种传输（见下） |
 | 契约层 | **dbpilot-core**（独立 crate） | `DatabaseDialect` / `DatabaseDriver` / `DriverRegistry` / `ConnectionHandle`，不依赖任何驱动实现 |
 | 驱动 | **sqlx 0.8**（mysql / postgres / sqlite） | 三个内置驱动作为静态插件注册，方言 SQL 落在 `drivers/<id>/dialect.rs` |
 | 运行时 | **tokio 1**（多线程） | 长任务（导入 / SQL 文件）`tokio::spawn` + 进度/取消 |
 | 网络 | **russh 0.45** + **rustls** | SSH 本地端口转发（跳板机）、TLS / mTLS 证书校验 |
-| 序列化 | serde / serde_json / chrono / uuid | 跨 FFI 数据统一是 JSON |
+| 序列化 | serde / serde_json / chrono / uuid | 结构化数据用 serde；过大结果集走 typed struct + StreamSink 分批（见「数据传输方式」） |
 
 分层：
 
 ```text
 Flutter UI（Dart）              lib/src/**：shell / views / components / builder
-      │  flutter_rust_bridge 2.13（JSON 进出）
+      │  flutter_rust_bridge 2.13（typed struct / 流式 / JSON 载荷）
 Rust api 层（唯一 FFI 表面）    rust/src/api/*
       │
 Rust 编排层                     state.rs（授权边界）· pools.rs（连接池 LRU 5 + 隧道）
@@ -58,6 +58,19 @@ Rust 编排层                     state.rs（授权边界）· pools.rs（连�
       │
 引擎与持久化                    importer · exporters · ssh · secure（0600 原子写）
 ```
+
+### 数据传输方式（FRB 桥）
+
+不同数据走不同通道，按「数据量 / 是否需要边读边显示」选择：
+
+| 通道 | 用于 | 机制 |
+| --- | --- | --- |
+| **typed struct**（首选） | SQL 控制台查询结果（`run_query_typed` → `ResultSetDto` / `CellValue`） | 结果按结构体字段逐个编码（`CellValue` 用 kind 码 + 强类型字段），二进制单元格以 `Uint8List` 直接过界；**无整包 JSON 文本、无 `jsonDecode`** |
+| **StreamSink 分批流式** | SQL 控制台大结果（`run_query_stream` → `Stream<QueryEvent>`） | 驱动边读边发：`started` → N×`batch`（500 行/批）→ `statement_done` → `done`；**首批到达即可上屏**，不等待整包完成 |
+| **JSON 载荷** | 表浏览（`table_data`）、结构、对象 / 库列表、设置、连接、导入导出元数据等绝大多数 `Api` 接口 | 返回值是 `serde_json::Value`，经桥以 JSON 字符串传输、Dart `jsonDecode` 解出 Map；接口简单、结构灵活 |
+| **外部 TypedData（零拷贝指针）** | 所有含大 `Vec<u8>` / `Uint8List` 的字段（如二进制单元格、文件字节） | FRB 以「外部 TypedData（ptr + len + finalizer）」移交，**不经序列化、0 拷贝**；解码侧仅一次 `getUint8List` |
+
+> 结果集默认「typed + 流式」，其余接口走 JSON。FRB 底层对字节缓冲本就是指针过界，不需要额外的 `ZeroCopyBuffer`（FRB 2.13 已移除该类型）。另有一个「Rust 持有整块结果 buffer、Dart 按 ptr+len 视图惰性读行」的**零拷贝机制原型**（`raw_buffer`），尚未接入线上数据路径。
 
 ## 支持的数据库
 
